@@ -41,9 +41,9 @@
 //!
 //! # Platforms
 //!
-//! Only Windows has a backend. Everywhere else the crate compiles and every
-//! window call returns [`WindowError::Unsupported`], so callers can be written
-//! once.
+//! Windows (Win32) and macOS (AppKit, `src/macos.rs`) have backends. Everywhere
+//! else the crate compiles and every window call returns
+//! [`WindowError::Unsupported`], so callers can be written once.
 //!
 //! # What this crate deliberately does not do
 //! - It knows nothing about VST3. It hands out a native handle and reports
@@ -52,7 +52,9 @@
 //!   before any window exists, and a library that fights the shell over that
 //!   produces blurry windows.
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(not(any(windows, target_os = "macos")))]
 mod unsupported;
 #[cfg(windows)]
 mod win32;
@@ -65,4 +67,4 @@ pub use service::{
 
 /// Whether this build has a native window backend. `false` means every
 /// [`Service::open_window`] returns [`WindowError::Unsupported`].
-pub const SUPPORTED: bool = cfg!(windows);
+pub const SUPPORTED: bool = cfg!(any(windows, target_os = "macos"));

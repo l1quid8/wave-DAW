@@ -16,7 +16,10 @@ use parking_lot::Mutex;
 #[cfg(windows)]
 use crate::win32 as backend;
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+use crate::macos as backend;
+
+#[cfg(not(any(windows, target_os = "macos")))]
 use crate::unsupported as backend;
 
 /// Smallest client area a plugin window may be given. A 1x1 window is a way to
@@ -119,7 +122,7 @@ pub enum WindowError {
     #[error("plugin windows are owned by thread {owner:?}; this call came from {caller:?}")]
     WrongThread { owner: ThreadId, caller: ThreadId },
 
-    /// This platform has no plugin-window backend (everything but Windows).
+    /// This platform has no plugin-window backend (everything but Windows and macOS).
     #[error("native plugin windows are not implemented on this platform")]
     Unsupported,
 
@@ -135,6 +138,10 @@ pub enum WindowError {
     /// [`Service::close_all`]).
     #[error("{0} is not open")]
     Closed(WindowId),
+
+    /// A native (AppKit) call failed or was refused.
+    #[error("could not drive the plugin window: {0}")]
+    Native(String),
 
     /// A Win32 call on a live window failed.
     #[error("{api} failed on {id} (win32 error {code})")]
@@ -436,7 +443,7 @@ impl Drop for Window {
 
 /// State every window procedure needs. Boxed and owned by the native window,
 /// freed when it is destroyed.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 pub(crate) struct WindowState {
     pub(crate) events: Sender<WindowEvent>,
     pub(crate) ticks: Arc<AtomicU64>,
@@ -444,7 +451,7 @@ pub(crate) struct WindowState {
     pub(crate) tick: std::cell::RefCell<Option<Rc<dyn Fn()>>>,
 }
 
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
 impl WindowState {
     /// Queue an event for the owner. A dropped receiver is not an error: the
     /// owner may have let go while the window is being torn down.
@@ -502,7 +509,7 @@ mod tests {
         assert_eq!(service.close_all(), 0);
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     #[test]
     fn without_a_backend_opening_is_unsupported_and_says_so() {
         let service = Service::new();

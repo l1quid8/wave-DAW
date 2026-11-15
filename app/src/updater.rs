@@ -38,7 +38,7 @@ pub struct AppInfo {
     pub seen_version: Option<String>,
     pub auto_update: bool,
     /// Whether VST3 plugins can open their own editor windows on this platform
-    /// (Windows only for now; on Linux they are hosted with WAVE's parameter list).
+    /// (Windows and macOS; on Linux they are hosted with WAVE's parameter list).
     pub plugin_editors: bool,
 }
 

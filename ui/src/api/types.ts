@@ -228,7 +228,7 @@ export interface F0ModelStatus {
 /** An update found on GitHub Releases (`update_check`). `notes`: the release notes (Markdown), `date`: `YYYY-MM-DD`. */
 export interface UpdateInfo { version: string; notes: string | null; date: string | null }
 /** `app_info`: the running version, the version whose notes were last shown (null on a fresh install), the auto-check switch. */
-/** `pluginEditors`: VST3 plugins can open their own editor windows (Windows only for now; LV2 plugins never do yet). */
+/** `pluginEditors`: VST3 plugins can open their own editor windows (Windows and macOS; LV2 plugins never do yet). */
 export interface AppInfo { version: string; seenVersion: string | null; autoUpdate: boolean; pluginEditors: boolean }
 export interface UpdateProgress { done: number; total: number }
 export interface ModelProgress { id: string; done: number; total: number; error?: string }

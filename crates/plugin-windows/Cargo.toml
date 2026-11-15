@@ -20,3 +20,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_HiDpi",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+# AppKit. tao (Tauri's event loop) already links these exact crates.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "NSObject", "NSString", "NSGeometry", "NSNotification", "NSRunLoop", "NSTimer", "NSDate", "NSArray"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSWindow", "NSView", "NSResponder", "NSGraphics"] }

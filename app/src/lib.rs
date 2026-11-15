@@ -938,7 +938,7 @@ async fn app_info(app: St<'_>, handle: AppHandle) -> R<updater::AppInfo> {
         version: handle.package_info().version.to_string(),
         seen_version: s.seen_version.clone(),
         auto_update: !s.no_auto_update,
-        plugin_editors: cfg!(windows),
+        plugin_editors: wave_plugin_windows::SUPPORTED,
     })
 }
 
@@ -1169,6 +1169,25 @@ pub fn run(project_arg: Option<&str>) {
         .expect("error while building WAVE");
     boot.mark("tauri built, entering the event loop");
     tapp.run(|h, ev| {
+        // Finder (double-click, "Open With", a drop on the Dock icon) delivers
+        // projects as an Apple Event, not in argv: queue them like a second
+        // launch on Windows does.
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Opened { urls } = &ev {
+            let paths: Vec<String> = urls
+                .iter()
+                .filter_map(|url| url.to_file_path().ok())
+                .filter_map(|path| project_launch::project_path(&path.to_string_lossy(), None))
+                .collect();
+            if !paths.is_empty() {
+                h.state::<ProjectOpenRequests>().0.lock().extend(paths);
+                if let Some(window) = h.get_webview_window("main") {
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                }
+                let _ = h.emit("project-open-requested", ());
+            }
+        }
         if let tauri::RunEvent::Exit = ev {
             if let Some(app) = h.try_state::<Arc<App>>() {
                 shutdown(h, &app);
