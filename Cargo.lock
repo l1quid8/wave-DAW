@@ -5751,6 +5751,7 @@ version = "0.4.0"
 dependencies = [
  "libc",
  "log",
+ "objc2-core-foundation",
  "parking_lot",
  "rtrb",
  "serde",

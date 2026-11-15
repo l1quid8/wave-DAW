@@ -2,7 +2,7 @@
 //!
 //! ```text
 //!  createView("editor")                does this plugin draw at all?
-//!  isPlatformTypeSupported(HWND)       will it embed in a Win32 window?
+//!  isPlatformTypeSupported(HWND/NSView) will it embed in a native window?
 //!  getSize()                           the size to open the window at
 //!  --- open the window, hidden ---
 //!  setContentScaleFactor(dpi / 96)     only now is the monitor's DPI known
@@ -38,7 +38,12 @@ const REFERENCE_DPI: u32 = 96;
 
 #[cfg(windows)]
 const PLATFORM_TYPE: (FIDString, &str) = (vst3::Steinberg::kPlatformTypeHWND, "HWND");
-#[cfg(not(windows))]
+/// On macOS the editor is handed the window's content `NSView` and works in
+/// points; the backend reports 96 "dpi", so no content scale is ever set (the
+/// view's backing layer already follows the display's scale factor).
+#[cfg(target_os = "macos")]
+const PLATFORM_TYPE: (FIDString, &str) = (vst3::Steinberg::kPlatformTypeNSView, "NSView");
+#[cfg(not(any(windows, target_os = "macos")))]
 const PLATFORM_TYPE: (FIDString, &str) = (vst3::Steinberg::kPlatformTypeX11EmbedWindowID, "X11EmbedWindowID");
 
 pub(crate) fn scale_for_dpi(dpi: u32) -> f32 {

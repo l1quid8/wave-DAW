@@ -6,8 +6,8 @@
 //! without a plugin in sight.
 //!
 //! ```text
-//!  load the library            LoadLibraryW / dlopen
-//!  InitDll() / ModuleEntry()   optional; false means "refused" (licence checks)
+//!  load the library            LoadLibraryW / dlopen / CFBundleLoadExecutable
+//!  InitDll() / ModuleEntry() / bundleEntry()   optional; false means "refused" (licence checks)
 //!  GetPluginFactory()          required: this is what makes it a VST3 module
 //! ```
 //!
@@ -53,11 +53,22 @@ pub(crate) const ARCH_DIR: &str = "aarch64-linux";
 #[cfg(not(any(windows, target_os = "macos", all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))))]
 pub(crate) const ARCH_DIR: &str = "unsupported";
 
-/// Extension of the binary inside a bundle: `.vst3` on Windows, `.so` on Linux.
+/// Extension of the binary inside a bundle: `.vst3` on Windows, `.so` on Linux,
+/// none on macOS (a Mach-O executable named after the bundle).
 #[cfg(windows)]
 const BINARY_EXTENSION: &str = "vst3";
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+const BINARY_EXTENSION: &str = "";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 const BINARY_EXTENSION: &str = "so";
+
+/// Whether `candidate` has this platform's binary extension (on macOS: none).
+fn has_binary_extension(candidate: &Path) -> bool {
+    match candidate.extension() {
+        Some(ext) => !BINARY_EXTENSION.is_empty() && ext.eq_ignore_ascii_case(BINARY_EXTENSION),
+        None => BINARY_EXTENSION.is_empty(),
+    }
+}
 
 /// The 16-byte class id naming one plugin inside a module.
 ///
@@ -136,8 +147,9 @@ impl<'de> serde::Deserialize<'de> for ClassId {
 /// Turn a `.vst3` path into the path the OS loader is given.
 ///
 /// A flat file *is* the library. A directory is a bundle: the binary is
-/// `Contents/<arch>/<bundle stem>.<vst3|so>`, or, failing that, the only
-/// binary in the architecture directory (legal, if rare).
+/// `Contents/<arch>/<bundle stem>.<vst3|so>` (`Contents/MacOS/<bundle stem>`
+/// on macOS), or, failing that, the only binary in the architecture directory
+/// (legal, if rare: on macOS the executable is named by `CFBundleExecutable`).
 pub(crate) fn resolve_binary(path: &Path) -> Result<PathBuf, Vst3Error> {
     if !path.is_dir() {
         // A file, or nothing at all: let the loader say why in its own words.
@@ -154,7 +166,7 @@ pub(crate) fn resolve_binary(path: &Path) -> Result<PathBuf, Vst3Error> {
         let mut candidates: Vec<PathBuf> = entries
             .flatten()
             .map(|entry| entry.path())
-            .filter(|candidate| candidate.is_file() && candidate.extension().is_some_and(|ext| ext.eq_ignore_ascii_case(BINARY_EXTENSION)))
+            .filter(|candidate| candidate.is_file() && has_binary_extension(candidate))
             .collect();
         candidates.sort();
         if let Some(only) = candidates.into_iter().next() {
@@ -348,10 +360,81 @@ impl LibraryHandle {
     }
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+/// A macOS VST3 module is a CoreFoundation bundle. Hosts load it through
+/// `CFBundle` (not `dlopen` on the inner binary) because the module's
+/// `bundleEntry` takes the `CFBundleRef`, which plugins use to find their own
+/// resources (`Contents/Resources`).
+#[cfg(target_os = "macos")]
+struct LibraryHandle {
+    // Retained for the life of the process: modules are never unloaded.
+    bundle: objc2_core_foundation::CFRetained<objc2_core_foundation::CFBundle>,
+}
+
+#[cfg(target_os = "macos")]
+impl LibraryHandle {
+    /// `binary` is what [`resolve_binary`] returned: the executable inside
+    /// `<name>.vst3/Contents/MacOS/`. The bundle is three levels up.
+    fn load(binary: &Path) -> Result<Self, Vst3Error> {
+        use objc2_core_foundation::{CFBundle, CFError, CFRetained, CFURL};
+
+        let load_error = |message: String| Vst3Error::Load { path: binary.to_path_buf(), message };
+        let bundle_root = binary
+            .parent()
+            .filter(|dir| dir.file_name() == Some(OsStr::new(ARCH_DIR)))
+            .and_then(Path::parent)
+            .filter(|dir| dir.file_name() == Some(OsStr::new(CONTENTS_DIR)))
+            .and_then(Path::parent)
+            .ok_or_else(|| load_error("not a macOS plugin bundle (expected <name>.vst3/Contents/MacOS/<binary>)".to_owned()))?;
+        let url = CFURL::from_directory_path(bundle_root).ok_or_else(|| load_error("the path cannot be expressed as a URL".to_owned()))?;
+        let bundle = CFBundle::new(None, Some(&url)).ok_or_else(|| load_error("CoreFoundation could not open the bundle".to_owned()))?;
+
+        let mut error: *mut CFError = std::ptr::null_mut();
+        // SAFETY: `bundle` is live and `error` is a valid out-pointer. Loading
+        // runs the module's static initialisers -- third-party code, unavoidably.
+        let loaded = unsafe { bundle.load_executable_and_return_error(&mut error) };
+        if !loaded {
+            let message = std::ptr::NonNull::new(error)
+                // SAFETY: a non-null error from a `...AndReturnError` call is +1 retained.
+                .map(|error| unsafe { CFRetained::from_raw(error) })
+                .and_then(|error| error.description())
+                .map(|text| text.to_string())
+                // Typical cause: an Intel-only or 32-bit plugin in an arm64 host.
+                .unwrap_or_else(|| "the bundle's executable could not be loaded (wrong architecture?)".to_owned());
+            return Err(load_error(message));
+        }
+        Ok(Self { bundle })
+    }
+
+    /// `bundleEntry(CFBundleRef)` (older modules: `BundleEntry`), when exported.
+    unsafe fn enter(&self) -> bool {
+        type BundleEntryFn = unsafe extern "C" fn(*const c_void) -> bool;
+        let bundle_ref = objc2_core_foundation::CFRetained::as_ptr(&self.bundle).as_ptr() as *const c_void;
+        match self.symbol::<BundleEntryFn>(b"bundleEntry\0").or_else(|| self.symbol::<BundleEntryFn>(b"BundleEntry\0")) {
+            Some(entry) => entry(bundle_ref),
+            None => true,
+        }
+    }
+
+    /// # Safety
+    /// `F` must be the exact signature of the export and `name` NUL-terminated.
+    unsafe fn symbol<F: Copy>(&self, name: &[u8]) -> Option<F> {
+        debug_assert_eq!(name.last(), Some(&0));
+        debug_assert_eq!(std::mem::size_of::<F>(), std::mem::size_of::<*const c_void>());
+        let name = std::str::from_utf8(&name[..name.len() - 1]).ok()?;
+        let name = objc2_core_foundation::CFString::from_str(name);
+        let address = self.bundle.function_pointer_for_name(Some(&name));
+        if address.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute_copy::<*mut c_void, F>(&address))
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 struct LibraryHandle;
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 impl LibraryHandle {
     fn load(_binary: &Path) -> Result<Self, Vst3Error> {
         Err(Vst3Error::UnsupportedPlatform)

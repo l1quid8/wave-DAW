@@ -198,7 +198,7 @@ pub(crate) fn read_classes(factory: &ComPtr<IPluginFactory>, path: &Path) -> Vec
 /// Windows: `C:\Program Files\Common Files\VST3`, `%COMMONPROGRAMFILES%\VST3`,
 /// `%LOCALAPPDATA%\Programs\Common\VST3`. Linux: `/usr/lib/vst3`,
 /// `/usr/local/lib/vst3`, `~/.vst3`. macOS: `/Library/Audio/Plug-Ins/VST3` and
-/// the per-user one (listed for completeness; this build cannot load them).
+/// `~/Library/Audio/Plug-Ins/VST3`.
 /// Duplicates are harmless: the walk dedups.
 pub fn default_search_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
