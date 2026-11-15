@@ -8,9 +8,10 @@ shown in the app after an update and is published as the release notes (see
 
 ### Added
 - **WAVE runs on Macs with Apple Silicon.** Build it from source (see the README) and it runs
-  natively: playback and recording through your Mac's audio devices, your MIDI keyboard, VST3
-  effects from the usual plug-in folders with their own editor windows, ⌘ shortcuts, and `.wave`
-  projects that open with a double-click in Finder.
+  natively, with the Mac's own window buttons and ⌘ shortcuts. VST3 effects in the usual plug-in
+  folders load and open their own editor windows, and `.wave` projects open with a double-click
+  in Finder. Recording and MIDI keyboards have not been tested on a Mac yet, and a source build
+  does not update itself.
 - **Ask AI how to do something (F1).** Click Ask next to the menus, press F1 or pick Help → Ask
   AI, and type your question, e.g. "can I reorder the effects on a mixer track?". It opens
   ChatGPT with the question and your WAVE version, and since WAVE is open source it checks the
@@ -44,6 +45,9 @@ shown in the app after an update and is published as the release notes (see
 - Mixer strips show one name row: the insert number and its name, with the effect count beside
   it. Inserts you have not named show just their number. The docked mixer keeps only the
   controls you need while arranging; the Mix view shows the rest.
+- **A plugin's own window and WAVE stay in step.** Turn a knob in a VST3 plugin's own editor and
+  the parameter list in WAVE's effect window follows it. Close the plugin's window with its close
+  button and the effect window's button says "Open plugin GUI" again, so one click reopens it.
 
 ## 0.9.15 — 2026-11-14
 

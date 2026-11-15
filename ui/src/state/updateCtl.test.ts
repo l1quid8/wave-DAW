@@ -167,6 +167,19 @@ describe('update journey', () => {
     await expect(m.updateInstall()).rejects.toThrow(/not downloaded/);
   });
 
+  it('a build without an update channel never asks the server, even when the user asks', async () => {
+    const { a } = api();
+    let asked = 0;
+    const noChannel: UpdatesApi = { ...a, appInfo: async () => ({ ...(await a.appInfo()), updates: false }), updateCheck: async () => { asked++; return a.updateCheck(); } };
+    const { c } = make(noChannel); await c.init();
+    expect(c.state.updates).toBe(false);
+    await c.check(false);
+    await c.check(true);
+    expect(asked).toBe(0);
+    expect(c.state.phase).toBe('idle');
+    expect(c.state.error).toBeNull();
+  });
+
   it('remembers the automatic-check switch', async () => {
     const { a, store } = api();
     const { c } = make(a); await c.init();

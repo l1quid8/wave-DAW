@@ -229,7 +229,8 @@ export interface F0ModelStatus {
 export interface UpdateInfo { version: string; notes: string | null; date: string | null }
 /** `app_info`: the running version, the version whose notes were last shown (null on a fresh install), the auto-check switch. */
 /** `pluginEditors`: VST3 plugins can open their own editor windows (Windows and macOS; LV2 plugins never do yet). */
-export interface AppInfo { version: string; seenVersion: string | null; autoUpdate: boolean; pluginEditors: boolean }
+/** `updates`: this build has an update channel (false on macOS, which is built from source for now). */
+export interface AppInfo { version: string; seenVersion: string | null; autoUpdate: boolean; pluginEditors: boolean; updates: boolean }
 export interface UpdateProgress { done: number; total: number }
 export interface ModelProgress { id: string; done: number; total: number; error?: string }
 

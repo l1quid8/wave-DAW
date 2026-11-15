@@ -23,6 +23,8 @@ export type UpdPhase = 'idle' | 'checking' | 'available' | 'downloading' | 'read
 
 export interface UpdState {
   current: string;
+  /** This build has an update channel; without one nothing is ever checked or offered. */
+  updates: boolean;
   autoUpdate: boolean;
   phase: UpdPhase;
   /** The release found by the last check. */
@@ -39,7 +41,7 @@ export interface UpdState {
   news: Release[] | null;
 }
 
-export const EMPTY_UPD: UpdState = { current: '', autoUpdate: true, phase: 'idle', info: null, done: 0, total: 0, error: null, upToDateAt: null, dialog: false, news: null };
+export const EMPTY_UPD: UpdState = { current: '', updates: true, autoUpdate: true, phase: 'idle', info: null, done: 0, total: 0, error: null, upToDateAt: null, dialog: false, news: null };
 
 export interface UpdateHooks {
   /** Asks about unsaved changes before the restart; false = the user cancelled. */
@@ -64,7 +66,7 @@ export class UpdateController {
   async init(): Promise<void> {
     try {
       const info = await this.api.appInfo();
-      this.set({ current: info.version, autoUpdate: info.autoUpdate });
+      this.set({ current: info.version, updates: info.updates !== false, autoUpdate: info.autoUpdate });
       this.off = await this.api.on('update-progress', p => { if (this.state.phase === 'downloading') this.set({ done: p.done, total: p.total }); });
       if (info.seenVersion == null) await this.api.updateMarkSeen(info.version); // fresh install: nothing is "new"
       else if (info.seenVersion !== info.version) {
@@ -79,6 +81,7 @@ export class UpdateController {
   /** `manual`: the user asked, so an answer is always shown (the dialog, "up to date" or the error). */
   async check(manual: boolean): Promise<void> {
     const { phase } = this.state;
+    if (!this.state.updates) return; // no channel: the UI says so instead of offering a check
     if (phase === 'available' && manual) { this.set({ dialog: true, error: null }); return; }
     if (phase !== 'idle') return;
     this.set({ phase: 'checking', error: manual ? null : this.state.error });

@@ -40,6 +40,9 @@ pub struct AppInfo {
     /// Whether VST3 plugins can open their own editor windows on this platform
     /// (Windows and macOS; on Linux they are hosted with WAVE's parameter list).
     pub plugin_editors: bool,
+    /// Whether this build has an update channel. macOS has no released build yet
+    /// (it is built from source), so there is nothing to check against.
+    pub updates: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]

@@ -1055,7 +1055,7 @@ impl Vst3Handle {
     /// # Errors
     /// [`Vst3Error::WrongThread`] off the UI thread, [`Vst3Error::NoEditor`]
     /// for a plugin without one, [`Vst3Error::Window`] where the platform has
-    /// no window backend (everything but Windows), and the plugin's refusals.
+    /// no window backend (everything but Windows and macOS), and the plugin's refusals.
     pub fn open_editor(&self, windows: &wave_plugin_windows::Service) -> Result<(), Vst3Error> {
         if !windows.on_owner_thread() || !main_thread::on_main_thread() {
             return Err(Vst3Error::WrongThread);

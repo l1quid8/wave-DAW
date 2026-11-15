@@ -14,7 +14,7 @@ import { commit, Gesture, wheelEdit } from '../state/edit';
 import { S } from '../state/store';
 import { curBeat, tele } from '../state/telemetry';
 import { closeMenu, openMenu, say, setU, U, type MenuItem, type Tool } from '../state/ui';
-import { checkUpdates, showWhatsNew } from '../state/updates';
+import { checkUpdates, showWhatsNew, upd } from '../state/updates';
 import { toggleMixView } from '../state/mixView';
 import { midiFlash, midiStatus } from '../state/midi';
 import { track } from '../ui/drag';
@@ -27,7 +27,7 @@ import { MiniKnob } from '../ui/Knob';
 import { VOL_UNITY } from '../api/types';
 import { volText } from '../lib/format';
 import { autoDisplay, isAutomated, paramMenu } from '../state/automation';
-import { IS_MAC } from '../lib/platform';
+import { IS_MAC, shortcuts as keyLabel } from '../lib/platform';
 
 export const TOOLS: [Tool, string, TranslationKey][] = [
   ['draw', 'P', 'a.tb.toolDraw'], ['paint', 'B', 'a.tb.toolPaint'], ['erase', 'D', 'a.tb.toolErase'], ['mute', 'T', 'a.tb.toolMute'], ['slice', 'C', 'a.tb.toolSlice'], ['select', 'E', 'a.tb.toolSelect'],
@@ -296,7 +296,7 @@ function MenuBar() {
       { t: 'item', label: t('d.ask.menu'), glyph: G.ask, kbd: 'F1', act: openAsk },
       { t: 'item', label: t('a.mn.shortcuts'), glyph: G.shortcuts, kbd: '?', act: () => setU('help', true) },
       { t: 'sep' },
-      { t: 'item', label: t('a.mn.updates'), glyph: G.updates, act: () => void checkUpdates() },
+      { t: 'item', label: t('a.mn.updates'), glyph: G.updates, disabled: !upd().updates, title: upd().updates ? undefined : t('d.upd.none'), act: () => void checkUpdates() },
       { t: 'item', label: t('a.mn.whatsNew'), glyph: G.whatsNew, act: () => void showWhatsNew() },
     ]],
   ];
@@ -465,7 +465,7 @@ export function Help() {
         <div class="dialog" style={{ width: 'min(680px,92vw)', 'max-height': '90vh', 'overflow-y': 'auto' }} onPointerDown={e => e.stopPropagation()}>
           <div class="hd"><span>{t('a.tb.helpTitle')}</span><button onClick={() => setU('help', false)}>×</button></div>
           <div style={{ display: 'grid', 'grid-template-columns': 'repeat(auto-fit,minmax(280px,1fr))', 'column-gap': '24px' }}>
-            <For each={shortcuts()}>{([a, k]) => <div class="sc"><span class="a">{a}</span><span class="k">{k}</span></div>}</For>
+            <For each={shortcuts()}>{([a, k]) => <div class="sc"><span class="a">{a}</span><span class="k">{keyLabel(k)}</span></div>}</For>
           </div>
         </div>
       </div>

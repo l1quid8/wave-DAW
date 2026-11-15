@@ -939,6 +939,7 @@ async fn app_info(app: St<'_>, handle: AppHandle) -> R<updater::AppInfo> {
         seen_version: s.seen_version.clone(),
         auto_update: !s.no_auto_update,
         plugin_editors: wave_plugin_windows::SUPPORTED,
+        updates: !cfg!(target_os = "macos"),
     })
 }
 

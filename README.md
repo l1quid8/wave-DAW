@@ -202,10 +202,11 @@ cd app && cargo tauri dev
 **macOS (Apple Silicon):** Xcode (or its Command Line Tools), Rust stable and Node + pnpm
 (`brew install pnpm`). `cargo tauri dev` runs it; `cd app && cargo tauri build --bundles app,dmg`
 makes an ad-hoc signed `WAVE.app` and `.dmg` in `target/release/bundle/` for your own Mac (not
-notarized, so another Mac asks you to right-click → Open the first time). Audio and MIDI go through
-CoreAudio and CoreMIDI; macOS asks for microphone access the first time you record. VST3 effects
-are found in `/Library/Audio/Plug-Ins/VST3` and `~/Library/Audio/Plug-Ins/VST3` and open their own
-editor windows; Intel-only plugins cannot load in the arm64 app and say so in the effect picker.
+notarized, so another Mac asks you to right-click → Open the first time). VST3 effects are found in
+`/Library/Audio/Plug-Ins/VST3` and `~/Library/Audio/Plug-Ins/VST3` and open their own editor
+windows; a plugin built only for Intel Macs cannot be loaded by the Apple Silicon app. A
+source build does not update itself: to update, get the new version and build it again. Not yet
+tested on a Mac: recording (the app asks macOS for microphone access) and MIDI keyboards.
 
 **ASIO (Windows):** build with the `asio` feature. It needs LLVM/Clang
 (`winget install LLVM.LLVM`, then `LIBCLANG_PATH=C:\Program Files\LLVM\bin`); cpal downloads

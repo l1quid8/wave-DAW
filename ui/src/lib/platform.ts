@@ -9,17 +9,34 @@ export const IS_MAC: boolean =
 // Whole chords whose Mac equivalent is a different key, not just a different modifier.
 const MAC_CHORDS: Record<string, string> = { 'Alt+F4': '⌘Q' };
 
-/** Rewrite every `Ctrl+…` / `Alt+…` chord in `text` in macOS notation (⌘⇧S). Other text is untouched. */
+/** A lower-case word ("click", "wheel", "right-click", "przeciągnij") rather than a key name ("S", "F4", "Enter", "Del"). */
+const isGesture = (key: string) => key.length > 1 && key[0] !== key[0].toUpperCase();
+
+const MODIFIERS = ['Ctrl', 'Alt', 'Shift'];
+
+/**
+ * Rewrite every `Ctrl+…` / `Alt+…` chord in `text` in macOS notation (⌘⇧S), with or without spaces
+ * around the `+` ("Ctrl + drag"), and a lone Ctrl or Alt ("hold Alt", "Ctrl = pitch only") as its
+ * glyph. Other text is untouched, and text already in macOS notation stays as it is.
+ */
 export function macShortcuts(text: string): string {
-  // A chord is one or more modifiers joined by `+`, then a key; at least one must be Ctrl or Alt
-  // (a bare "Shift+drag" reads the same on every platform).
-  return text.replace(/\b((?:(?:Ctrl|Alt|Shift)\+)+)([^\s+,;:)]+)/g, (chord: string, mods: string, key: string) => {
-    if (Object.prototype.hasOwnProperty.call(MAC_CHORDS, chord)) return MAC_CHORDS[chord];
-    if (!/Ctrl|Alt/.test(mods)) return chord;
+  // A chord is one or more modifiers joined by `+`, then a key (which may itself be a modifier:
+  // "Ctrl+Alt"); at least one must be Ctrl or Alt (a bare "Shift+drag" reads the same everywhere).
+  const chords = text.replace(/\b((?:(?:Ctrl|Alt|Shift)\s*\+\s*)+)([^\s+,;:)]+)/g, (chord: string, rawMods: string, key: string) => {
+    const mods = rawMods.replace(/\s+/g, '').split('+').filter(Boolean);
+    const named = mods.join('+') + '+' + key;
+    if (Object.prototype.hasOwnProperty.call(MAC_CHORDS, named)) return MAC_CHORDS[named];
+    const keyIsModifier = MODIFIERS.includes(key);
+    const all = keyIsModifier ? [...mods, key] : mods;
+    if (!all.includes('Ctrl') && !all.includes('Alt')) return chord;
     // Apple's order: ⌃ ⌥ ⇧ ⌘. Ctrl maps to ⌘ because the handlers treat them alike.
-    const has = (m: string) => mods.split('+').includes(m);
-    return (has('Alt') ? '⌥' : '') + (has('Shift') ? '⇧' : '') + (has('Ctrl') ? '⌘' : '') + key;
+    const glyphs = (all.includes('Alt') ? '⌥' : '') + (all.includes('Shift') ? '⇧' : '') + (all.includes('Ctrl') ? '⌘' : '');
+    if (keyIsModifier) return glyphs;
+    // A key is written right after its glyphs (⌘S, ⇧⌘F4); a mouse gesture or other word keeps a
+    // hyphen, as Apple writes "⌘-click", so "⌘-click" / "⌥-drag" / "⌘-klik" stay readable.
+    return glyphs + (isGesture(key) ? '-' : '') + key;
   });
+  return chords.replace(/\bCtrl\b/g, '⌘').replace(/\bAlt\b/g, '⌥');
 }
 
 /** `macShortcuts` on macOS, the text itself elsewhere. */
