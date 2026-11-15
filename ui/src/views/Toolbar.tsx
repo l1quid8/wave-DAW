@@ -27,6 +27,7 @@ import { MiniKnob } from '../ui/Knob';
 import { VOL_UNITY } from '../api/types';
 import { volText } from '../lib/format';
 import { autoDisplay, isAutomated, paramMenu } from '../state/automation';
+import { IS_MAC } from '../lib/platform';
 
 export const TOOLS: [Tool, string, TranslationKey][] = [
   ['draw', 'P', 'a.tb.toolDraw'], ['paint', 'B', 'a.tb.toolPaint'], ['erase', 'D', 'a.tb.toolErase'], ['mute', 'T', 'a.tb.toolMute'], ['slice', 'C', 'a.tb.toolSlice'], ['select', 'E', 'a.tb.toolSelect'],
@@ -133,7 +134,7 @@ export function Toolbar() {
   const wins = () => U.plugs.length + (rackFloating() ? 1 : 0) + (rollFloating() ? 1 : 0);
   const hint = () => t('a.tb.statusHint', { tool: t(TOOLS.find(x => x[0] === U.tool)![2]), hint: t(TOOL_HINT[U.tool]), snap: U.alt ? 'off' : snapLabel(U.snap, U.bw).replace('Snap: ', '') });
   return (
-    <div class="toolbar" classList={{ native: !!win }} onMouseDown={dragDown}>
+    <div class="toolbar" classList={{ native: !!win, mac: !!win && IS_MAC }} onMouseDown={dragDown}>
       {/* left: the menus over the hint line (FL): what the last action did, and what the tool does */}
       <div class="tbleft" data-drag>
         <div class="tbmenu" data-drag>
@@ -221,7 +222,8 @@ export function Toolbar() {
           <span class="midiled" classList={{ on: !!midiStatus()?.connected, hit: midiFlash() }} /><span class="tag9">MIDI</span>
         </button>
       </Show>
-      <Show when={win}>
+      {/* macOS draws its own traffic lights over the bar's left end (titleBarStyle "Overlay") */}
+      <Show when={win && !IS_MAC}>
         <div class="winbtns">
           <button title={t('a.tb.minimize')} aria-label={t('a.tb.minimize')} onClick={() => void win!.minimize()}><svg width="10" height="10" viewBox="0 0 10 10"><path d="M0 5h10" stroke="currentColor" /></svg></button>
           <button title={maxed() ? t('a.tb.restore') : t('a.tb.maximize')} aria-label={maxed() ? t('a.tb.restore') : t('a.tb.maximize')} onClick={() => void win!.toggleMaximize()}>

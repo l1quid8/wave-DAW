@@ -120,8 +120,8 @@ than twenty-five years behind it and wins on breadth.
 | Vocal pitch editing | Included | NewTone and Pitcher come with the higher editions |
 | Working with an AI agent | The agent edits the open project and measures its own renders | No command line into the open project |
 | Built-in instruments and effects | 14 | More than a hundred across the editions |
-| Third-party plugins | VST3 effects, and LV2 effects on Linux; plugin windows on Windows only | VST instruments and effects, and more formats |
-| Platforms | Windows and Linux | Windows and macOS |
+| Third-party plugins | VST3 effects, and LV2 effects on Linux; plugin windows on Windows and macOS | VST instruments and effects, and more formats |
+| Platforms | Windows, Linux and macOS (Apple Silicon, build from source) | Windows and macOS |
 | Maturity | Version 0.9, one developer, expect rough edges | Since 1998, large community, tutorials, sample packs |
 
 FL Studio details as of November 2026; see Image-Line's edition comparison for current
@@ -137,12 +137,12 @@ session. What it does not do yet:
 
 - no VST or LV2 instruments, only effects (VST3 everywhere, LV2 on Linux), and no CLAP; on
   Linux an effect is edited through WAVE's parameter list, because plugin windows work on
-  Windows only (and LV2 plugins' own windows are not hosted yet);
+  Windows and macOS only (and LV2 plugins' own windows are not hosted yet);
 - LV2 needs the lilv library (`liblilv-0-0` on Debian/Ubuntu, `lilv-libs` on Fedora): the
   `.deb` and `.rpm` packages install it; with the AppImage, LV2 works when the system has it and
   WAVE says what to install when it does not. An LV2 plugin that needs a host feature WAVE does
   not provide (for example a fixed block size) is listed with the reason and cannot be added;
-- no macOS build;
+- no released macOS build yet: build it from source (see below);
 - no Session view or clip launching;
 - no import of FL Studio projects (`.flp`); bring stems or samples over instead;
 - releases come often, so things still move. The [changelog](CHANGELOG.md) is written for
@@ -158,7 +158,8 @@ Found a bug or miss something from FL? [Open an issue](https://github.com/miskib
 your own recordings: yes, that is what it is made for. If your sound depends on VST
 instruments such as Serum, or on FL's own plugins: not yet.
 
-**Does it run on a Mac?** No. Windows and Linux (deb, rpm, AppImage) only.
+**Does it run on a Mac?** Yes, natively on Apple Silicon, built from source (see Build from
+source). Releases are Windows and Linux (deb, rpm, AppImage) only for now.
 
 **Do I need an AI agent to use it?** No. It is a normal DAW with a mouse and a keyboard. The
 `wave` command is there if you want an agent, or your own script, to work in the project.
@@ -197,6 +198,14 @@ pnpm --dir ui install
 cargo install tauri-cli --version "^2"
 cd app && cargo tauri dev
 ```
+
+**macOS (Apple Silicon):** Xcode (or its Command Line Tools), Rust stable and Node + pnpm
+(`brew install pnpm`). `cargo tauri dev` runs it; `cd app && cargo tauri build --bundles app,dmg`
+makes an ad-hoc signed `WAVE.app` and `.dmg` in `target/release/bundle/` for your own Mac (not
+notarized, so another Mac asks you to right-click → Open the first time). Audio and MIDI go through
+CoreAudio and CoreMIDI; macOS asks for microphone access the first time you record. VST3 effects
+are found in `/Library/Audio/Plug-Ins/VST3` and `~/Library/Audio/Plug-Ins/VST3` and open their own
+editor windows; Intel-only plugins cannot load in the arm64 app and say so in the effect picker.
 
 **ASIO (Windows):** build with the `asio` feature. It needs LLVM/Clang
 (`winget install LLVM.LLVM`, then `LIBCLANG_PATH=C:\Program Files\LLVM\bin`); cpal downloads

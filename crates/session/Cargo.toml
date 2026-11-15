@@ -12,3 +12,7 @@ serde_json.workspace = true
 interprocess.workspace = true
 uuid.workspace = true
 log.workspace = true
+
+# `kill(pid, 0)`: is the process behind a session endpoint still running?
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

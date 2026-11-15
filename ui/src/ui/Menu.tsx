@@ -7,6 +7,7 @@ import { S } from '../state/store';
 import { commit } from '../state/edit';
 import { clamp, dbText } from '../lib/format';
 import { t } from '../lib/i18n';
+import { shortcuts } from '../lib/platform';
 import { Icon, TC } from './icons';
 import { INST_ICONS, InstIcon } from './instIcons';
 
@@ -71,7 +72,7 @@ function MenuList(props: { items: MenuItem[]; x: number; y: number; sub?: boolea
                           </Show>
                           <span>{i().label}</span>
                         </span>
-                        <span class="kbd">{i().kbd ?? ''}</span>
+                        <span class="kbd">{shortcuts(i().kbd ?? '')}</span>
                       </button>
                     )}
                   </Match>

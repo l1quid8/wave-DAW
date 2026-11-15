@@ -33,13 +33,16 @@ use parking_lot::Mutex;
 /// Where WAVE keeps the small persistent files a scan needs, or `None` when this
 /// platform will not say.
 ///
-/// `%LOCALAPPDATA%\WAVE\` on Windows, `$XDG_DATA_HOME`/`~/.local/share/wave`
-/// elsewhere. A machine that answers neither simply gets in-memory state, which
+/// `%LOCALAPPDATA%\WAVE\` on Windows, `~/Library/Application Support/WAVE` on
+/// macOS, `$XDG_DATA_HOME`/`~/.local/share/wave` elsewhere. A machine that answers neither simply gets in-memory state, which
 /// still fixes the within-one-session half of the problem.
 pub fn data_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     let root = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
-    #[cfg(not(windows))]
+    // Beside the engine's own data (`~/Library/Application Support/WAVE`).
+    #[cfg(target_os = "macos")]
+    let root = std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/Application Support"));
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     let root = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")));

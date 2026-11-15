@@ -7,6 +7,10 @@ shown in the app after an update and is published as the release notes (see
 ## Unreleased
 
 ### Added
+- **WAVE runs on Macs with Apple Silicon.** Build it from source (see the README) and it runs
+  natively: playback and recording through your Mac's audio devices, your MIDI keyboard, VST3
+  effects from the usual plug-in folders with their own editor windows, ⌘ shortcuts, and `.wave`
+  projects that open with a double-click in Finder.
 - **Ask AI how to do something (F1).** Click Ask next to the menus, press F1 or pick Help → Ask
   AI, and type your question, e.g. "can I reorder the effects on a mixer track?". It opens
   ChatGPT with the question and your WAVE version, and since WAVE is open source it checks the
