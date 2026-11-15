@@ -177,7 +177,15 @@ pub(crate) struct HostFlags {
     pub(crate) restart: AtomicI32,
     /// A `performEdit` happened: the saved state is stale.
     pub(crate) dirty: AtomicBool,
+    /// The plugin changed parameter values itself (its editor moved a control,
+    /// or it reloaded a preset) and the host's UI has not been told yet.
+    /// Separate from `dirty`, which the project's save logic consumes.
+    pub(crate) edited: AtomicBool,
 }
+
+/// `IComponentHandler::restartComponent` flags that mean "the values (or names)
+/// of my parameters changed": `kParamValuesChanged` and `kParamTitlesChanged`.
+const PARAMS_CHANGED: int32 = (1 << 2) | (1 << 4);
 
 // ---------------------------------------------------------------------------
 // IHostApplication + IComponentHandler
@@ -241,6 +249,7 @@ impl IComponentHandlerTrait for HostContext {
         if !value_normalized.is_finite() {
             return kInvalidArgument;
         }
+        self.flags.edited.store(true, Ordering::Release);
         match self.inbox.get() {
             Some(inbox) if !inbox.post(id, value_normalized.clamp(0.0, 1.0)) => kResultFalse,
             _ => kResultOk,
@@ -254,6 +263,9 @@ impl IComponentHandlerTrait for HostContext {
     unsafe fn restartComponent(&self, flags: int32) -> tresult {
         self.flags.restart.fetch_or(flags, Ordering::AcqRel);
         self.flags.dirty.store(true, Ordering::Release);
+        if flags & PARAMS_CHANGED != 0 {
+            self.flags.edited.store(true, Ordering::Release);
+        }
         kResultOk
     }
 }
@@ -700,7 +712,25 @@ mod tests {
         assert_eq!(drained(&inbox, 64), vec![(7, 1.0)], "moves of one knob coalesce to the latest");
         assert_eq!(unlisted.pop(), Ok((99, 0.5)));
         assert!(flags.dirty.load(Ordering::Acquire));
+        assert!(flags.edited.load(Ordering::Acquire), "the host's UI is told about editor edits");
         assert_eq!(flags.restart.load(Ordering::Acquire), 2 | 8);
+    }
+
+    #[test]
+    fn only_value_changes_reach_the_ui_and_a_refused_edit_is_not_one() {
+        let (context, _inbox, _unlisted, flags) = context();
+        let handler: ComPtr<IComponentHandler> = context.to_com_ptr().unwrap();
+        // SAFETY: plain scalars.
+        unsafe {
+            assert_eq!(handler.performEdit(7, f64::NAN), kInvalidArgument);
+            assert!(!flags.edited.load(Ordering::Acquire), "a refused edit changes nothing the UI shows");
+            assert_eq!(handler.restartComponent(8), kResultOk);
+            assert!(!flags.edited.load(Ordering::Acquire), "a latency change is not a parameter change");
+            assert_eq!(handler.restartComponent(1 << 2), kResultOk);
+            assert!(flags.edited.swap(false, Ordering::AcqRel), "kParamValuesChanged (a preset load) is");
+            assert_eq!(handler.restartComponent(1 << 4), kResultOk);
+            assert!(flags.edited.load(Ordering::Acquire), "kParamTitlesChanged is");
+        }
     }
 
     #[test]

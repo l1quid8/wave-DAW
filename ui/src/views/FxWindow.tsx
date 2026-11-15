@@ -37,6 +37,7 @@ import { halfHit, HalfViz, halfXf } from './fx/half';
 import { ChorusViz, PhaserViz } from './fx/modulation';
 import { warpDown, warpHover, WarpViz } from './fx/warp';
 import { onVoicePad, padParams, padToVoice, VoiceViz } from './fx/voice';
+import { followEditor } from '../lib/pluginEditor';
 
 
 function makeViz(f: Fx): Viz | null {
@@ -651,12 +652,12 @@ const nearestOption = (p: PluginParam) =>
 const paramTitle = (p: PluginParam) =>
   p.min != null && p.max != null && !p.toggle && !p.options?.length ? `${p.name} (${+p.min.toPrecision(6)} … ${+p.max.toPrecision(6)}${p.unit ? ' ' + p.unit : ''})` : p.name;
 
-/** A hosted plugin's window: its editor button (VST3 on Windows) and the generic parameter list (every format). */
+/** A hosted plugin's window: its editor button (VST3 on Windows and macOS) and the generic parameter list (every format). */
 function PluginBody(props: { fx: Fx }) {
   const [params, setParams] = createSignal<PluginParam[]>([]);
   const [err, setErr] = createSignal<string | null>(null);
   const [guiOpen, setGuiOpen] = createSignal(false);
-  // VST3 editor windows exist on Windows only; LV2 editors are not hosted: there the list is the plugin's UI
+  // VST3 editor windows exist on Windows and macOS; LV2 editors are not hosted: there the list is the plugin's UI
   const [editors, setEditors] = createSignal(true);
   const isLv2 = () => props.fx.plugin?.format === 'lv2';
   const [q, setQ] = createSignal('');
@@ -665,6 +666,11 @@ function PluginBody(props: { fx: Fx }) {
   /** Why the engine could not load the plugin (not installed, refused): shown instead of a parameter error. */
   const loadErr = () => S.fxErrors[props.fx.id];
   onMount(() => { load(); be().appInfo().then(i => setEditors(i.pluginEditors)).catch(() => {}); });
+  // the plugin's own window: its close button and its knobs show here as they happen
+  const editor = followEditor(props.fx.id, setGuiOpen, load);
+  let offEditor: (() => void) | null = null, gone = false;
+  void be().on('plugin-editor', editor.handle).then(off => { if (gone) off(); else offEditor = off; });
+  onCleanup(() => { gone = true; offEditor?.(); editor.dispose(); });
   // a window opened with the slot is asked before the engine has the instance: ask again once it does
   createEffect(() => { void S.revision; if (err() && !loadErr()) load(); });
   onCleanup(() => { clearTimeout(refresh); if (guiOpen()) void be().pluginEditor(props.fx.id, false).catch(() => {}); });

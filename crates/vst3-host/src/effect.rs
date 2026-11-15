@@ -567,6 +567,8 @@ pub(crate) struct Shared {
     gui: Arc<GuiRequests>,
     counters: Counters,
     editor_open: AtomicBool,
+    /// Told what the plugin's own editor did (see [`Vst3Handle::set_editor_observer`]).
+    observer: Mutex<Option<EditorObserver>>,
     /// What `IAudioProcessor::getLatencySamples` said at the last (re)activation or
     /// latency-change request.
     latency: AtomicU32,
@@ -584,21 +586,58 @@ impl Shared {
 
     /// The editor's per-tick work. UI thread.
     fn tick_editor(&self) {
-        // `try_lock`: a plugin running a modal loop inside a call we made can
-        // deliver a nested tick; skip it rather than deadlock.
-        let Some(mut guard) = self.instance.try_lock() else {
-            return;
+        let closed = {
+            // `try_lock`: a plugin running a modal loop inside a call we made can
+            // deliver a nested tick; skip it rather than deadlock.
+            let Some(mut guard) = self.instance.try_lock() else {
+                return;
+            };
+            let Some(instance) = guard.as_mut() else {
+                return;
+            };
+            self.apply_feedback(instance);
+            let closed = instance.editor.as_mut().is_some_and(EditorSession::pump);
+            if closed {
+                drop(instance.editor.take());
+                self.editor_open.store(false, Ordering::Release);
+            }
+            closed
         };
-        let Some(instance) = guard.as_mut() else {
-            return;
-        };
-        self.apply_feedback(instance);
-        let closed = instance.editor.as_mut().is_some_and(EditorSession::pump);
-        if closed {
-            drop(instance.editor.take());
-            self.editor_open.store(false, Ordering::Release);
+        // Outside the instance lock: the observer may call straight back in
+        // (to list the parameters it was just told changed).
+        let edited = self.flags.edited.swap(false, Ordering::AcqRel);
+        self.notify(editor_events(edited, closed));
+    }
+
+    fn notify(&self, events: impl IntoIterator<Item = EditorEvent>) {
+        let observer = self.observer.lock().clone();
+        if let Some(observer) = observer {
+            for event in events {
+                observer(event);
+            }
         }
     }
+}
+
+/// What a plugin's own editor did that the host's UI should reflect. Reported
+/// from the editor window's tick, so at most once per event kind per ~16 ms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorEvent {
+    /// The plugin changed parameter values itself (a control moved in its
+    /// editor, a preset loaded): [`Vst3Handle::params`] has new values.
+    Edited,
+    /// The user closed the editor's window; [`Vst3Handle::is_editor_open`] is
+    /// now `false`.
+    Closed,
+}
+
+/// Receives [`EditorEvent`]s on the UI thread. Must not block.
+pub type EditorObserver = Arc<dyn Fn(EditorEvent) + Send + Sync>;
+
+/// The events one tick reports: edits first, so the last values are read
+/// before the window is reported gone.
+fn editor_events(edited: bool, closed: bool) -> impl Iterator<Item = EditorEvent> {
+    [edited.then_some(EditorEvent::Edited), closed.then_some(EditorEvent::Closed)].into_iter().flatten()
 }
 
 impl Drop for Shared {
@@ -1040,9 +1079,20 @@ impl Vst3Handle {
             }
         });
         session.window().set_tick_handler(Some(tick))?;
+        // What changed before the window existed is already in the list the UI shows.
+        self.shared.flags.edited.store(false, Ordering::Release);
         instance.editor = Some(session);
         self.shared.editor_open.store(true, Ordering::Release);
         Ok(())
+    }
+
+    /// Be told what this plugin's own editor does: [`EditorEvent::Edited`] when
+    /// it changes parameter values, [`EditorEvent::Closed`] when the user closes
+    /// its window. Called on the UI thread from the editor's tick; `None`
+    /// removes the observer. Not called for [`close_editor`](Self::close_editor),
+    /// whose caller already knows.
+    pub fn set_editor_observer(&self, observer: Option<EditorObserver>) {
+        *self.shared.observer.lock() = observer;
     }
 
     /// Close the editor (no-op when closed). **UI thread only.**
@@ -1130,6 +1180,7 @@ pub(crate) fn instantiate_effect(
         gui: Arc::new(GuiRequests::default()),
         counters: Counters::default(),
         editor_open: AtomicBool::new(false),
+        observer: Mutex::new(None),
         latency: AtomicU32::new(latency),
     });
     // Restoring a state is not an edit.
@@ -1153,6 +1204,15 @@ pub(crate) fn instantiate_effect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tick_reports_edits_before_the_close_and_nothing_when_idle() {
+        let all = |edited, closed| editor_events(edited, closed).collect::<Vec<_>>();
+        assert_eq!(all(false, false), vec![]);
+        assert_eq!(all(true, false), vec![EditorEvent::Edited]);
+        assert_eq!(all(false, true), vec![EditorEvent::Closed]);
+        assert_eq!(all(true, true), vec![EditorEvent::Edited, EditorEvent::Closed], "the last values are read before the window is gone");
+    }
 
     fn stereo() -> BusLayout {
         BusLayout { inputs: vec![2], outputs: vec![2] }

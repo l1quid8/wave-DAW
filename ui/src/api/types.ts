@@ -594,4 +594,7 @@ export interface PluginParam {
   options?: { value: number; label: string }[];
 }
 
+/** `plugin-editor`: a plugin's own editor window was closed by the user (`open: false`) or changed parameter values (`edited`). */
+export interface PluginEditorEvent { fxId: Id; open: boolean; edited: boolean }
+
 export interface CliStatus { installed: boolean; command: string; path: string | null; note?: string | null }

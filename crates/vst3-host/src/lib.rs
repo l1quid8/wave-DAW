@@ -131,7 +131,7 @@ mod module;
 mod scan;
 mod state;
 
-pub use effect::{instantiate, ParamInfo, Vst3Effect, Vst3Handle};
+pub use effect::{instantiate, EditorEvent, EditorObserver, ParamInfo, Vst3Effect, Vst3Handle};
 pub use error::Vst3Error;
 pub use host::MAX_STATE_BYTES;
 pub use main_thread::{on_main_thread, set_main_thread_executor, MainThreadJob};

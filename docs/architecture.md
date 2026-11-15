@@ -433,7 +433,9 @@ device), so plain edits and bounces do not pay for them. `crates/cli` owns load 
 Events: `state` (a `StateDto`, after every change from any origin: UI, CLI,
 undo, import, recording, file open), `library-progress`, `model-progress`, `audio-status`,
 `export-progress` (`{done, total, name, stage, frac, beat, peak, wave}` while a bounce runs: the
-file in progress, `prepare`/`render`/`write`/`done`, the song position and a live peak waveform).
+file in progress, `prepare`/`render`/`write`/`done`, the song position and a live peak waveform),
+`plugin-editor` (`{fxId, open, edited}` from a VST3 editor window's tick: the user closed the
+window, or the plugin changed parameter values itself; the effect window re-reads the list).
 
 ```ts
 type StateDto = { project: Project; revision: number; canUndo: boolean; canRedo: boolean;
