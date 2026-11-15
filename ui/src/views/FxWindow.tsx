@@ -677,6 +677,7 @@ function PluginBody(props: { fx: Fx }) {
   const label = () => PLUGIN_FORMAT_LABEL[props.fx.plugin?.format ?? 'vst3'];
   const set = (id: number, v: number) => {
     setParams(ps => ps.map(p => p.id === id ? { ...p, value: v } : p));
+    editor.localEdit();
     void be().pluginSetParam(props.fx.id, id, v).catch(e => say(label() + ': ' + String(e)));
     clearTimeout(refresh); refresh = window.setTimeout(load, 200);
   };

@@ -623,6 +623,11 @@ async fn library_remove_folder(app: St<'_>, path: String) -> R<Vec<String>> {
 
 struct ProjectOpenRequests(Mutex<Vec<String>>);
 
+/// Whether a project is waiting to be opened (from argv, a second launch or Finder).
+fn launch_requested_a_project(requests: &ProjectOpenRequests) -> bool {
+    !requests.0.lock().is_empty()
+}
+
 #[tauri::command]
 fn take_project_open_requests(requests: State<'_, ProjectOpenRequests>) -> Vec<String> {
     std::mem::take(&mut *requests.0.lock())
@@ -1198,6 +1203,10 @@ pub fn run(project_arg: Option<&str>) {
 }
 
 fn start_app(tapp: &mut tauri::App, boot: Arc<boot::Boot>, reopen_last: bool) {
+    // A project the launch asked for wins over the last one. On macOS, Finder delivers it as
+    // `RunEvent::Opened` (not argv), and macOS sends a launch's files before the app finishes
+    // launching, so it is already queued here: decoding the last project first would be wasted.
+    let reopen_last = reopen_last && !launch_requested_a_project(&tapp.state::<ProjectOpenRequests>());
     // gtk_init pulled the user locale back over LC_NUMERIC; plugin state
     // text parsing must stay in the C locale (see ensure_c_numeric_locale)
     ensure_c_numeric_locale();
@@ -1345,6 +1354,17 @@ mod tests {
     use super::open_reply;
     use std::sync::Arc;
     use wave_engine::{Engine, NoPlugins, Project};
+
+    /// A project queued by the launch (argv, or Finder's open event on macOS, which arrives
+    /// before setup) means the last project is not reopened first.
+    #[test]
+    fn a_queued_project_replaces_the_last_project_reopen() {
+        let requests = super::ProjectOpenRequests(parking_lot::Mutex::new(Vec::new()));
+        assert!(!super::launch_requested_a_project(&requests));
+        requests.0.lock().push("/Music/Song.wave".into());
+        assert!(super::launch_requested_a_project(&requests));
+        assert_eq!(requests.0.lock().len(), 1, "checking does not take the request the UI opens");
+    }
 
     /// The UI replaces its whole state with `state` after an open: it must be a full StateDto
     /// (a reply with only `warnings` crashed the UI on every open).

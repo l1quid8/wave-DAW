@@ -8,28 +8,44 @@ import type { PluginEditorEvent } from '../api/types';
 /** Longest a moved editor control takes to show in the parameter list (ms). */
 export const EDIT_RELOAD_MS = 100;
 
+/**
+ * How long after the user moves a control in WAVE's own list the plugin's "I changed values" reports
+ * are taken as an echo of that move (ms). Some plugins report a host-set value back as their own
+ * edit; re-reading the list then would pull the slider under the user's mouse. The list's own
+ * re-read after a local change brings the plugin's answer in anyway.
+ */
+export const ECHO_MS = 300;
+
 export interface EditorFollower {
   /** Feed every `plugin-editor` event; those for other effects are ignored. */
   handle(e: PluginEditorEvent): void;
+  /** The user just changed a value in WAVE's own list: what the plugin reports next is its echo. */
+  localEdit(): void;
   /** Cancel a pending re-read (the window is closing). */
   dispose(): void;
 }
 
 export function followEditor(fxId: number, setOpen: (open: boolean) => void, reload: () => void, ms = EDIT_RELOAD_MS): EditorFollower {
   let pending: ReturnType<typeof setTimeout> | null = null;
-  let last = -Infinity;
+  let last = -Infinity, local = -Infinity;
   const run = () => { if (pending !== null) clearTimeout(pending); pending = null; last = Date.now(); reload(); };
   return {
     handle(e) {
       if (e.fxId !== fxId) return;
       setOpen(e.open);
-      if (!e.edited) return;
+      if (!e.edited || Date.now() - local < ECHO_MS) return;
       // At most one re-read per `ms`. Leading edge: the first move shows at once, and a timer the
       // webview delays (an inactive window) can never hold the list back. Trailing: the last value
       // of a drag always lands.
       const since = Date.now() - last;
       if (since >= ms) run();
       else if (pending === null) pending = setTimeout(run, ms - since);
+    },
+    localEdit() {
+      local = Date.now();
+      // a re-read already queued would land mid-drag with the value from before the move
+      if (pending !== null) clearTimeout(pending);
+      pending = null;
     },
     dispose() {
       if (pending !== null) clearTimeout(pending);
