@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The hardened runtime only loads libraries signed by the app's own team.
+	     VST3 plugins come from every vendor (or are ad-hoc signed), so a DAW must opt out. -->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+	<!-- Recording: with the hardened runtime, audio input needs this as well as the usage string. -->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+</dict>
+</plist>

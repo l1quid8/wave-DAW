@@ -27,3 +27,4 @@ assets/
 # bundled by `tauri build`.
 app/resources/keys/*.flac
 app/resources/keys/ATTRIBUTION.txt
+.DS_Store
