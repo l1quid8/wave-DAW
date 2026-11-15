@@ -62,12 +62,23 @@ const BINARY_EXTENSION: &str = "";
 #[cfg(all(not(windows), not(target_os = "macos")))]
 const BINARY_EXTENSION: &str = "so";
 
-/// Whether `candidate` has this platform's binary extension (on macOS: none).
-fn has_binary_extension(candidate: &Path) -> bool {
-    match candidate.extension() {
-        Some(ext) => !BINARY_EXTENSION.is_empty() && ext.eq_ignore_ascii_case(BINARY_EXTENSION),
-        None => BINARY_EXTENSION.is_empty(),
+/// The binary's file name for a bundle stem: the stem with this platform's
+/// extension **appended** (`Foo 2.0` -> `Foo 2.0.so`; macOS: `Foo 2.0` itself).
+/// Never `set_extension`, which would take `.0` for an extension and replace it.
+fn binary_file_name(stem: &OsStr) -> std::ffi::OsString {
+    let mut name = stem.to_os_string();
+    if !BINARY_EXTENSION.is_empty() {
+        name.push(".");
+        name.push(BINARY_EXTENSION);
     }
+    name
+}
+
+/// Whether `candidate` could be this platform's binary. On macOS any file: a
+/// Mach-O executable has no extension, and its name may contain dots
+/// (`Foo 2.0`), which `Path::extension` would misread as one.
+fn is_platform_binary(candidate: &Path) -> bool {
+    BINARY_EXTENSION.is_empty() || candidate.extension().is_some_and(|ext| ext.eq_ignore_ascii_case(BINARY_EXTENSION))
 }
 
 /// The 16-byte class id naming one plugin inside a module.
@@ -157,17 +168,13 @@ pub(crate) fn resolve_binary(path: &Path) -> Result<PathBuf, Vst3Error> {
     }
     let stem = path.file_stem().unwrap_or_else(|| OsStr::new("plugin"));
     let arch_dir = path.join(CONTENTS_DIR).join(ARCH_DIR);
-    let mut expected = arch_dir.join(stem);
-    expected.set_extension(BINARY_EXTENSION);
+    let expected = arch_dir.join(binary_file_name(stem));
     if expected.is_file() {
         return Ok(expected);
     }
     if let Ok(entries) = std::fs::read_dir(&arch_dir) {
-        let mut candidates: Vec<PathBuf> = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|candidate| candidate.is_file() && has_binary_extension(candidate))
-            .collect();
+        let mut candidates: Vec<PathBuf> =
+            entries.flatten().map(|entry| entry.path()).filter(|candidate| candidate.is_file() && is_platform_binary(candidate)).collect();
         candidates.sort();
         if let Some(only) = candidates.into_iter().next() {
             return Ok(only);
@@ -573,16 +580,35 @@ mod tests {
         let bundle = dir.join("Serum.vst3");
         let arch = bundle.join(CONTENTS_DIR).join(ARCH_DIR);
         std::fs::create_dir_all(&arch).unwrap();
-        let mut binary = arch.join("Serum");
-        binary.set_extension(BINARY_EXTENSION);
+        let binary = arch.join(binary_file_name(OsStr::new("Serum")));
         std::fs::write(&binary, b"x").unwrap();
         assert_eq!(resolve_binary(&bundle).unwrap(), binary);
 
         let renamed = dir.join("Suite.vst3");
         let arch = renamed.join(CONTENTS_DIR).join(ARCH_DIR);
         std::fs::create_dir_all(&arch).unwrap();
-        let mut core = arch.join("SuiteCore");
-        core.set_extension(BINARY_EXTENSION);
+        let core = arch.join(binary_file_name(OsStr::new("SuiteCore")));
+        std::fs::write(&core, b"x").unwrap();
+        assert_eq!(resolve_binary(&renamed).unwrap(), core);
+    }
+
+    #[test]
+    fn a_bundle_name_with_dots_keeps_them_in_the_binary_name() {
+        // `set_extension` would read `.0` as an extension: `Foo 2.0` -> `Foo 2`.
+        let dir = scratch_dir("dotted");
+        let bundle = dir.join("Foo 2.0.vst3");
+        let arch = bundle.join(CONTENTS_DIR).join(ARCH_DIR);
+        std::fs::create_dir_all(&arch).unwrap();
+        let binary = arch.join(binary_file_name(OsStr::new("Foo 2.0")));
+        assert_eq!(binary.file_name().unwrap().to_string_lossy().matches("2.0").count(), 1);
+        std::fs::write(&binary, b"x").unwrap();
+        assert_eq!(resolve_binary(&bundle).unwrap(), binary);
+
+        // the fallback too: an executable named by CFBundleExecutable, with a dot, in a bundle named otherwise
+        let renamed = dir.join("Suite.vst3");
+        let arch = renamed.join(CONTENTS_DIR).join(ARCH_DIR);
+        std::fs::create_dir_all(&arch).unwrap();
+        let core = arch.join(binary_file_name(OsStr::new("Suite Core 1.5")));
         std::fs::write(&core, b"x").unwrap();
         assert_eq!(resolve_binary(&renamed).unwrap(), core);
     }

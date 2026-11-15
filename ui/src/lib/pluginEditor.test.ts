@@ -6,10 +6,10 @@ describe('followEditor', () => {
   afterEach(() => { vi.useRealTimers(); });
 
   it('follows the editor window being closed with its own close button', () => {
-    const open: boolean[] = [];
-    const f = followEditor(7, v => open.push(v), () => {});
+    const closed = vi.fn();
+    const f = followEditor(7, closed, () => {});
     f.handle({ fxId: 7, open: false, edited: false });
-    expect(open).toEqual([false]);
+    expect(closed).toHaveBeenCalledTimes(1);
   });
 
   it('re-reads the parameters once per interval however fast the editor sends edits', () => {
@@ -45,7 +45,7 @@ describe('followEditor', () => {
     f.handle({ fxId: 7, open: true, edited: true });
     vi.advanceTimersByTime(1000);
     expect(reload).not.toHaveBeenCalled();
-    expect(open).toHaveBeenLastCalledWith(true); // the editor button still follows
+    expect(open).not.toHaveBeenCalled(); // edits never touch the editor button
     // once the user lets go, the plugin's own edits show again
     f.handle({ fxId: 7, open: true, edited: true });
     expect(reload).toHaveBeenCalledTimes(1);
@@ -62,11 +62,19 @@ describe('followEditor', () => {
   });
 
   it('still follows the window being closed during the echo window', () => {
-    const open = vi.fn();
-    const f = followEditor(7, open, () => {});
+    const closed = vi.fn();
+    const f = followEditor(7, closed, () => {});
     f.localEdit();
     f.handle({ fxId: 7, open: false, edited: false });
-    expect(open).toHaveBeenLastCalledWith(false);
+    expect(closed).toHaveBeenCalledTimes(1);
+  });
+
+  it('an edit still in flight after the user closed the editor from WAVE does not reopen the button', () => {
+    let guiOpen = true;
+    const f = followEditor(7, () => { guiOpen = false; }, () => {});
+    guiOpen = false; // WAVE's own "Close plugin GUI" resolved
+    f.handle({ fxId: 7, open: true, edited: true }); // emitted by the last tick before the close
+    expect(guiOpen).toBe(false);
   });
 
   it('ignores other effects and forgets a pending re-read when disposed', () => {

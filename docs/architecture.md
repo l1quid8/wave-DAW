@@ -435,7 +435,8 @@ undo, import, recording, file open), `library-progress`, `model-progress`, `audi
 `export-progress` (`{done, total, name, stage, frac, beat, peak, wave}` while a bounce runs: the
 file in progress, `prepare`/`render`/`write`/`done`, the song position and a live peak waveform),
 `plugin-editor` (`{fxId, open, edited}` from a VST3 editor window's tick: the user closed the
-window, or the plugin changed parameter values itself; the effect window re-reads the list).
+window, or the plugin changed parameter values itself; the effect window re-reads the list, and
+only `open: false` changes its editor button, so a late `edited` cannot reopen it).
 
 ```ts
 type StateDto = { project: Project; revision: number; canUndo: boolean; canRedo: boolean;

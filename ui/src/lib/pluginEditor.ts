@@ -1,5 +1,5 @@
-// Keep an effect window in step with the plugin's own editor window: the editor button follows the
-// window (the user can close it with its own close button), and the parameter list is read again when
+// Keep an effect window in step with the plugin's own editor window: the editor button turns back to
+// "open" when the user closes the window with its own close button, and the parameter list is read again when
 // the plugin changes values itself. Edits arrive up to ~60 times a second while a knob is dragged,
 // and reading the list asks the plugin for every parameter, so re-reads are throttled.
 
@@ -25,14 +25,18 @@ export interface EditorFollower {
   dispose(): void;
 }
 
-export function followEditor(fxId: number, setOpen: (open: boolean) => void, reload: () => void, ms = EDIT_RELOAD_MS): EditorFollower {
+/**
+ * `onClosed`: the user closed the editor's window. Only a close changes the button: an "edited" event
+ * that was still in flight when the user closed the editor from WAVE's own button must not reopen it.
+ */
+export function followEditor(fxId: number, onClosed: () => void, reload: () => void, ms = EDIT_RELOAD_MS): EditorFollower {
   let pending: ReturnType<typeof setTimeout> | null = null;
   let last = -Infinity, local = -Infinity;
   const run = () => { if (pending !== null) clearTimeout(pending); pending = null; last = Date.now(); reload(); };
   return {
     handle(e) {
       if (e.fxId !== fxId) return;
-      setOpen(e.open);
+      if (!e.open) onClosed();
       if (!e.edited || Date.now() - local < ECHO_MS) return;
       // At most one re-read per `ms`. Leading edge: the first move shows at once, and a timer the
       // webview delays (an inactive window) can never hold the list back. Trailing: the last value

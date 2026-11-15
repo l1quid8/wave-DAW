@@ -667,7 +667,7 @@ function PluginBody(props: { fx: Fx }) {
   const loadErr = () => S.fxErrors[props.fx.id];
   onMount(() => { load(); be().appInfo().then(i => setEditors(i.pluginEditors)).catch(() => {}); });
   // the plugin's own window: its close button and its knobs show here as they happen
-  const editor = followEditor(props.fx.id, setGuiOpen, load);
+  const editor = followEditor(props.fx.id, () => setGuiOpen(false), load);
   let offEditor: (() => void) | null = null, gone = false;
   void be().on('plugin-editor', editor.handle).then(off => { if (gone) off(); else offEditor = off; });
   onCleanup(() => { gone = true; offEditor?.(); editor.dispose(); });
