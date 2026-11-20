@@ -1,4 +1,4 @@
-//! MIDI files through the shared actions, as the app and `wave --project FILE midi …` use them:
+//! MIDI files through the shared actions, as the app and `synkopa --project FILE midi …` use them:
 //! inspect, import (new pattern, drums as library samplers, tempo, into a channel), export of
 //! the song and of a pattern, and an import → export round trip that keeps every note.
 
@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 use wave_cli::Files as _;
 use wave_engine::midi_file::{self, OutTrack, SmfNote, DRUM_CHANNEL};
+use wave_engine::{Note, Pattern};
 
 use crate::headless::Files;
 
@@ -63,7 +64,7 @@ fn inspect_lists_parts_with_what_each_becomes() {
     assert_eq!(parts.len(), 3);
     assert_eq!(parts[0]["name"], "Bass");
     assert_eq!(parts[0]["gmName"], "Fingered Bass");
-    assert_eq!(parts[0]["becomes"], json!({ "kind": "synth", "preset": "Bas Analog" }));
+    assert_eq!(parts[0]["becomes"], json!({ "kind": "synth", "preset": "Warm Bass" }));
     assert_eq!(parts[2]["drums"], true);
     assert_eq!(parts[2]["channel"], 10);
     let drums: Vec<&str> = parts[2]["becomes"]["drums"].as_array().unwrap().iter().map(|x| x["name"].as_str().unwrap()).collect();
@@ -109,7 +110,7 @@ fn import_makes_one_pattern_with_drum_samplers_and_round_trips_through_export() 
         assert_eq!(g.1.vel, w.1.vel);
         assert!((g.1.start - w.1.start).abs() < 1e-3 && (g.1.len - w.1.len).abs() < 1e-3, "{g:?} vs {w:?}");
     }
-    // programs survive: the bass synth and the piano (synth piano or WAVE Keys)
+    // programs survive: the bass synth and the piano (synth piano or Synkopa Keys)
     let programs: Vec<Option<u8>> = back.parts.iter().filter(|p| p.channel != DRUM_CHANNEL).map(|p| p.program).collect();
     assert!(programs.contains(&Some(38)), "{programs:?}");
 
@@ -164,4 +165,55 @@ fn bad_files_and_empty_choices_are_errors_and_change_nothing() {
     assert!(!doc.dirty());
     assert!(doc.call("midi_export", &json!({ "out": d.join("e.mid") }), None).unwrap_err().contains("no notes"));
     std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn slide_notes_are_left_out_of_a_midi_file() {
+    let held = Note::new(1, 0.0, 8.0, Some(36));
+    let slide = Note { slide: true, ..Note::new(1, 4.0, 2.0, Some(48)) };
+    let pat = Pattern { id: 1, name: "P".into(), color: "#fff".into(), len: 4.0, min_len: 4.0, notes: vec![held, slide], swing: 0.0 };
+    let mut out = vec![];
+    super::clip_notes(&wave_engine::Clip { len: 4.0, ..super::placeholder_clip(1) }, &pat, &mut out);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].2, Some(36));
+}
+
+#[test]
+fn the_cli_writes_and_lists_slide_notes_and_refuses_a_sliding_trigger() {
+    let d = tmp("slidecli");
+    let doc = Files.create("sketch").unwrap();
+    let chans = call(&*doc, "channels", json!({}));
+    let ch = chans.as_array().unwrap()[0]["id"].as_u64().unwrap();
+    let r = call(
+        &*doc,
+        "pattern",
+        json!({ "id": 1, "ch": ch, "notes": [{ "step": 0, "len": 8, "p": 36 }, { "step": 4, "len": 2, "p": 48, "slide": true }] }),
+    );
+    // the reply lists the row's notes, the slide marked
+    let text = serde_json::to_string(&r).unwrap();
+    assert!(text.contains("\"slide\":true"), "{text}");
+    let e = doc
+        .call("pattern", &json!({ "id": 1, "ch": ch, "notes": [{ "step": 0, "len": 1, "p": 36, "trig": true, "slide": true }] }), None)
+        .unwrap_err();
+    assert!(e.contains("cannot be a trigger"), "{e}");
+    // the exported file has the held note only
+    let out = d.join("s.mid");
+    call(&*doc, "midi_export", json!({ "out": out, "pattern": 1 }));
+    let f = midi_file::parse(&std::fs::read(&out).unwrap()).unwrap();
+    assert!(f.parts.iter().flat_map(|p| &p.notes).all(|n| n.key != 48));
+    std::fs::remove_dir_all(&d).ok();
+}
+
+#[test]
+fn a_channel_joins_and_leaves_a_filter_group_from_the_cli() {
+    let doc = Files.create("sketch").unwrap();
+    let chans = call(&*doc, "channels", json!({}));
+    let ch = chans.as_array().unwrap()[0]["id"].as_u64().unwrap();
+    let r = call(&*doc, "channels", json!({ "ch": ch, "group": " Drums " }));
+    let row = r["channels"].as_array().unwrap().iter().find(|c| c["id"] == ch).unwrap().clone();
+    assert_eq!(row["group"], "Drums");
+    let r = call(&*doc, "channels", json!({ "ch": ch, "group": "" }));
+    let row = r["channels"].as_array().unwrap().iter().find(|c| c["id"] == ch).unwrap().clone();
+    assert_eq!(row["group"], Value::Null);
+    assert!(doc.call("channels", &json!({ "ch": ch, "group": "x".repeat(41) }), None).unwrap_err().contains("40 characters"));
 }

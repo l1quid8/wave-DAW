@@ -1,4 +1,4 @@
-// "Import MIDI": the parts of a .mid file (track × channel) with what each becomes in WAVE,
+// "Import MIDI": the parts of a .mid file (track × channel) with what each becomes in Synkopa,
 // chosen with checkboxes; optionally the file's tempo. Imports as one new pattern on the
 // Playlist, or — opened from a channel — one part's notes into that channel. One undo step.
 import { createEffect, createSignal, For, on, Show } from 'solid-js';
@@ -47,7 +47,7 @@ export function MidiImport() {
     const b = p.becomes;
     if (into()) return t('d.midi.intoCh', { name: S.project.channels?.find(c => c.id === into()!.ch)?.name ?? '?' });
     if (b.kind === 'drums') return t('d.midi.drums', { list: b.drums.map(d => d.name).join(', ') });
-    if (b.kind === 'keys') return 'WAVE Keys';
+    if (b.kind === 'keys') return 'Synkopa Keys';
     return tName(b.preset);
   };
   const fileName = () => (U.midiWin?.path.split(/[\\/]/).pop() ?? '');
@@ -78,7 +78,7 @@ export function MidiImport() {
     <Show when={U.midiWin}>
       <div class="overlay" onPointerDown={close}>
         <div class="dialog mididlg" role="dialog" aria-modal="true" aria-label={t('d.midi.title', { name: fileName() })} onPointerDown={e => e.stopPropagation()}
-          onKeyDown={e => { if (e.key === 'Enter' && !e.repeat && (e.target as HTMLElement).tagName !== 'BUTTON') { e.preventDefault(); void run(); } }} data-midi-dialog>
+          onKeyDown={e => { if (e.key !== 'Escape') e.stopPropagation(); if (e.key === 'Enter' && !e.repeat && (e.target as HTMLElement).tagName !== 'BUTTON') { e.preventDefault(); void run(); } }} data-midi-dialog>
           <div class="hd">
             <span title={U.midiWin?.path}>{into() ? t('d.midi.titleInto', { name: fileName() }) : t('d.midi.title', { name: fileName() })}</span>
             <button onClick={close} aria-label={t('d.midi.cancel')}>×</button>

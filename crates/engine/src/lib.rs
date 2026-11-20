@@ -1,4 +1,4 @@
-//! `wave-engine` — everything WAVE does with sound, independent of any window or device.
+//! `wave-engine` — everything Synkopa does with sound, independent of any window or device.
 
 pub mod autovocal;
 pub mod catalog;
@@ -11,28 +11,34 @@ pub mod melody;
 pub mod midi;
 pub mod model;
 pub mod music;
+pub mod note_track;
 pub mod ops;
 pub mod pitch;
+pub mod plug;
 pub mod poly;
+pub mod pool;
 pub mod processor;
 pub mod reference;
 pub mod rider;
+pub mod routing;
 pub mod singer;
 pub mod transform;
 
 pub use model::*;
 pub use ops::{Dirty, Op, OpError};
-pub use processor::{BandParams, FxData, ParamBlock, ProcessCtx, Processor, MAX_PARAMS};
+pub use processor::{BandParams, FxData, InstEvent, InstMsg, Instrument, ParamBlock, ProcessCtx, Processor, MAX_INST_EVENTS, MAX_PARAMS};
 pub mod analysis;
 pub mod denoise;
 pub mod dsp;
 pub mod engine;
+pub mod errors;
 pub mod keys;
 pub mod midi_file;
 pub mod pitch_api;
 mod project_zip;
 pub mod relink;
 pub mod rt;
+pub mod slices;
 pub mod sources;
 pub mod synth;
 pub mod telemetry;
@@ -41,7 +47,9 @@ pub mod tune_render;
 pub mod vocal;
 
 pub use engine::{
-    Engine, EngineError, MadeUnique, NoPlugins, PluginFactory, Relink, RelinkSearch, Relinked, RenderProgress, RenderTail, StateDto,
-    TransportDto,
+    pattern_project, Engine, EngineError, InPlace, MadeUnique, NoPlugins, PlacedStems, PluginFactory, Relink, RelinkSearch, Relinked,
+    RenderProgress, RenderTail, StateDto, StemFile, StemRegion, TransportDto, IN_PLACE_MAX_TAIL_S, STEMS_MAX_S,
 };
 pub use rt::Rt;
+/// The audio file extensions this build decodes: one list for the library, dialogs and relink.
+pub use wave_audio_file::AUDIO_EXTENSIONS;

@@ -36,7 +36,7 @@ not exist (GTSinger segments with one index but different lyrics) are listed as 
 ## Environment and data
 
 * Windows 11, Intel Core i5-12400F (6 cores), 32 GB; Rust 1.99.0; release build.
-* Detector: RMVPE (`rmvpe.onnx`, SHA-256 `5370e71a…660fd`, the model WAVE installs), on CPU.
+* Detector: RMVPE (`rmvpe.onnx`, SHA-256 `5370e71a…660fd`, the model Synkopa installs), on CPU.
 * **Annotated VocalSet** — Zenodo 7061507 (annotations) + 1442513 (`VocalSet11.zip` audio),
   CC BY 4.0; 20 professional singers, hand-checked F0 and note boundaries. 30 recordings
   (spread over singers/techniques) for the controlled cases, 30 cross-singer pairs, 15
@@ -49,7 +49,7 @@ not exist (GTSinger segments with one index but different lyrics) are listed as 
 * **MedleyDB** — the full dataset needs an access request; the open **MedleyDB_Sample**
   (Zenodo 1438309, CC BY-SA 4.0) has one song with an annotated lead vocal
   (`LizNelson_Rainfall`, stems 02/03 are backing vocals). 12 phrases of 3–12 s.
-* Injected errors are made with WAVE's own PSOLA on the real recording; truth is the dataset's
+* Injected errors are made with Synkopa's own PSOLA on the real recording; truth is the dataset's
   annotation (VocalSet, MedleyDB) or the unmodified recording (GTSinger).
 
 ## Commands
@@ -182,3 +182,130 @@ both methods except tune-ref with backing-vocal references (1.0 %).
   toward A440 in these runs.
 * Injected errors are constant per note (plus a drift group); real intonation errors also
   include scoops and wavering that these cases do not model.
+
+---
+
+# Sung note transcription — the pitch editor's notes and *Copy notes* (issue #76)
+
+Measured 2026-11-15, RMVPE, same machine as above. Every number comes from the JSON reports of
+the commands below.
+
+## What is measured
+
+Note-level accuracy as in mir_eval.transcription / MIREX note tracking: a detected note matches
+an annotated one when its onset is within 50 ms and its pitch within 50 cents (**COnP**); **COnPOff**
+also needs the offset within max(50 ms, 20 % of the note); **COn** is onsets only. Notes are
+paired by a maximum bipartite matching; the F1 is reported. Error kinds are counted apart:
+annotated notes split into several (`frag` = extra pieces), several annotated notes in one
+(`merged`), annotated notes without a note (`missed`), notes over silence/transitions (`spur`)
+and wrong keys (`wrongP`). What is scored is what the user gets: **pasted** = *Copy notes* as
+it pastes now (sung timing, semitone keys, monophonic); **grid 1/16** = the earlier paste
+(1/16 grid at 120 BPM).
+
+* **Annotated VocalSet** (282 exercises after leaving out 6 takes whose note annotation is
+  1.2–1.5 s off the audio and 12 whose fast runs are annotated only at their ends). Pitch truth
+  is the median of the hand-checked F0 of each note — the score column is often a semitone off
+  what was sung. VocalSet annotates the glide between legato notes as a separate *Transition*
+  and starts the next note where the pitch has **settled**; the change a listener hears (and
+  where a Piano roll note belongs) is during the glide, so scores are given both ways:
+  **mid** = a legato note starts at the middle of its annotated transition, **settled** = the
+  annotation as published.
+* **GTSinger** English subset, plain singing (Control_Group, 184 segments of real songs with
+  aligned score notes: repeated notes on new syllables, melismas, slides). The technique groups
+  (vibrato/glissando) ornament the written note, so they are reported apart only.
+* **Held out**: the parameters were chosen on VocalSet's training singers and GTSinger's
+  Alto-1/Tenor-1 (`--maximin`: the best *worse* of the two datasets' COnP); the rows below are
+  VocalSet's test singers (female2/8, male3/5/10) and GTSinger's Alto-2, never used for tuning.
+
+## Commands
+
+```sh
+B="cargo run --release -p wave-tune-bench --"
+$B transcribe-grid --maximin --root D:/wave-datasets/vocalset --limit 300 \
+   --gtsinger D:/wave-datasets/gtsinger --glimit 185 --json final.json --dump dump/
+# the tuning sweep that chose the defaults (`TrackParams::default`):
+$B transcribe-grid --maximin … --sigmas 0.6,0.8,1.0,1.2 --switches 4,6,8,12 --smooths 0.15,0.2,0.25 \
+   --glides 45,60 --mins 0.05,0.08 --onsets 0,6,9,12 --glide-notes 0.12,0.16 --steadies 0.05,0.07 \
+   --arrives 0.5,0.7 --snaps 0,2,3
+$B transcribe --root D:/wave-datasets/vocalset --limit 80 --basic-pitch nmp.onnx   # Basic Pitch baseline
+cargo test --release -p wave-engine note_track_speed -- --ignored --nocapture       # cost
+```
+
+## Results (held-out singers)
+
+Before = the earlier segmenter and paste (1/16 grid); after = the note tracker and the new paste.
+
+| data | | COn | COnP | COnPOff | notes / annotated | extra pieces | merged | wrong key |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| VocalSet test, mid | before | 0.398 | 0.305 | 0.142 | 1776 / 687 | 1010 | 16 | 120 |
+| | **after** | **0.671** | **0.570** | **0.419** | 984 / 687 | 290 | 13 | 59 |
+| VocalSet test, settled | before | 0.286 | 0.221 | 0.091 | 1776 / 687 | 957 | 7 | 109 |
+| | after | 0.257 | 0.194 | 0.123 | 984 / 687 | 268 | 13 | 57 |
+| GTSinger songs (Alto-2) | before | 0.433 | 0.296 | 0.147 | 793 / 647 | 221 | 62 | 72 |
+| | **after** | **0.471** | **0.384** | **0.236** | 753 / 647 | 164 | 53 | 62 |
+| GTSinger technique groups | before (pasted) | 0.418 | 0.280 | 0.145 | 1886 / 1104 | 867 | 79 | 154 |
+| | after | 0.497 | 0.393 | 0.228 | 1294 / 1104 | 307 | 96 | 164 |
+
+Notes per sung note by VocalSet technique (all 282 takes), before → after: vibrato 6.0 → 1.56,
+slow piano 4.1 → 1.38, messa di voce 17.9 → 2.78, long forte 16.2 → 2.92, trill 23.2 → 6.06,
+trillo 10.9 → 3.71, straight 1.4 → 1.20, belt 2.3 → 1.27, fast forte 1.7 → 0.95, fast piano
+1.5 → 0.99.
+
+**Basic Pitch** (Spotify `nmp.onnx`, icassp_2022, library-default decoding, made monophonic),
+80 VocalSet takes, settled onsets, notes as detected: COn 0.188, COnP 0.133, COnPOff 0.059 —
+below the earlier segmenter on the same takes (0.217 / 0.171 / 0.074). It also splits sustained
+sung notes; its paper notes sung pitch "fluctuation around a center pitch" makes singing hard.
+
+**Cost**: a minute of singing takes 1.8 ms of note tracking and 49 ms of spectral onset strength
+(release, i5-12400F) — under 1 % of the RMVPE analysis it runs with.
+
+## What this shows
+
+* Vibrato, drift, scoops and slides no longer become notes: on held-out exercises the notes per
+  sung note fall from 2.6 to 1.4 and twice as many notes are placed right (COnP 0.31 → 0.57,
+  transition-middle onsets). On real songs COnP rises 0.30 → 0.38 and COnPOff 0.15 → 0.24.
+* Against VocalSet's *settled* onsets the onset-only scores do not improve (COnP 0.22 → 0.19):
+  the tracker starts a legato note during its glide (that is where the change is heard, and
+  where GTSinger's song annotations put it); VocalSet starts it after the glide. Offsets and
+  full-note scores still improve there (COnPOff 0.09 → 0.12).
+* The 1/16 grid itself cost accuracy (it moves notes up to half a step and collapsed quick
+  ones), so *Copy notes* now keeps the sung timing.
+
+## Effect on Tune to Reference and the agent workflow
+
+Both work on the editor's notes, so they were run again (same commands as above, `--limit 30 /
+16 / 12`) against a build of `main` before this change. Failed criteria, before → after:
+VocalSet **54 → 49**, GTSinger **36 → 34**, MedleyDB **7 → 8**. Vibrato is kept far better
+(vibrato-depth change passes in 6 more suites: a note now holds its whole vibrato, so a
+correction moves the centre instead of flattening the swings) and the planner corrects more of
+the injected slips (introduced-error reduction passes in 3 more suites).
+
+Two things changed with it:
+* `pitch compare` called a reference related on as little as one matched note (an unrelated
+  exercise with one coincidental note was "the same melody" once its fragments were gone). It
+  now needs at least 3 confidently matched notes, 55 % of them agreeing (was 50 %): on these
+  suites no unrelated reference or harmony part is taken for the melody (4 of 33 were at 50 %),
+  and 110 of 141 related references are (117). Refusing changes nothing; accepting a wrong one
+  edits the take.
+* The agent suites' *note onset drift* check re-segments the render to see that timing was
+  kept; it now uses the plain splitter, because the note tracker places a legato change along
+  its glide, which a pitch correction legitimately reshapes.
+
+Still failing after (not before): MedleyDB Tune to Reference with a **harmony** part as the
+reference reports one octave error and 1.28 % voicing changes (limit 1 %). Tune to Reference
+at 100 % follows whatever it is given; before and after it pulls the lead onto the harmony in
+most of those cases (frame error ~2 → 230–510 ct before, the same class after), one note now
+by more than 6 semitones. Vibrato-depth change fails in two suites that passed (GTSinger agent
+with a glissando reference, MedleyDB Tune to Reference on slips: P90 17 ct, limit 15).
+
+## Limitations
+
+* Trills are transcribed as the two notes they alternate between (VocalSet annotates a trill as
+  one note); long notes sung with a crescendo or a drift of about a semitone (messa di voce,
+  long forte) still split, 2.8–2.9 notes per annotated note.
+* A half-step ornament shorter than about 150 ms (a whole-step one shorter than 90 ms) stays in
+  its note: at that length it is indistinguishable from a vibrato swing. Split it in the editor.
+* Onsets are 50 ms-tolerance hard: COn on songs is 0.47. A learned onset model (as in
+  MIR-ST500 / ROSVOT systems) would be the next step and is not part of this change.
+* MIR-ST500 was not run: its audio is links to commercial recordings (mixes needing vocal
+  separation).

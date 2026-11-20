@@ -19,7 +19,7 @@ export interface Track {
 }
 
 /** `plugin`: a hosted VST3 or LV2 effect (`Fx.plugin.format`); projects from before LV2 said `vst3`, which the engine reads as `plugin`. */
-export type FxKind = 'eq' | 'comp' | 'sat' | 'delay' | 'reverb' | 'limit' | 'fet' | 'deess' | 'tune' | 'denoise' | 'voice' | 'rider' | 'half' | 'warp' | 'chorus' | 'phaser' | 'plugin';
+export type FxKind = 'eq' | 'comp' | 'sat' | 'delay' | 'reverb' | 'limit' | 'fet' | 'deess' | 'tune' | 'denoise' | 'voice' | 'rider' | 'half' | 'warp' | 'chorus' | 'phaser' | 'stereo' | 'multiband' | 'analyzer' | 'plugin';
 /** Built-in kinds the effect picker lists (the views keep a label and blurb per kind). */
 export type BuiltinKind = Exclude<FxKind, 'plugin'>;
 /** Every built-in kind, including ones the picker does not list yet ('rider': added by "Auto wokal"). */
@@ -69,7 +69,13 @@ export interface Insert {
   width?: number;
   muted: boolean; solo: boolean;
   fx: Fx[];
+  /** Post-fader sends to other inserts (FL's mixer routing; absent = none). See lib/routing.ts. */
+  sends?: InsertSend[];
+  /** The output also goes to the master (absent = true). False: only where it sends. */
+  master?: boolean;
 }
+/** One send of an insert: the insert it feeds, and the level (linear 0..2). */
+export interface InsertSend { to: Id; gain: number }
 
 /** MIDI key at which a sampler plays its sample unpitched (C5 in FL Studio's naming, C4 here). */
 export const SAMPLE_ROOT = 60;
@@ -81,7 +87,7 @@ export const SAMPLE_ROOT = 60;
  */
 export interface SynthState { preset: string | null; params: Record<string, number> }
 /**
- * WAVE Keys (the sampled grand piano): `release` = how long a note rings after its key is let
+ * Synkopa Keys (the sampled grand piano): `release` = how long a note rings after its key is let
  * go, in ms; `dynamics` 0..100 % = how much the velocity changes the level (the timbre always
  * follows the velocity). Mirrors crates/engine/src/keys.rs.
  */
@@ -101,17 +107,37 @@ export interface KeysStatus { state: 'idle' | 'missing' | 'loading' | 'ready' | 
  */
 export interface SamplerState {
   start: number; end: number; reverse: boolean; norm: boolean; semi: number; fine: number;
-  gate: boolean; attack: number; decay: number; sustain: number; release: number; cut: number;
+  /**
+   * The volume envelope (FL Studio's Channel settings ▸ Volume): `env` switches it on. Off, the sample plays as
+   * recorded. On, notes are shaped by delay → attack → hold → decay to `sustain` (0..1) and fade over `release`
+   * from their note-off; times in ms, tensions −1..1 bend the attack, decay and release (0 = straight).
+   */
+  env: boolean; delay: number; attack: number; hold: number; decay: number; sustain: number; release: number;
+  attackTension: number; decayTension: number; releaseTension: number;
+  cut: number;
   fadeInMs?: number; fadeOutMs?: number;
 }
 export const SAMPLER = {
   semi: { min: -24, max: 24 }, fine: { min: -100, max: 100 },
-  attack: { min: 0, max: 2000 }, decay: { min: 0, max: 5000 }, release: { min: 1, max: 5000, def: 20 },
+  delay: { min: 0, max: 5000 }, attack: { min: 0, max: 2000 }, hold: { min: 0, max: 5000 }, decay: { min: 0, max: 5000 },
+  release: { min: 1, max: 5000, def: 20 },
   fadeMaxMs: 5000, cutGroups: 8, minSpan: 0.001,
 } as const;
-export const samplerDefault = (): SamplerState => ({ start: 0, end: 1, reverse: false, norm: false, semi: 0, fine: 0, gate: false, attack: 0, decay: 0, sustain: 1, release: SAMPLER.release.def, cut: 0, fadeInMs: 0, fadeOutMs: 0 });
-/** What a channel plays: a sample of a project source (the sampler), the built-in synth, or WAVE Keys. */
-export type ChannelSrc = { kind: 'sample'; source: Id; sampler: SamplerState } | { kind: 'synth'; synth: SynthState } | { kind: 'keys'; keys: KeysState };
+export const samplerDefault = (): SamplerState => ({
+  start: 0, end: 1, reverse: false, norm: false, semi: 0, fine: 0,
+  env: false, delay: 0, attack: 0, hold: 0, decay: 0, sustain: 1, release: SAMPLER.release.def,
+  attackTension: 0, decayTension: 0, releaseTension: 0, cut: 0, fadeInMs: 0, fadeOutMs: 0,
+});
+/**
+ * What a channel plays: a sample of a project source (the sampler), the built-in synth, Synkopa Keys, or a hosted
+ * VST3 instrument (`plugin`; its sound, parameters and editor are the plugin's, `state` is saved with the project).
+ */
+export type ChannelSrc =
+  /** `slices`: slice mode, where each slice starts (increasing fractions of the file); absent = off. */
+  | { kind: 'sample'; source: Id; sampler: SamplerState; slices?: number[] }
+  | { kind: 'synth'; synth: SynthState }
+  | { kind: 'keys'; keys: KeysState }
+  | { kind: 'plugin'; plugin: PluginRef };
 /**
  * A Channel Rack row, global to the project (every pattern can have notes for it).
  * `vol` fader position (0.7937 = 0 dB), `pan` −1..1, `insert` null = the clip's track insert,
@@ -120,13 +146,18 @@ export type ChannelSrc = { kind: 'sample'; source: Id; sampler: SamplerState } |
 export type Channel = {
   id: Id; name: string; color: string;
   vol: number; pan: number; mute: boolean; solo: boolean; insert: Id | null; root: number;
+  /** The Channel Rack filter group (FL's filter groups); absent = unsorted. */
+  group?: string;
 } & ChannelSrc;
 /**
  * A pattern note: channel `ch`, `step`/`len` in 16ths, `p` MIDI key (absent = the channel's root),
  * `v` velocity 0..1 (absent = 1).
  */
 /** `trig` is true for a step trigger, false for a held note, absent on legacy notes. */
-export interface Note { ch: Id; step: number; len: number; p?: number; v?: number; trig?: boolean }
+/** `pan`: the note's own pan, -1..1, added to its channel's (absent = 0). Sampler and Synkopa Keys channels play it. */
+/** `slide`: an FL slide note. It starts no sound; the channel's sounding notes glide by the distance
+ * from the highest of them to its key, over its length (sampler, Keys and Synth channels; plugins ignore it). */
+export interface Note { ch: Id; step: number; len: number; p?: number; v?: number; pan?: number; trig?: boolean; slide?: boolean }
 /** `len` in beats; `swing` 0..1 (absent = 0). Notes at or past `len` are kept but hidden and silent. */
 /**
  * `len` (beats) is derived by the engine: the end of the last note rounded up to a bar, at least
@@ -168,6 +199,12 @@ export interface Clip {
   /** Audio clips: transposition in semitones (cents as the fraction), ±`CLIP_PITCH`; the length stays.
    *  Rendered offline with the stretch, in the background (absent = 0). */
   pitch?: number;
+  /** Audio clips: the mixer insert this clip plays into, past its track (the editor sets it for every
+   *  clip of the sample, like FL's audio clip channel). Absent/null = the track's insert. */
+  insert?: Id | null;
+  /** Audio clips: the MIDI key at which the sample sounds at its own pitch (FL's root note; shared by every clip of
+   *  the sample). The sample editor's keyboard plays it transposed from here; absent = `SAMPLE_ROOT` (C5). */
+  root?: number;
 }
 /** Range of `Clip.stretch`. */
 export const STRETCH_MIN = 0.25;
@@ -228,12 +265,24 @@ export interface F0ModelStatus {
 /** An update found on GitHub Releases (`update_check`). `notes`: the release notes (Markdown), `date`: `YYYY-MM-DD`. */
 export interface UpdateInfo { version: string; notes: string | null; date: string | null }
 /** `app_info`: the running version, the version whose notes were last shown (null on a fresh install), the auto-check switch. */
-/** `pluginEditors`: VST3 plugins can open their own editor windows (Windows and macOS; LV2 plugins never do yet). */
-/** `updates`: this build has an update channel (false on macOS, which is built from source for now). */
-export interface AppInfo { version: string; seenVersion: string | null; autoUpdate: boolean; pluginEditors: boolean; updates: boolean }
+/** `pluginEditors`: plugins can open their own windows in this session (Windows, macOS; Linux with an X11 display or XWayland);
+ *  `pluginEditorsWhy`: why not, when they cannot. */
+export interface AppInfo { version: string; seenVersion: string | null; autoUpdate: boolean; pluginEditors: boolean; pluginEditorsWhy?: string }
 export interface UpdateProgress { done: number; total: number }
 export interface ModelProgress { id: string; done: number; total: number; error?: string }
 
+/** The stems HTDemucs separates, in its order. */
+export type StemId = 'drums' | 'bass' | 'other' | 'vocals';
+/** `stems_model_status`: the stem separation model (downloaded on first use). */
+export interface StemModelStatus {
+  id: string; name: string; bytes: number; installed: boolean;
+  licenseNote: string; licenseUrl: string; path: string; stems: StemId[];
+}
+/** `stems-progress` while `extractStems` runs: `prepare` (copying/resampling the region), `load` (the model),
+ *  `separate` (`frac` 0..1, once per 5.85 s of audio), `place` (the stems go into the playlist). */
+export interface StemsProgress { clipId: Id; stage: 'prepare' | 'load' | 'separate' | 'place'; frac: number }
+/** What `extractStems` made: one source, track and clip per stem in the model's order; `track` = the first new track. */
+export interface ExtractStemsResult { sourceIds: Id[]; clipIds: Id[]; track: number; mutedClip: Id; revision: number }
 export interface TempoCandidate { bpm: number; score: number }
 export interface TempoEstimate { bpm: number; confidence: number; candidates: TempoCandidate[]; firstBeat: number }
 export interface KeyCandidate { root: number; minor: boolean; score: number }
@@ -307,7 +356,7 @@ export type AutoTarget =
   | { kind: 'chanPan'; id: Id }
   /** A synth channel's parameter (`Catalog.synth` id). */
   | { kind: 'synth'; chanId: Id; param: string }
-  /** A WAVE Keys channel's release (ms, log) or dynamics (%). */
+  /** A Synkopa Keys channel's release (ms, log) or dynamics (%). */
   | { kind: 'keys'; chanId: Id; param: 'release' | 'dynamics' }
   /** A hosted plugin parameter (`paramId` as `pluginParams` reports it: VST3 id, LV2 port index); values are normalized 0..1. */
   | { kind: 'plugin'; fxId: Id; paramId: number }
@@ -348,7 +397,15 @@ export type TransformVerb =
   | { kind: 'euclidFill'; ch: Id; k: number; n: number; rotate?: number; vel?: number }
   | { kind: 'strum'; width?: number; ramp?: number }
   | { kind: 'euclidDrums'; voices: { ch: Id; k: number; n: number; rotate?: number; vel?: number }[]; bars?: number }
-  | { kind: 'melody'; ch: Id; bars?: number; density?: number; repeat?: number };
+  | { kind: 'melody'; ch: Id; bars?: number; density?: number; repeat?: number }
+  | { kind: 'chord'; harmony?: string }
+  | { kind: 'progression'; ch: Id; bars?: number; template?: string; voiceLead?: boolean; degrees?: number[] }
+  /** FL's chop: held notes cut into pieces `len` steps long (≥ 0.25). */
+  | { kind: 'chop'; len?: number }
+  /** FL's glue: touching / overlapping held notes of one channel and key become one. */
+  | { kind: 'glue' }
+  /** FL's arpeggiator: each chord (notes starting together, per channel) becomes a run of its keys. */
+  | { kind: 'arpeggiate'; mode?: 'up' | 'down' | 'upDown' | 'random'; rate?: number; gate?: number; octaves?: number };
 /** Which notes a `transformNotes` verb touches. */
 export type TransformSelect =
   | { kind: 'indices'; indices: number[] }
@@ -387,10 +444,18 @@ export type Op =
 
 export interface TransportDto {
   playing: boolean; rec: boolean; monitor: boolean; metro: boolean; countIn: boolean; startBeat: number;
+  /** The recording filter (right-click on Record): the input's audio becomes takes; keyboard notes a pattern. One stays on. */
+  recAudio: boolean; recNotes: boolean;
+  /** Input quantize of recorded notes: starts snap to multiples of this many beats (0 = as played). */
+  recQuantize: number;
 }
 
 export interface StateDto {
   project: Project; revision: number; canUndo: boolean; canRedo: boolean;
+  /** What the step Ctrl+Z would take back was called ("Move clips", a script's `--label`). */
+  undoLabel?: string | null;
+  /** Same for the step Ctrl+Shift+Z would redo. */
+  redoLabel?: string | null;
   transport: TransportDto; path: string | null; dirty: boolean;
   /** Comp id (as a string key) → take played instead of the comp. Live only, not undone. */
   audition?: Record<string, Id>;
@@ -412,7 +477,11 @@ export interface Preset { name: string; params: Record<string, number>; bands?: 
 export interface SynthSection { id: string; name: string; params: ParamDef[] }
 /** A factory synth preset: `params` is the complete parameter set (every id). */
 export interface SynthPreset { name: string; category: string; params: Record<string, number> }
-export interface SynthCatalog { sections: SynthSection[]; categories: string[]; presets: SynthPreset[] }
+export interface SynthCatalog {
+  sections: SynthSection[]; categories: string[]; presets: SynthPreset[];
+  /** One cycle of every frame of every oscillator wave, `[wave][frame][point]` (peak 1): what the panel draws. */
+  waves: number[][][];
+}
 export interface Catalog {
   types: Partial<Record<FxKind, TypeDef>>;
   presets: Partial<Record<FxKind, Preset[]>>;
@@ -477,6 +546,8 @@ export interface MidiStatus {
   noteCount: number;
   /** Channel (instrument) the keyboard plays; null = the first pitched channel. */
   target: Id | null;
+  /** Every key plays at this velocity (1..127); null = the keyboard's own velocity. */
+  fixedVelocity: number | null;
 }
 /** Event `midi-note`: one key down/up as it happens. */
 export interface MidiNoteEvent { note: MidiLastNote; count: number }
@@ -485,11 +556,17 @@ export interface Kit { id: string; name: string; description: string; bytes: num
 export interface LibraryList { kits: Kit[]; folders: string[] }
 /** `root`: the MIDI key at which the file sounds at its own pitch, when the library knows it; `pitched`: it plays a note there (drums and noises do not). */
 export interface LibFile { name: string; path: string; group: string; root?: number; pitched?: boolean }
+/** A library listing: the files, and whether a bigger folder was cut off at the walk's cap. */
+export interface LibraryFiles { files: LibFile[]; truncated: boolean }
 export interface LibraryProgress { id: string; done: number; total: number; error?: string }
 
 /** `wavBits`: 16 or 24 = signed PCM, 32 = float (default); `dither` (TPDF, ±1 LSB) only for PCM. */
 export interface WavExportOptions { wavBits?: 16 | 24 | 32; dither?: boolean; wrapTail?: boolean }
-export interface ExportRangeOptions { useLoop: boolean; tail: number; sampleRate: number }
+export interface ExportRangeOptions {
+  useLoop: boolean; tail: number; sampleRate: number;
+  /** Render this pattern alone, as PAT mode plays it (FL's pattern export), instead of the song. */
+  pattern?: Id | null;
+}
 export type ExportAudioOptions = ExportRangeOptions & (
   | ({ format?: 'wav' } & WavExportOptions)
   | { format: 'mp3'; mp3Kbps?: number }
@@ -535,10 +612,14 @@ export type OpenResult =
   | { cancelled?: false; state: StateDto; warnings: string[] };
 /** Result of `projectSave`; `{ cancelled: true }` when the save dialog was dismissed. */
 export type SaveResult = { cancelled: true } | { cancelled?: false; path: string };
-/** An unsaved project a WAVE that crashed or was killed left behind (`recovery_list`). */
-export interface RecoveredProject { id: string; savedMs: number }
+/** File → Open recent: a project opened or saved lately; `exists` false = moved or deleted since. */
+export interface RecentProject { path: string; name: string; dir: string; exists: boolean }
+/** An unsaved project a Synkopa that crashed or was killed left behind (`recovery_list`). */
+/** `project`: the file the unsaved changes belong to (absent: a project that was never saved). */
+export interface RecoveredProject { id: string; savedMs: number; project?: string }
 
-export interface ImportResult { sourceIds: Id[]; clipIds: Id[] }
+export interface ImportResult { sourceIds: Id[]; clipIds: Id[]; /** The files that did not load (the rest did). */
+  errors: { path: string; error: string }[] }
 
 /** One relink (`relinkSources`): `error` = why it was not done (the source is unchanged). */
 export interface Relinked { sourceId: Id; path: string; error: string | null; lengthDiffers: boolean }
@@ -553,7 +634,7 @@ export interface RelinkSearch {
   /** The search stopped at its limit before seeing the whole folder. */
   truncated: boolean;
 }
-/** What an imported MIDI part becomes: GM drums (one library sampler per drum), WAVE Keys or a synth preset. */
+/** What an imported MIDI part becomes: GM drums (one library sampler per drum), Synkopa Keys or a synth preset. */
 export type MidiBecomes =
   | { kind: 'drums'; drums: { key: number; name: string; notes: number }[] }
   | { kind: 'keys' }
@@ -581,8 +662,13 @@ export interface MidiExportResult { out: string; what: string; tracks: number; n
 
 /** One installed effect (`plugin_scan`). `unsupported`: why it cannot be used here (an LV2 host feature it needs). */
 export interface PluginInfo { format: PluginFormat; path: string; cid: string; name: string; vendor: string; category: string; unsupported?: string }
-/** `plugin_scan`: the effects, and per format why it is unavailable on this machine (LV2 without liblilv). */
-export interface PluginScan { plugins: PluginInfo[]; unavailable: Partial<Record<PluginFormat, string>> }
+/**
+ * `plugin_scan`: the effects, the VST3 instruments (Channel Rack), and per format why it is unavailable on this
+ * machine (LV2 without liblilv). `instruments` is absent from an older backend.
+ */
+export interface PluginScan { plugins: PluginInfo[]; instruments?: PluginInfo[]; unavailable: Partial<Record<PluginFormat, string>> }
+/** A plugin that was loaded when the last session ended without exiting: one of these may be why Synkopa died. */
+export interface PluginCrashSuspect { format: string; cid: string; name: string; path: string }
 /**
  * One parameter of a hosted plugin. `value`/`def` are normalized 0..1 (what `pluginSetParam` and automation take),
  * `display` the plugin's text for the value. LV2 adds the port's own range and kind: `real` within `min..max` in
@@ -599,3 +685,12 @@ export interface PluginParam {
 export interface PluginEditorEvent { fxId: Id; open: boolean; edited: boolean }
 
 export interface CliStatus { installed: boolean; command: string; path: string | null; note?: string | null }
+
+/** Marks an `fxErrors` entry of a plugin Synkopa's safety check refused (it crashed or hung in a worker process): the UI offers "Load anyway". */
+export const UNSAFE_PLUGIN = 'UNSAFE_PLUGIN: ';
+/** The plugin was refused by the safety check: the sentence without the marker, else null. */
+export function unsafeReason(err: string | undefined): string | null {
+  if (!err) return null;
+  const i = err.indexOf(UNSAFE_PLUGIN);
+  return i < 0 ? null : (err.slice(0, i) + err.slice(i + UNSAFE_PLUGIN.length)).trim();
+}

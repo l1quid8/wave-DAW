@@ -1,5 +1,8 @@
+import { defaultHomes, defaultSizes } from './dock';
 import { describe, expect, it } from 'vitest';
-import { isDefaultInsertName, planRoute, rangeSelect, restoreArrange, stripLabel, takeArrange, toggleSelect, type Arrange } from './mixer';
+import { freeInsert, isDefaultInsertName, planRoute, rangeSelect, restoreArrange, routeToFreeInsert, stripLabel, takeArrange, toggleSelect, type Arrange } from './mixer';
+import { emptyProject } from './factory';
+import type { Project } from '../api/types';
 
 describe('stripLabel', () => {
   it('shows the Master by name, without a number', () => {
@@ -71,8 +74,9 @@ describe('channel multi-selection', () => {
 
 describe('Mix view snapshot of the arrange layout', () => {
   const arrange = (): Arrange => ({
-    rackWin: { x: 10, y: 60, w: 700, h: 400, z: 3 }, rollWin: null, rackDock: false, rollDock: true, rackDockW: 0, rollDockH: 320,
-    rollMax: false, rackFloat: { x: 10, y: 60, w: 700, h: 400 }, rollFloat: null, plugsHidden: false, mixH: 260, mixMin: true, pickOpen: true, pickW: 240,
+    rackWin: { x: 10, y: 60, w: 700, h: 400, z: 3 }, rollWin: null,
+    dock: { left: [], right: [], bottom: [[{ id: 'roll', share: 1 }], [{ id: 'mix', share: 1 }]] }, paneSize: defaultSizes(), dockHome: defaultHomes(),
+    rollMax: false, rackFloat: { x: 10, y: 60, w: 700, h: 400 }, rollFloat: null, plugsHidden: false, mixMin: true, pickOpen: true, pickW: 240,
   });
   it('gives back exactly what was taken', () => {
     const u = arrange();
@@ -82,10 +86,12 @@ describe('Mix view snapshot of the arrange layout', () => {
   it('is detached from the live state (moving a window later does not change it)', () => {
     const u = arrange();
     const snap = takeArrange(u);
-    u.rackWin!.x = 500; u.mixH = 400; u.rollDock = false;
+    u.rackWin!.x = 500; u.paneSize.mix.h = 400; u.dock.bottom[0][0].share = 3; u.dock.bottom.shift();
     const back = restoreArrange(snap);
     expect(back.rackWin).toEqual({ x: 10, y: 60, w: 700, h: 400, z: 3 });
-    expect(back).toMatchObject({ mixH: 260, rollDock: true, mixMin: true });
+    expect(back).toMatchObject({ paneSize: { mix: { h: defaultSizes().mix.h } }, mixMin: true });
+    // the dock layout is copied deep: strips and shares too
+    expect(back.dock).toEqual(arrange().dock);
     // and the restore patch is a copy too: the snapshot can be restored again
     back.rackWin!.y = 0;
     expect(restoreArrange(snap).rackWin!.y).toBe(60);
@@ -93,5 +99,48 @@ describe('Mix view snapshot of the arrange layout', () => {
   it('holds only layout fields', () => {
     const snap = takeArrange({ ...arrange(), tool: 'paint', mixView: true } as Arrange);
     expect(Object.keys(snap).sort()).toEqual(Object.keys(arrange()).sort());
+  });
+});
+
+describe('route to a free insert (FL)', () => {
+  const proj = (): Project => {
+    const p = emptyProject();
+    // a fresh project: Kick, Clap, Hat, Snare on inserts 1-4; 5-8 free
+    return p;
+  };
+  it('picks the first insert without effects that nothing plays into, and names and colours it', () => {
+    const p = proj();
+    const ins = p.inserts;
+    expect(freeInsert(p)?.id).toBe(ins[5].id);
+    // an effect, a track or a send into it makes an insert taken
+    ins[5].fx.push({ id: 1, type: 'eq', params: {} } as never);
+    p.tracks[0].insert = ins[6].id;
+    ins[1].sends = [{ to: ins[7].id, gain: 1 }];
+    expect(freeInsert(p)?.id).toBe(ins[8].id);
+    const ch = p.channels![0];
+    const r = routeToFreeInsert(p, 'Vox', '#d9678f', () => 999, id => [{ op: 'putChannel', channel: { ...ch, insert: id } }]);
+    expect(r.created).toBe(false);
+    expect(r.insert).toMatchObject({ id: ins[8].id, name: 'Vox', color: '#d9678f' });
+    expect(r.ops).toHaveLength(2);
+  });
+  it('skips inserts the user muted, renamed, moved or automates', () => {
+    const p = proj();
+    const ins = p.inserts;
+    ins[5].muted = true;
+    ins[6].name = 'Vox bus';
+    ins[7].vol = 0;
+    p.automations = [{ id: 77, name: 'A', color: '#fff', target: { kind: 'insertVol', id: ins[8].id }, points: [] }];
+    // 1-4 play the starter kit and 5-8 are the user's now: none is free, so a new insert is made
+    expect(freeInsert(p)).toBeNull();
+    ins[5].muted = false;
+    expect(freeInsert(p)?.id).toBe(ins[5].id);
+  });
+  it('makes a new insert when every one is in use', () => {
+    const p = proj();
+    for (const m of p.inserts.slice(1)) m.fx.push({ id: m.id + 500, type: 'eq', params: {} } as never);
+    expect(freeInsert(p)).toBeNull();
+    const r = routeToFreeInsert(p, 'Bass', '#47b8a8', () => 4242, () => []);
+    expect(r.created).toBe(true);
+    expect(r.insert).toMatchObject({ id: 4242, name: 'Bass', color: '#47b8a8', fx: [] });
   });
 });

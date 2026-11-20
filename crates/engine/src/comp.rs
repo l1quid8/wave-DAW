@@ -221,6 +221,8 @@ pub fn land_takes(p: &mut Project, track: u32, passes: &[(Id, f64, f64)]) {
             stretch: 1.0,
             resample: false,
             pitch: 0.0,
+            insert: None,
+            root: crate::model::CLIP_ROOT,
         });
         return;
     }
@@ -263,6 +265,8 @@ pub fn land_takes(p: &mut Project, track: u32, passes: &[(Id, f64, f64)]) {
         stretch: 1.0,
         resample: false,
         pitch: 0.0,
+        insert: None,
+        root: crate::model::CLIP_ROOT,
     });
     p.comps.push(comp);
 }

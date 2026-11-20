@@ -27,7 +27,7 @@ use crate::urid;
 use crate::world::{self, Designation, Model, PortKind, World};
 
 /// Bytes of each atom port buffer (an empty input sequence; room for output events,
-/// which WAVE discards).
+/// which Synkopa discards).
 const ATOM_BYTES: usize = 8192;
 /// The subject URI of a saved state.
 const STATE_URI: &str = "urn:wave:lv2-state\0";
@@ -84,11 +84,33 @@ unsafe impl Send for StateTarget {}
 pub(crate) struct Shared {
     info: PluginInfo,
     model: Model,
-    /// Control input values (f32 bits) by port index; other ports' slots are unused.
+    /// Control port values (f32 bits) by port index: inputs as set, outputs as the plugin
+    /// last wrote them (meters, for its own interface); other ports' slots are unused.
     values: Vec<AtomicU32>,
     latency: AtomicU32,
     dirty: AtomicBool,
     target: Mutex<Option<StateTarget>>,
+    /// The plugin's own interface Synkopa can embed, or why none (looked up once).
+    ui: std::sync::OnceLock<Result<crate::ui::UiSpec, String>>,
+    ui_open: AtomicBool,
+    /// The running instance a UI may be given (`instance-access`), and what that UI holds.
+    access: Mutex<Access>,
+}
+
+/// `instance-access`: a UI (JUCE-built ones need it) gets the plugin instance's own handle
+/// and calls into it directly, so the instance must outlive the UI. Instances that stop
+/// running while such a UI is open (the effect removed, or re-created at a new sample
+/// rate) are parked here and freed only after the UI is cleaned up; `stale` tells the UI
+/// to close at its next tick.
+#[derive(Default)]
+pub(crate) struct Access {
+    /// The first running instance's `LV2_Handle` (0: none running).
+    handle: usize,
+    /// An open UI was handed `handle`.
+    lent: bool,
+    /// The lent instance is no longer running: the UI must close.
+    stale: bool,
+    parked: Vec<Unit>,
 }
 
 impl Shared {
@@ -108,7 +130,96 @@ impl Shared {
             latency: AtomicU32::new(0),
             dirty: AtomicBool::new(false),
             target: Mutex::new(None),
+            ui: std::sync::OnceLock::new(),
+            ui_open: AtomicBool::new(false),
+            access: Mutex::new(Access::default()),
         }
+    }
+
+    pub(crate) fn uri(&self) -> &str {
+        &self.model.uri
+    }
+
+    pub(crate) fn port_count(&self) -> usize {
+        self.model.ports.len()
+    }
+
+    /// Indices of the control ports (inputs and outputs).
+    pub(crate) fn control_ports(&self) -> impl Iterator<Item = usize> + '_ {
+        self.model
+            .ports
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| matches!(p.kind, PortKind::ControlIn { .. } | PortKind::ControlOut { .. }))
+            .map(|(i, _)| i)
+    }
+
+    pub(crate) fn port_value(&self, port: usize) -> f32 {
+        self.value(port)
+    }
+
+    /// The plugin's interface moved a control input (a plain value, in the port's range).
+    pub(crate) fn set_from_ui(&self, port: u32, v: f32) {
+        if let Some(PortKind::ControlIn { spec, .. }) = self.model.ports.get(port as usize).map(|p| &p.kind) {
+            if v.is_finite() {
+                self.values[port as usize].store(spec.snap(v).to_bits(), Ordering::Relaxed);
+                self.dirty.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    /// The embeddable interface (looked up on first use).
+    pub(crate) fn ui(&self) -> Result<crate::ui::UiSpec, String> {
+        self.ui.get_or_init(|| crate::ui::find(&self.model.uri)).clone()
+    }
+
+    pub(crate) fn set_ui_open(&self, open: bool) {
+        self.ui_open.store(open, Ordering::Release);
+    }
+
+    /// Lend the running instance's handle to a UI that is opening (`None`: none running).
+    pub(crate) fn lend_instance(&self) -> Option<usize> {
+        let mut a = self.access.lock();
+        if a.handle == 0 {
+            return None;
+        }
+        a.lent = true;
+        a.stale = false;
+        Some(a.handle)
+    }
+
+    /// The lent instance stopped running: the UI holding it must close.
+    pub(crate) fn lent_instance_stale(&self) -> bool {
+        let a = self.access.lock();
+        a.lent && a.stale
+    }
+
+    /// The UI that held the instance is cleaned up: free what was parked for it (here,
+    /// outside the lock).
+    pub(crate) fn return_instance(&self) {
+        let parked = {
+            let mut a = self.access.lock();
+            a.lent = false;
+            a.stale = false;
+            std::mem::take(&mut a.parked)
+        };
+        drop(parked);
+    }
+
+    /// `units` stop running: parked while a UI holds their instance, else freed.
+    fn retire(&self, units: Vec<Unit>) {
+        let freed = {
+            let mut a = self.access.lock();
+            a.handle = 0;
+            if a.lent && !units.is_empty() {
+                a.stale = true;
+                a.parked.extend(units);
+                Vec::new()
+            } else {
+                units
+            }
+        };
+        drop(freed);
     }
 
     fn port_by_symbol(&self, symbol: &str) -> Option<usize> {
@@ -171,6 +282,8 @@ struct Wiring {
     atom_in: Vec<usize>,
     atom_out: Vec<usize>,
     latency_out: Option<usize>,
+    /// Control outputs, published for the plugin's interface (meters).
+    control_out: Vec<usize>,
 }
 
 impl Wiring {
@@ -183,7 +296,12 @@ impl Wiring {
                 PortKind::AudioIn { .. } | PortKind::CvIn => w.silent_in.push(i),
                 PortKind::AudioOut => w.main_out.push(i),
                 PortKind::ControlIn { designation, .. } => w.controls.push((i, *designation)),
-                PortKind::ControlOut { latency: true } if w.latency_out.is_none() => w.latency_out = Some(i),
+                PortKind::ControlOut { latency } => {
+                    if *latency && w.latency_out.is_none() {
+                        w.latency_out = Some(i);
+                    }
+                    w.control_out.push(i);
+                }
                 PortKind::AtomIn => w.atom_in.push(i),
                 PortKind::AtomOut => w.atom_out.push(i),
                 _ => {}
@@ -358,6 +476,7 @@ impl Lv2Effect {
             }
             u.inst.activate();
         }
+        shared.access.lock().handle = self.units.first().map_or(0, |u| u.inst.handle() as usize);
         *shared.target.lock() = self.units.first().map(|u| StateTarget {
             raw: u.inst.raw(),
             features: u.inst.features(),
@@ -435,6 +554,9 @@ impl Lv2Effect {
                 r.copy_from_slice(l);
             }
         }
+        for &i in &w.control_out {
+            shared.values[i].store(self.units[0].bufs[i].floats()[0].to_bits(), Ordering::Relaxed);
+        }
         if let Some(i) = w.latency_out {
             let lat = self.units[0].bufs[i].floats()[0];
             let lat = if lat.is_finite() && lat > 0.0 { lat.round().min(u32::MAX as f32) as u32 } else { 0 };
@@ -451,6 +573,7 @@ impl Lv2Effect {
 impl Drop for Lv2Effect {
     fn drop(&mut self) {
         self.withdraw();
+        self.shared.retire(std::mem::take(&mut self.units));
     }
 }
 
@@ -469,7 +592,8 @@ impl Processor for Lv2Effect {
         match created {
             Ok(units) => {
                 self.withdraw();
-                self.units = units;
+                let old = std::mem::replace(&mut self.units, units);
+                self.shared.retire(old);
                 self.sample_rate = sample_rate;
                 self.max_block = max_block.max(1);
                 self.start();
@@ -609,6 +733,39 @@ impl Lv2Handle {
     pub fn latency(&self) -> usize {
         self.shared.latency.load(Ordering::Relaxed) as usize
     }
+
+    /// Whether the plugin has an interface of its own Synkopa can embed (an X11 UI whose
+    /// required features Synkopa provides). Looks it up once.
+    pub fn has_editor(&self) -> bool {
+        self.editor_unavailable().is_none()
+    }
+
+    /// Why the plugin's own interface cannot be shown, when it cannot.
+    pub fn editor_unavailable(&self) -> Option<String> {
+        self.shared.ui().err()
+    }
+
+    /// Whether its interface window is open (turns `false` when the user closes it).
+    pub fn is_editor_open(&self) -> bool {
+        self.shared.ui_open.load(Ordering::Acquire)
+    }
+
+    /// Open the plugin's interface in a Synkopa plugin window under a header showing `label`,
+    /// or bring it forward. **UI thread only** (the window service's).
+    pub fn open_editor(&self, windows: &wave_plugin_windows::Service, label: &wave_plugin_windows::Label) -> Result<(), String> {
+        crate::ui::open(&self.shared, windows, label).map_err(|e| format!("{}: {e}", self.shared.info.name))
+    }
+
+    /// Close the interface (no-op when closed). **UI thread only.**
+    pub fn close_editor(&self) -> Result<(), String> {
+        crate::ui::close(&self.shared);
+        Ok(())
+    }
+
+    /// Pin the interface's window on top of the app's (no-op when it is closed). **UI thread only.**
+    pub fn set_editor_pinned(&self, pinned: bool) {
+        crate::ui::set_pinned(&self.shared, pinned);
+    }
 }
 
 impl std::fmt::Debug for Lv2Handle {
@@ -668,7 +825,7 @@ pub fn instantiate(uri: &str, state: Option<&[u8]>, sample_rate: f32, max_block:
 /// Every installed LV2 effect (plugins with audio in and out; instruments and analysers
 /// are left out), with the reason for those that cannot run here. `rescan` re-reads the
 /// LV2 directories (new or removed bundles). Reads Turtle metadata only: no plugin code
-/// runs. Bundles listed in `lv2-blocklist.txt` (WAVE's data directory) are skipped.
+/// runs. Bundles listed in `lv2-blocklist.txt` (Synkopa's data directory) are skipped.
 pub fn scan(rescan: bool) -> Result<Vec<PluginInfo>, String> {
     let l = lilv::lilv()?;
     let world = world::world(rescan)?;

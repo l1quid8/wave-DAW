@@ -1,7 +1,8 @@
-# Releasing WAVE
+# Releasing Synkopa
 
 A release is one commit; the workflow does the rest. Installed copies find it by themselves
-(Settings → General → Updates, or the button beside the menus) and show its notes.
+(downloading it in the background, then offering "Restart to update" under the menus) and
+show its notes after the restart.
 
 ## Each release
 
@@ -19,17 +20,22 @@ A release is one commit; the workflow does the rest. Installed copies find it by
 * Windows: `WAVE_<v>_x64-setup.exe` (NSIS). No `.msi`: it was the same app a second time, and
   the updater installs the NSIS one anyway (`updaterJsonPreferNsis`).
 * Linux: `.AppImage` (any distribution; the most downloaded), `.deb` and `.rpm`.
+* macOS (Apple Silicon, 13.4 or newer): `Synkopa_<v>_aarch64.dmg`, plus the `.app.tar.gz` the
+  updater installs. 13.4 is what ONNX Runtime's prebuilt library (stems, pitch) needs; `app/build.rs`
+  links clang's runtime for it. The app is ad-hoc signed, not notarized (that needs an Apple
+  Developer account): the first start asks for System Settings → Privacy & Security → Open Anyway.
+  VST3 plugins (Apple Silicon or universal) are hosted, with their own windows; the Demo Synth is not bundled on macOS yet. `.github/workflows/macos.yml` builds it on demand.
 * A `.sig` beside each (the updater's signature) and `latest.json`.
 
 The bundle list is `bundles` in the matrix of `.github/workflows/release.yml`. Every installer
-carries the WAVE Keys piano, which `scripts/fetch-keys.mjs` cuts to what the app plays before
+carries the Synkopa Keys piano, which `scripts/fetch-keys.mjs` cuts to what the app plays before
 the build (138 MB of downloads become about 23 MB; see `docs/keys.md`). The AppImage is the
 largest because it also carries its own WebKit and GTK.
 
 ## What the updater uses
 
 * `latest.json` on the latest release, found at
-  `https://github.com/miskibin/wave-DAW/releases/latest/download/latest.json`. Pre-releases
+  `https://github.com/miskibin/synkopa/releases/latest/download/latest.json`. Pre-releases
   are not "latest", so they never reach users.
 * The `notes` in `latest.json` are the release body above the first `---` line: the CHANGELOG
   section. The part under the rule (install tips) stays on the release page.

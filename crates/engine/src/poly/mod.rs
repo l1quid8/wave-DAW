@@ -43,6 +43,9 @@ pub const CHUNK: usize = 32;
 const MAX_EVENTS: usize = 1024;
 /// Synth channels the audio thread can hold.
 pub const MAX_SYNTHS: usize = 64;
+/// The largest block a synth instance renders into its own buffer (an Rt's `max_block` is at
+/// most this); larger blocks fall back to rendering one instance after another.
+const OUT_CAP: usize = 8192;
 /// Steal fade time.
 const STEAL_S: f32 = 0.004;
 /// Fade when the transport restarts.
@@ -67,8 +70,21 @@ fn headroom(mode: f32) -> f32 {
 
 #[derive(Clone, Copy, Debug)]
 enum Ev {
-    On { key: u8, vel: f32, id: u32, live: bool },
-    Off { id: u32 },
+    On {
+        key: u8,
+        vel: f32,
+        id: u32,
+        live: bool,
+        pan: f32,
+    },
+    Off {
+        id: u32,
+    },
+    /// A slide note: the sounding notes glide by the distance from the highest to `key`.
+    Slide {
+        key: u8,
+        len: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -78,9 +94,15 @@ struct Event {
 }
 
 impl Event {
-    /// Note-offs before note-ons at the same sample (touching notes do not slide).
+    /// Note-offs before note-ons at the same sample (touching notes do not slide), and slide
+    /// notes after the note-ons (a slide bends a note that starts with it).
     fn key(&self) -> (u64, u8) {
-        (self.at, matches!(self.ev, Ev::On { .. }) as u8)
+        let order = match self.ev {
+            Ev::Off { .. } => 0,
+            Ev::On { .. } => 1,
+            Ev::Slide { .. } => 2,
+        };
+        (self.at, order)
     }
 }
 
@@ -170,13 +192,17 @@ pub struct SynthInst {
     rng: u32,
     /// Matrix routing as it sounds: (source, destination, amount %). A changed source or
     /// destination first fades the old routing out, then the new one in.
-    mslots: [(u8, usize, f32); 4],
+    mslots: [(u8, usize, f32); params::SLOTS],
     gain: (f32, f32),
     /// Output headroom as it sounds (glides when the voice mode changes, see [`POLY_HEADROOM`]).
     hr: f32,
     quiet: usize,
     idle: bool,
     age: u64,
+    /// Parallel rendering (see [`SynthBank::render`]): this instance's output of the block
+    /// and whether it put any out.
+    out: (Vec<f32>, Vec<f32>),
+    wrote: bool,
 }
 
 impl SynthInst {
@@ -214,12 +240,14 @@ impl SynthInst {
             bl: [0.0; CHUNK],
             br: [0.0; CHUNK],
             rng: 0x1234_5678 ^ (chan as u32).wrapping_mul(0x9E37_79B9) | 1,
-            mslots: [(0, 0, 0.0); 4],
+            mslots: [(0, 0, 0.0); params::SLOTS],
             gain: (0.0, 0.0),
             hr: headroom(patch[ix::V_MODE]),
             quiet: 0,
             idle: true,
             age: 0,
+            out: (vec![0.0; OUT_CAP], vec![0.0; OUT_CAP]),
+            wrote: false,
         }
     }
 
@@ -265,14 +293,37 @@ impl SynthInst {
 
     /// A sequenced note: starts `delay` samples from now, lasts `len` samples.
     pub fn note(&mut self, delay: u32, len: u32, key: u8, vel: f32, dest: Dest) {
+        self.note_pan(delay, len, key, vel, dest, 0.0);
+    }
+
+    /// [`Self::note`] with the note's own pan (-1 = left .. 1 = right), added to the patch's.
+    pub fn note_pan(&mut self, delay: u32, len: u32, key: u8, vel: f32, dest: Dest, pan: f32) {
         if self.events.len() + 2 > self.events.capacity() {
             return;
         }
         let id = self.new_id();
         let at = self.now + delay as u64;
         self.dest = Some(dest);
-        self.push(Event { at, ev: Ev::On { key, vel, id, live: false } });
+        self.push(Event { at, ev: Ev::On { key, vel, id, live: false, pan } });
         self.push(Event { at: at + len.max(1) as u64, ev: Ev::Off { id } });
+    }
+
+    /// A slide note `delay` samples from now (see [`crate::model::Note::slide`]): the notes
+    /// sounding then glide by the distance from the highest of them to `key` over `len` samples.
+    pub fn slide(&mut self, delay: u32, key: u8, len: u32) {
+        self.push(Event { at: self.now + delay as u64, ev: Ev::Slide { key, len } });
+    }
+
+    fn slide_now(&mut self, key: u8, len: u32) {
+        let sounding = |v: &Voice| v.on && v.fade_step == 0.0 && !v.released();
+        let Some(top) = self.voices[..POLY].iter().filter(|v| sounding(v)).map(|v| v.goal()).max_by(f32::total_cmp) else {
+            return;
+        };
+        let by = key as f32 - top;
+        for v in self.voices[..POLY].iter_mut().filter(|v| sounding(v)) {
+            v.slide_by(by, len as f32);
+        }
+        self.last_st = Some(key as f32);
     }
 
     /// A live key went down; it sounds until [`Self::key_up`] (and the pedal).
@@ -288,7 +339,7 @@ impl SynthInst {
         let id = self.new_id();
         self.live[k] = id;
         self.dest = Some(dest);
-        self.push(Event { at: self.now, ev: Ev::On { key, vel, id, live: true } });
+        self.push(Event { at: self.now, ev: Ev::On { key, vel, id, live: true, pan: 0.0 } });
     }
 
     pub fn key_up(&mut self, key: u8) {
@@ -349,6 +400,16 @@ impl SynthInst {
         }
     }
 
+    /// Panic (a second Stop): no voice and no tail of the built-in effects is heard any more.
+    /// The engine ramps its output away, so cutting here does not click.
+    pub fn silence(&mut self) {
+        self.stop_all();
+        for v in self.voices.iter_mut() {
+            v.on = false;
+        }
+        self.fx.reset();
+    }
+
     fn glide_samples(&self) -> f32 {
         self.cur[ix::V_GLIDE] * 0.001 * self.sr
     }
@@ -360,7 +421,7 @@ impl SynthInst {
         self.rng
     }
 
-    fn note_start(&mut self, key: u8, vel: f32, id: u32, live: bool) {
+    fn note_start(&mut self, key: u8, vel: f32, id: u32, live: bool, pan: f32) {
         if !self.fresh {
             self.cur = self.target;
             self.fresh = true;
@@ -380,6 +441,7 @@ impl SynthInst {
             let from = if glide >= 1.0 { self.chord_from } else { None };
             let slot = self.free_slot();
             self.voices[slot].start(&p, id, key, vel, live, self.age, seed, from, glide);
+            self.voices[slot].npan = pan;
         } else {
             // mono / legato: one voice, a stack of held keys (last note wins)
             if let Some(i) = self.stack[..self.nstack].iter().position(|s| s.1 == id) {
@@ -420,6 +482,7 @@ impl SynthInst {
                     None
                 };
                 self.voices[0].start(&p, id, key, vel, live, self.age, seed, from, glide);
+                self.voices[0].npan = pan;
                 if sounding && amp > 0.002 {
                     self.voices[0].take_over(amp, menv, STEAL_S * self.sr);
                 }
@@ -490,8 +553,9 @@ impl SynthInst {
             }
             self.events.remove(0);
             match e.ev {
-                Ev::On { key, vel, id, live } => self.note_start(key, vel, id, live),
+                Ev::On { key, vel, id, live, pan } => self.note_start(key, vel, id, live, pan),
                 Ev::Off { id } => self.note_stop(id),
+                Ev::Slide { key, len } => self.slide_now(key, len),
             }
         }
     }
@@ -500,7 +564,7 @@ impl SynthInst {
     fn control(&mut self, m: usize, bpm: f64) {
         let sr = self.sr;
         let k_amt = 1.0 - (-(m as f32) / (0.004 * sr)).exp();
-        for s in 0..4 {
+        for s in 0..params::SLOTS {
             let t = (self.target[ix::M1_SRC + 3 * s] as u8, self.target[ix::M1_DST + 3 * s] as usize, self.target[ix::M1_AMT + 3 * s]);
             let st = &mut self.mslots[s];
             if !self.fresh || st.0 == 0 || (st.0 == t.0 && st.1 == t.1) {
@@ -574,6 +638,7 @@ impl SynthInst {
                 bend: self.bend,
                 amp: EnvCoef::new(c[ix::AMP_A], c[ix::AMP_D], c[ix::AMP_S] * 0.01, c[ix::AMP_R], self.sr),
                 menv: EnvCoef::new(c[ix::MOD_A], c[ix::MOD_D], c[ix::MOD_S] * 0.01, c[ix::MOD_R], self.sr),
+                macros: [c[ix::MACRO1] * 0.01, c[ix::MACRO2] * 0.01, c[ix::MACRO3] * 0.01, c[ix::MACRO4] * 0.01],
                 slots,
                 nslots,
             };
@@ -695,24 +760,90 @@ impl SynthBank {
         self.insts.iter_mut().for_each(|s| s.stop_all());
     }
 
+    pub fn silence(&mut self) {
+        self.insts.iter_mut().for_each(|s| s.silence());
+    }
+
     /// Adds every instance's output into where its notes were played (a track buffer or an
-    /// insert input), scaled by its channel's gain and pan.
-    pub fn render(&mut self, n: usize, tracks: &mut [(Vec<f32>, Vec<f32>)], inserts: &mut [InsertRt], chans: &[ChanRt], bpm: f64) {
+    /// insert input), scaled by its channel's gain and pan. With a `pool`, the instances
+    /// render in parallel into their own buffers and are summed here in order: the same
+    /// result as rendering them one after another.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render(
+        &mut self,
+        n: usize,
+        tracks: &mut [(Vec<f32>, Vec<f32>)],
+        inserts: &mut [InsertRt],
+        chans: &[ChanRt],
+        bpm: f64,
+        pool: Option<&crate::pool::RtPool>,
+        track_dirty: &mut [bool],
+    ) {
+        if let Some(pool) = pool.filter(|_| self.insts.len() > 1 && n <= OUT_CAP) {
+            pool.for_each_mut(&mut self.insts, &|_, s| {
+                let (g, pan) =
+                    chans.iter().find(|c| c.id == s.chan).map(|c| (if c.on { c.gain } else { 0.0 }, c.pan)).unwrap_or((0.0, 0.0));
+                let (pl, pr) = pan_gains(pan);
+                let (gl, gr) = if s.dest.is_some() { (g * pl, g * pr) } else { (0.0, 0.0) };
+                let mut out = std::mem::take(&mut s.out);
+                let mut wrote = false;
+                s.process(n, bpm, gl, gr, |o, a, b| {
+                    if !wrote {
+                        out.0[..n].fill(0.0);
+                        out.1[..n].fill(0.0);
+                        wrote = true;
+                    }
+                    out.0[o..o + a.len()].copy_from_slice(a);
+                    out.1[o..o + b.len()].copy_from_slice(b);
+                });
+                s.out = out;
+                s.wrote = wrote;
+            });
+            for s in self.insts.iter_mut().filter(|s| s.wrote) {
+                let out: Option<(&mut [f32], &mut [f32])> = match s.dest {
+                    Some(Dest::Track(t)) => tracks.get_mut(t).map(|(l, r)| {
+                        track_dirty[t] = true;
+                        (&mut l[..], &mut r[..])
+                    }),
+                    Some(Dest::Insert(k)) => inserts.get_mut(k).map(|i| {
+                        i.dirty = true;
+                        (&mut i.l[..], &mut i.r[..])
+                    }),
+                    _ => None,
+                };
+                if let Some((l, r)) = out {
+                    for i in 0..n {
+                        l[i] += s.out.0[i];
+                        r[i] += s.out.1[i];
+                    }
+                }
+            }
+            return;
+        }
         for s in self.insts.iter_mut() {
             let (g, pan) = chans.iter().find(|c| c.id == s.chan).map(|c| (if c.on { c.gain } else { 0.0 }, c.pan)).unwrap_or((0.0, 0.0));
             let (pl, pr) = pan_gains(pan);
-            let out: Option<(&mut [f32], &mut [f32])> = match s.dest {
-                Some(Dest::Track(t)) => tracks.get_mut(t).map(|(l, r)| (&mut l[..], &mut r[..])),
-                Some(Dest::Insert(k)) => inserts.get_mut(k).map(|i| (&mut i.l[..], &mut i.r[..])),
+            // resolve the sink without marking: an idle instance advances its clock without
+            // calling it, so mark at the first actual write (like the pool path's `wrote`)
+            let out: Option<(&mut bool, &mut [f32], &mut [f32])> = match s.dest {
+                Some(Dest::Track(t)) => tracks.get_mut(t).and_then(|(l, r)| track_dirty.get_mut(t).map(|d| (d, &mut l[..], &mut r[..]))),
+                Some(Dest::Insert(k)) => inserts.get_mut(k).map(|i| (&mut i.dirty, &mut i.l[..], &mut i.r[..])),
                 _ => None,
             };
             match out {
-                Some((l, r)) => s.process(n, bpm, g * pl, g * pr, |o, a, b| {
-                    for i in 0..a.len() {
-                        l[o + i] += a[i];
-                        r[o + i] += b[i];
-                    }
-                }),
+                Some((dirty, l, r)) => {
+                    let mut marked = false;
+                    s.process(n, bpm, g * pl, g * pr, |o, a, b| {
+                        if !marked {
+                            *dirty = true;
+                            marked = true;
+                        }
+                        for i in 0..a.len() {
+                            l[o + i] += a[i];
+                            r[o + i] += b[i];
+                        }
+                    });
+                }
                 None => s.process(n, bpm, 0.0, 0.0, |_, _, _| {}),
             }
         }
@@ -735,6 +866,9 @@ pub struct SynthCatalog {
     pub sections: Vec<params::SectionDef>,
     pub categories: &'static [&'static str],
     pub presets: Vec<SynthPreset>,
+    /// One cycle of every frame of every oscillator wave (`[wave][frame][point]`, 96 points,
+    /// peak 1): the panel draws the real tables, not an approximation.
+    pub waves: Vec<Vec<Vec<f32>>>,
 }
 
 pub fn catalog() -> SynthCatalog {
@@ -749,11 +883,13 @@ pub fn catalog() -> SynthCatalog {
                 params: PARAMS.iter().zip(p.patch.iter()).map(|(d, v)| (d.id, (*v as f64 * 1000.0).round() / 1000.0)).collect(),
             })
             .collect(),
+        waves: tables::bank().display(96),
     }
 }
 
 /// A synth state holding preset `name`'s full parameter set (`None` if there is no such preset).
 pub fn preset_state(name: &str) -> Option<crate::model::SynthState> {
+    let name = presets::current_name(name);
     let p = presets::all().into_iter().find(|p| p.name == name)?;
     Some(crate::model::SynthState {
         preset: Some(p.name.to_owned()),

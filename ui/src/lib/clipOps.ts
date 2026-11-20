@@ -19,6 +19,13 @@ export function moveClips(orig: Clip[], d: number, dt: number): Clip[] {
   return orig.map(c => ({ ...c, start: c.start + d, track: c.track + dt }));
 }
 
+/** Place another instance of an existing clip, keeping the exact source region and its
+ * clip-local settings (trim/offset, stretch, fades and pitch edits), not the full file. */
+export function placeClipCopy(source: Clip, id: number, track: number, beat: number): Clip {
+  const len = Math.min(source.len, TOTAL);
+  return { ...source, id, track, start: clamp(beat, 0, TOTAL - len), len };
+}
+
 /** Split `c` at beat `b`; null when `b` is not strictly inside. */
 export function sliceClip(c: Clip, b: number, newId: number): [Clip, Clip] | null {
   if (b <= c.start + 1e-6 || b >= c.start + c.len - 1e-6) return null;
@@ -44,16 +51,20 @@ export function pasteClips(cb: Clip[], beat: number, track: number | null, nTrac
   }));
 }
 
-/** Resize from an edge. `srcLen` is the source length in beats (audio only; Infinity for patterns). */
+/**
+ * Resize from an edge. `srcLen` is the source length in beats (audio only; Infinity for patterns).
+ * `minL` is the shortest a trim leaves a clip, but a clip that is already shorter keeps its length
+ * as its floor: an edge never moves against the drag, so trimming a short clip cannot make it longer.
+ */
 export function resizeClip(o: Clip, edge: 'l' | 'r', target: number, minL: number, srcLen: number): Clip {
   const n = { ...o };
   if (edge === 'r') {
-    let len = Math.max(minL, target - o.start);
+    let len = Math.max(Math.min(minL, o.len), target - o.start);
     if (o.kind === 'audio' || o.kind === 'comp') len = Math.min(len, srcLen - o.offset);
     n.len = Math.min(len, TOTAL - o.start);
   } else {
     const lo = o.kind === 'audio' || o.kind === 'comp' ? o.start - o.offset : 0;
-    const ns = clamp(target, Math.max(0, lo), o.start + o.len - minL);
+    const ns = clamp(target, Math.max(0, lo), o.start + o.len - Math.min(minL, o.len));
     n.start = ns; n.offset = o.offset + (ns - o.start); n.len = o.len - (ns - o.start);
   }
   return n;
@@ -137,4 +148,119 @@ export function fitClip(c: Clip, beats: number): Clip | null {
   if (ns < STRETCH_MIN - 1e-9 || ns > STRETCH_MAX + 1e-9 || c.start + beats > TOTAL_BEATS + 1e-9) return null;
   const r = (x: number) => Math.round(x * 1e9) / 1e9;
   return { ...c, stretch: r(Math.min(STRETCH_MAX, Math.max(STRETCH_MIN, ns))), offset: r(c.offset * k), len: beats };
+}
+
+/**
+ * What every audio clip of one source shares, as FL's audio clips share their channel: volume,
+ * pan, pitch, normalize, reverse and the mixer insert. Editing one clip's sound edits them all; the region, the
+ * fades, the stretch and pitch-editor notes stay the clip's own ("Make unique" splits a clip off).
+ */
+export const SHARED_SOUND = ['gain', 'pan', 'pitch', 'norm', 'rev', 'insert', 'root'] as const;
+type SoundKey = typeof SHARED_SOUND[number];
+
+/** The shared sound of `ref`'s audio clips (from the first one), for a new clip of it; empty when it has none yet. */
+export function sharedSound(clips: readonly Clip[], ref: number): Partial<Pick<Clip, SoundKey>> {
+  const like = clips.find(c => c.kind === 'audio' && c.ref === ref);
+  if (!like) return {};
+  const out: Partial<Pick<Clip, SoundKey>> = {};
+  for (const k of SHARED_SOUND) if (like[k] !== undefined) (out as Record<string, unknown>)[k] = like[k];
+  return out;
+}
+
+/**
+ * `edited` with `patch`, and every other audio clip of the same source with the shared-sound part
+ * of it (one op, one undo step). A comp or a pattern clip only changes itself.
+ */
+export function putSoundClips(clips: readonly Clip[], edited: Clip, patch: Partial<Clip>): Op {
+  const self = { ...edited, ...patch };
+  if (edited.kind !== 'audio') return { op: 'putClips', clips: [self] };
+  const shared: Partial<Clip> = {};
+  for (const k of SHARED_SOUND) if (k in patch) (shared as Record<string, unknown>)[k] = patch[k];
+  if (!Object.keys(shared).length) return { op: 'putClips', clips: [self] };
+  const others = clips.filter(c => c.id !== edited.id && c.kind === 'audio' && c.ref === edited.ref && SHARED_SOUND.some(k => k in shared && (c[k] ?? null) !== (shared[k] ?? null)));
+  return { op: 'putClips', clips: [self, ...others.map(c => ({ ...c, ...shared }))] };
+}
+
+/**
+ * The slice tool dragged down or up across lanes (FL): every clip on tracks `t0`..`t1` that the
+ * beat `b` falls inside is cut there. Returns the clips to put (both halves of each), empty when
+ * the line crosses none.
+ */
+export function sliceAcross(clips: readonly Clip[], b: number, t0: number, t1: number, alloc: () => number): Clip[] {
+  const lo = Math.min(t0, t1), hi = Math.max(t0, t1);
+  return clips.filter(c => c.track >= lo && c.track <= hi).flatMap(c => sliceClip(c, b, alloc()) ?? []);
+}
+
+/**
+ * The paint tool's sweep (FL): the cells a drag from the first clip to (`beat`, `track`) passes that
+ * are still free. The grid is the first clip's own: cells are `len` wide and start at `first.start`,
+ * in both directions and on any lane. `taken` holds the cells already painted ("track:cell").
+ */
+export function paintCells(first: { start: number; len: number; track: number }, beat: number, track: number, nTracks: number, total: number, taken: ReadonlySet<string>): { track: number; start: number; key: string }[] {
+  const tr = Math.max(0, Math.min(nTracks - 1, track));
+  const cell = Math.floor((beat - first.start) / first.len + 1e-9), start = first.start + cell * first.len;
+  const key = tr + ':' + cell;
+  if (start < -1e-9 || start + first.len > total + 1e-9 || taken.has(key)) return [];
+  return [{ track: tr, start: Math.max(0, start), key }];
+}
+
+/**
+ * Move lane `i` to the place of lane `j` (its neighbour: Move up / Move down). Like `insertTrackOps`,
+ * the lanes swap what they hold and ids stay with their slots: names, colours, routing and heights
+ * trade places, the clips follow, and a volume automation keeps driving the track it was made for.
+ */
+/**
+ * Lane `from` moved to index `to` (the lanes between shift by one). Track ids stay with their
+ * slots (the op set has no reorder), so the lanes' contents move: every slot from the lower to
+ * the higher index takes the data of the lane that lands there, its clips follow, and a track
+ * volume automation follows its lane to the slot's id. `[]` when nothing moves.
+ */
+export function moveTrackOps(p: Project, from: number, to: number): Op[] {
+  const n = p.tracks.length;
+  if (from === to || from < 0 || to < 0 || from >= n || to >= n) return [];
+  // order[k] = the old index of the lane that ends up at index k
+  const order = p.tracks.map((_, k) => k);
+  order.splice(to, 0, ...order.splice(from, 1));
+  const newIndex = new Map(order.map((old, k) => [old, k]));
+  const lo = Math.min(from, to), hi = Math.max(from, to);
+  const ops: Op[] = [];
+  for (let k = lo; k <= hi; k++) ops.push({ op: 'putTrack', track: { ...p.tracks[order[k]], id: p.tracks[k].id } });
+  const moved = p.clips.filter(c => c.track >= lo && c.track <= hi).map(c => ({ ...c, track: newIndex.get(c.track)! }));
+  if (moved.length) ops.push({ op: 'putClips', clips: moved });
+  for (const au of p.automations ?? []) {
+    const t = au.target;
+    if (t.kind !== 'trackVol') continue;
+    const old = p.tracks.findIndex(tr => tr.id === t.id);
+    if (old < lo || old > hi) continue;
+    const id = p.tracks[newIndex.get(old)!].id;
+    if (id !== t.id) ops.push({ op: 'putAutomation', automation: { ...au, target: { kind: 'trackVol', id } } });
+  }
+  return ops;
+}
+
+export function swapTrackOps(p: Project, i: number, j: number): Op[] {
+  const a = p.tracks[i], b = p.tracks[j];
+  if (!a || !b || i === j) return [];
+  const ops: Op[] = [{ op: 'putTrack', track: { ...b, id: a.id } }, { op: 'putTrack', track: { ...a, id: b.id } }];
+  const moved = p.clips.filter(c => c.track === i || c.track === j).map(c => ({ ...c, track: c.track === i ? j : i }));
+  if (moved.length) ops.push({ op: 'putClips', clips: moved });
+  for (const au of p.automations ?? []) {
+    const t = au.target;
+    if (t.kind === 'trackVol' && (t.id === a.id || t.id === b.id)) ops.push({ op: 'putAutomation', automation: { ...au, target: { kind: 'trackVol', id: t.id === a.id ? b.id : a.id } } });
+  }
+  return ops;
+}
+
+/**
+ * Several patterns dropped at once (Browser multi-selection): each on its own track, from the
+ * drop's track down, all starting at `start` (clipped to the song). Tracks missing below the last
+ * one are added. `lenOf`: a pattern's length in beats.
+ */
+export function stackPatternClips(refs: readonly number[], track: number, start: number, tracks: number, total: number,
+  lenOf: (ref: number) => number, newId: () => number): { clips: Clip[]; newTracks: number } {
+  const clips = refs.map((ref, i): Clip => {
+    const len = Math.max(1e-3, Math.min(lenOf(ref), total - start));
+    return { id: newId(), track: track + i, start, len, offset: 0, kind: 'pat', ref, muted: false, gain: 0, fadeIn: 0, fadeOut: 0, pan: 0, norm: false, rev: false };
+  });
+  return { clips, newTracks: Math.max(0, track + refs.length - tracks) };
 }

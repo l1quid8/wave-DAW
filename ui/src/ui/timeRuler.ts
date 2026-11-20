@@ -17,6 +17,19 @@ export const RULER_H = 26;
  * Draws the ruler `W` px wide: beat `b` at x = b × bw − offX. Bar numbers count from beat 0
  * (bar 1); `loop` is the green band, `start` the start marker (none: not drawn).
  */
+/** The finest unit the ruler names besides bars, in beats: 1 (beats) once a beat is 48 px wide, ¼ (16ths) at 48 px a 16th; 0 = bars only. */
+export function rulerSubdivision(bw: number): number {
+  return bw * 0.25 >= 48 ? 0.25 : bw >= 48 ? 1 : 0;
+}
+
+/** The ruler's name for beat `b` (on a beat or a 16th): "5.2", "5.2.3"; empty on a bar line (the bar number is drawn there). */
+export function rulerLabel(b: number): string {
+  const step = Math.round(b * 4);
+  const bar = Math.floor(step / 16), beat = Math.floor((step % 16) / 4), six = step % 4;
+  if (beat === 0 && six === 0) return '';
+  return six ? `${bar + 1}.${beat + 1}.${six + 1}` : `${bar + 1}.${beat + 1}`;
+}
+
 export function drawRuler(g: CanvasRenderingContext2D, offX: number, W: number, bw: number, loop: BeatRange | null | undefined, start: number | null, H = RULER_H) {
   g.fillStyle = T.rulerBg; g.fillRect(0, 0, W, H);
   if (!(bw > 0)) return;
@@ -35,6 +48,22 @@ export function drawRuler(g: CanvasRenderingContext2D, offX: number, W: number, 
     const x = Math.round(bar * barW);
     g.fillStyle = T.fg6; g.fillRect(x, 0, 1, H);
     g.fillStyle = T.rulerText; g.fillText(String(bar + 1), x + 4, H - 11);
+  }
+  // zoomed in past a bar per screen: beats ("5.2") and then 16ths ("5.2.3") are named too
+  const sub = rulerSubdivision(bw);
+  if (sub) {
+    const stepPx = bw * sub;
+    g.fillStyle = T.fg6;
+    if (sub < 1) for (let k = Math.max(0, Math.floor(x0 / stepPx)); k * stepPx <= x1; k++) g.fillRect(Math.round(k * stepPx), H - 3, 1, 3);
+    g.fillStyle = T.fg4;
+    for (let k = Math.max(0, Math.floor(x0 / stepPx)); k * stepPx <= x1; k++) {
+      const label = rulerLabel(k * sub);
+      if (!label) continue;
+      // a 16th inside a beat shows only its own number, dimmer: the beat's label to its left already names the bar and beat
+      const six = sub < 1 ? k % 4 : 0;
+      g.fillStyle = six ? T.fg6 : T.fg4;
+      g.fillText(six ? String(six + 1) : label, Math.round(k * stepPx) + 4, H - 11);
+    }
   }
   if (start != null) {
     const sx = start * bw;
@@ -99,10 +128,19 @@ export function rulerDown(h: RulerHost, e: PointerEvent) {
     }, () => { if (g) g.end(); else h.seek(b0); }, edge === 'body' ? 'grabbing' : 'ew-resize');
     return;
   }
+  // FL: a click sets the start position, a drag draws the loop. Ctrl+drag scrubs the start position
+  // with the pointer instead. A sloppy click leaves no loop (nor an undo step): the loop starts only
+  // after a real drag that spans a grid unit.
+  if (e.ctrlKey || e.metaKey) {
+    let at = b0;
+    h.seek(b0);
+    tr(ev => { const b = snapAt(ev); if (b !== at) { at = b; h.seek(b); } }, () => {}, 'ew-resize');
+    return;
+  }
   let last: BeatRange | null = lp;
   tr(ev => {
-    if (!g && Math.abs(ev.clientX - e.clientX) > 4) g = h.edit(t('a.pl.loop'));
     const r = drawnLoop(b0, snapAt(ev));
+    if (!g && r && Math.abs(ev.clientX - e.clientX) > 4) g = h.edit(t('a.pl.loop'));
     if (g && r && !sameRange(r, last)) { last = r; g.set(r); }
   }, () => {
     if (!g) { h.seek(b0); return; }

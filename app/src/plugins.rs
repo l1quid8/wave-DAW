@@ -1,5 +1,6 @@
 //! Plugin hosting glue: the engine's `PluginFactory` for every hosted format (VST3
-//! everywhere, LV2 on Linux), per-effect handles, scanning, editors.
+//! everywhere, LV2 on Linux), per-effect and per-instrument-channel handles (by id: effect
+//! and channel ids never collide), scanning, editors.
 //!
 //! Threading: VST3 instantiate/params/state block on a UI-thread job, so they are only
 //! ever reached from async commands or worker threads — never from the UI thread itself.
@@ -10,9 +11,9 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
-use wave_engine::{Id, PluginFactory, PluginRef, Processor};
+use wave_engine::{Id, Instrument, PluginFactory, PluginRef, Processor};
 
 /// A live hosted effect's non-real-time side.
 #[derive(Clone)]
@@ -90,18 +91,87 @@ pub struct ScanEntry {
     pub unsupported: Option<String>,
 }
 
-/// What `plugin_scan` returns: the effects, and per format why it is unavailable here.
+/// What `plugin_scan` returns: the effects, the instruments, and per format why it is
+/// unavailable here.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScanResult {
     pub plugins: Vec<ScanEntry>,
+    /// Plugin instruments for the Channel Rack (VST3).
+    pub instruments: Vec<ScanEntry>,
     /// Format → the sentence explaining why it is not available (LV2 without liblilv).
     pub unavailable: HashMap<String, String>,
+}
+
+/// Tells the VST3 scan where the plugins that ship with Synkopa are (`plugins/` among the app's
+/// resources: Synkopa Demo Synth). `resource_dir`: the app's, when a Tauri app runs; otherwise
+/// (the CLI on a file) next to the executable, or the Linux packages' `/usr/lib/Synkopa`.
+pub fn register_bundled(resource_dir: Option<std::path::PathBuf>) {
+    let dirs: Vec<std::path::PathBuf> = match resource_dir {
+        Some(dir) => vec![dir],
+        None => std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+            .map(|dir| vec![dir.clone(), dir.join("..").join("lib").join("Synkopa")])
+            .unwrap_or_default(),
+    };
+    for dir in dirs {
+        wave_vst3::add_bundled_dir(dir.join("plugins"));
+    }
+}
+
+/// The error of a plugin that has no window of its own (Synkopa Demo Synth): the UI matches its
+/// prefix (`wave_engine::errors::ERR_NO_EDITOR`, pinned by `src/ui_prefixes_tests.rs`).
+pub const NO_EDITOR: &str = "NO_EDITOR: this plugin has no window of its own; its parameters are listed below";
+
+fn vst3_editor_error(e: wave_vst3::Vst3Error) -> String {
+    match e {
+        // the UI recognises this one: it turns the button into a note instead of an error
+        wave_vst3::Vst3Error::NoEditor => NO_EDITOR.to_string(),
+        e => e.to_string(),
+    }
 }
 
 pub struct Plugins {
     handles: Mutex<HashMap<Id, Handle>>,
     known: Mutex<Option<ScanResult>>,
+    /// This session's live plugins, mirrored into the marker file (`live_loaded`).
+    live: Mutex<HashMap<Id, CrashSuspect>>,
+    /// Plugins still live when the last session ended: the suspects of a crash (a session
+    /// that exits normally leaves the marker file empty).
+    crash_suspects: Mutex<Vec<CrashSuspect>>,
+    /// The safety check every plugin passes before it is first loaded into Synkopa.
+    safety: Arc<crate::plugin_probe::Safety>,
+    /// Where the live marker file is (`None`: nowhere — a machine without Synkopa's data
+    /// folder, and every test).
+    marker: Option<std::path::PathBuf>,
+}
+
+/// A plugin to ask the user about: it was loaded when Synkopa last died without exiting.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrashSuspect {
+    pub format: String,
+    /// VST3 class id, LV2 plugin URI.
+    pub cid: String,
+    pub name: String,
+    /// The module (bundle) path, as the scan block list knows it.
+    pub path: String,
+}
+
+/// The file naming every live plugin; its absence or emptiness means a normal exit.
+fn live_marker() -> Option<std::path::PathBuf> {
+    wave_plugin_scan::data_file("live-plugins.json")
+}
+
+fn read_marker_at(path: &std::path::Path) -> Vec<CrashSuspect> {
+    std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+fn write_marker_at(path: &std::path::Path, live: &[CrashSuspect]) {
+    if let Ok(t) = serde_json::to_string(live) {
+        let _ = std::fs::write(path, t);
+    }
 }
 
 struct Factory(Arc<Plugins>);
@@ -109,6 +179,7 @@ struct Factory(Arc<Plugins>);
 impl PluginFactory for Factory {
     fn create(&self, fx_id: Id, p: &PluginRef, sr: f32, max_block: usize, live: bool) -> Result<Box<dyn Processor>, String> {
         let state = p.state.as_deref().and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok());
+        self.0.safe(p, false).map_err(|e| format!("{}: {e}", p.name))?;
         let (proc, handle) = match p.format.as_str() {
             PluginRef::LV2 => {
                 let (proc, h) =
@@ -116,26 +187,62 @@ impl PluginFactory for Factory {
                 (proc, Handle::Lv2(h))
             }
             PluginRef::VST3 => {
+                let path = self.0.vst3_path(p);
                 let (proc, h) =
-                    wave_vst3::instantiate(&p.path, &p.cid, state.as_deref(), sr, max_block).map_err(|e| format!("{}: {e}", p.name))?;
+                    wave_vst3::instantiate(&path, &p.cid, state.as_deref(), sr, max_block).map_err(|e| format!("{}: {e}", p.name))?;
                 (proc, Handle::Vst3(h))
             }
-            other => return Err(format!("{}: WAVE does not host `{other}` plugins", p.name)),
+            other => return Err(format!("{}: Synkopa does not host `{other}` plugins", p.name)),
         };
         if live {
             self.0.handles.lock().insert(fx_id, handle);
+            self.0.live_loaded(fx_id, p);
         }
         Ok(proc)
     }
+    fn create_instrument(&self, chan_id: Id, p: &PluginRef, sr: f32, max_block: usize, live: bool) -> Result<Box<dyn Instrument>, String> {
+        if p.format != PluginRef::VST3 {
+            return Err(format!("{}: {} instruments are not supported (VST3 only)", p.name, p.format_label()));
+        }
+        let state = p.state.as_deref().and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok());
+        self.0.safe(p, true).map_err(|e| format!("{}: {e}", p.name))?;
+        let path = self.0.vst3_path(p);
+        let (inst, h) = wave_vst3::instantiate_instrument(&path, &p.cid, state.as_deref(), sr, max_block, !live)
+            .map_err(|e| format!("{}: {e}", p.name))?;
+        if live {
+            self.0.handles.lock().insert(chan_id, Handle::Vst3(h));
+            self.0.live_loaded(chan_id, p);
+        }
+        Ok(inst)
+    }
+    fn vet(&self, plugins: &[(&PluginRef, bool)]) {
+        // first-time safety checks, a few at once (a project opening with ten new plugins)
+        let mut seen = std::collections::HashSet::new();
+        let todo: Vec<crate::plugin_probe::Request> = plugins
+            .iter()
+            .map(|(p, inst)| self.0.request(p, *inst))
+            .filter(|r| self.0.safety.verdict(r).is_none() && seen.insert(r.clone()))
+            .collect();
+        std::thread::scope(|s| {
+            for chunk in todo.chunks(todo.len().div_ceil(4).max(1)) {
+                s.spawn(move || {
+                    for r in chunk {
+                        let _ = self.0.safety.check(r);
+                    }
+                });
+            }
+        });
+    }
     fn release(&self, fx_id: Id) {
         self.0.handles.lock().remove(&fx_id);
+        self.0.live_released(fx_id);
     }
     fn state(&self, fx_id: Id) -> Option<String> {
         let h = self.0.handles.lock().get(&fx_id).cloned()?;
         match h.state() {
             Ok(b) => Some(base64::engine::general_purpose::STANDARD.encode(b)),
             Err(e) => {
-                log::warn!("effect {fx_id}: the plugin's state could not be saved ({e}); the last saved state is kept");
+                log::warn!("plugin {fx_id}: its state could not be saved ({e}); the last saved state is kept");
                 None
             }
         }
@@ -151,28 +258,125 @@ impl PluginFactory for Factory {
 
 impl Plugins {
     pub fn new() -> Arc<Self> {
-        Arc::new(Plugins { handles: Mutex::new(HashMap::new()), known: Mutex::new(None) })
+        Arc::new(Self::open(live_marker(), crate::plugin_probe::Safety::load()))
+    }
+
+    /// With a given safety check (tests: one without a worker process or a file).
+    pub fn with_safety(safety: crate::plugin_probe::Safety) -> Arc<Self> {
+        Arc::new(Self::open(None, safety))
+    }
+
+    /// Whatever the last session left in the marker file names its crash suspects; this
+    /// session starts clean (entries come back as plugins load).
+    fn open(marker: Option<std::path::PathBuf>, safety: crate::plugin_probe::Safety) -> Self {
+        let crash_suspects = marker.as_ref().map(|p| read_marker_at(p)).unwrap_or_default();
+        if let Some(p) = &marker {
+            write_marker_at(p, &[]);
+        }
+        Plugins {
+            handles: Mutex::new(HashMap::new()),
+            known: Mutex::new(None),
+            live: Mutex::new(HashMap::new()),
+            crash_suspects: Mutex::new(crash_suspects),
+            marker,
+            safety: Arc::new(safety),
+        }
+    }
+
+    /// A plugin loaded for real: it goes into the live marker, so a crash while it is
+    /// loaded points here the next time Synkopa starts.
+    fn live_loaded(&self, id: Id, p: &PluginRef) {
+        let path = match p.format.as_str() {
+            PluginRef::VST3 => self.vst3_path(p),
+            _ => p.path.clone(),
+        };
+        let suspect = CrashSuspect { format: p.format.clone(), cid: p.cid.clone(), name: p.name.clone(), path };
+        let mut live = self.live.lock();
+        live.insert(id, suspect);
+        self.write_live(&live);
+    }
+
+    /// A plugin's instance went away: out of the live marker with it.
+    fn live_released(&self, id: Id) {
+        let mut live = self.live.lock();
+        if live.remove(&id).is_some() {
+            self.write_live(&live);
+        }
+    }
+
+    /// The marker file follows the live set.
+    fn write_live(&self, live: &HashMap<Id, CrashSuspect>) {
+        if let Some(path) = &self.marker {
+            let mut all: Vec<CrashSuspect> = live.values().cloned().collect();
+            all.sort_by(|a, b| a.cid.cmp(&b.cid).then_with(|| a.path.cmp(&b.path)));
+            write_marker_at(path, &all);
+        }
+    }
+
+    /// The plugins that were live when the last session ended without exiting.
+    pub fn crash_suspects(&self) -> Vec<CrashSuspect> {
+        self.crash_suspects.lock().clone()
+    }
+
+    /// A clean exit: nothing is suspected any more.
+    pub fn clear_crash_suspects(&self) {
+        self.crash_suspects.lock().clear();
+    }
+
+    /// Synkopa is exiting normally: the live marker is emptied (the plugins still loaded are not
+    /// crash suspects at the next start), and a plugin loaded anyway that Synkopa survived is
+    /// trusted for good even when its trial had not run out.
+    pub fn clean_exit(&self) {
+        self.clear_crash_suspects();
+        let mut live = self.live.lock();
+        live.clear();
+        self.write_live(&live);
+        self.safety.survived_all();
+    }
+
+    /// Keep a plugin's module out of future scans (the user asked, after a crash).
+    pub fn block(&self, format: &str, path: &str) -> Result<(), String> {
+        let file =
+            wave_plugin_scan::data_file(&format!("{format}-blocklist.txt")).ok_or("Synkopa has no data folder for the block list")?;
+        wave_plugin_scan::BlockList::with_file(file).block(std::path::Path::new(path));
+        Ok(())
     }
 
     pub fn factory(self: &Arc<Self>) -> Arc<dyn PluginFactory> {
         Arc::new(Factory(self.clone()))
     }
 
+    /// The safety check for `p` (cached; the first time, the plugin is tried in a worker
+    /// process): `Err` when loading it would likely bring Synkopa down.
+    fn safe(&self, p: &PluginRef, instrument: bool) -> Result<(), String> {
+        self.safety.check(&self.request(p, instrument))
+    }
+
+    fn request(&self, p: &PluginRef, instrument: bool) -> crate::plugin_probe::Request {
+        let path = if p.format == PluginRef::VST3 { self.vst3_path(p) } else { p.path.clone() };
+        crate::plugin_probe::Request::of(p, path, instrument)
+    }
+
+    /// Load `p` from now on although the safety check refused it.
+    pub fn trust(&self, p: &PluginRef, instrument: bool) {
+        self.safety.trust(&self.request(p, instrument));
+    }
+
     /// Every installed effect of every format this platform hosts (VST3; LV2 on Linux).
     /// A cold `rescan` is slow: call it from a worker thread.
     pub fn scan(&self, rescan: bool) -> ScanResult {
-        let mut plugins: Vec<ScanEntry> = wave_vst3::scan(rescan)
-            .into_iter()
-            .map(|p| ScanEntry {
-                format: PluginRef::VST3.into(),
-                path: p.path,
-                cid: p.cid,
-                name: p.name,
-                vendor: p.vendor,
-                category: p.category,
-                unsupported: None,
-            })
-            .collect();
+        let vst3 = |p: wave_vst3::PluginInfo| ScanEntry {
+            format: PluginRef::VST3.into(),
+            path: p.path,
+            cid: p.cid,
+            name: p.name,
+            vendor: p.vendor,
+            category: p.category,
+            unsupported: None,
+        };
+        let mut plugins: Vec<ScanEntry> = wave_vst3::scan(rescan).into_iter().map(vst3).collect();
+        // the effects' scan opened whatever was new: this reads the same cache
+        let instruments: Vec<ScanEntry> = wave_vst3::scan_instruments(false).into_iter().map(vst3).collect();
         let mut unavailable = HashMap::new();
         if cfg!(target_os = "linux") {
             match wave_lv2::scan(rescan) {
@@ -190,15 +394,24 @@ impl Plugins {
                 }
             }
         }
-        let r = ScanResult { plugins, unavailable };
+        let r = ScanResult { plugins, instruments, unavailable };
         *self.known.lock() = Some(r.clone());
         r
     }
 
-    /// A scanned plugin: from the last scan, else a scan that opens nothing new.
+    /// A scanned effect: from the last scan, else a scan that opens nothing new.
     pub fn info(&self, format: &str, path: &str, cid: &str) -> Option<ScanEntry> {
+        self.find(format, path, cid, |r| &r.plugins)
+    }
+
+    /// A scanned instrument (VST3): from the last scan, else a scan that opens nothing new.
+    pub fn instrument(&self, path: &str, cid: &str) -> Option<ScanEntry> {
+        self.find(PluginRef::VST3, path, cid, |r| &r.instruments)
+    }
+
+    fn find(&self, format: &str, path: &str, cid: &str, list: fn(&ScanResult) -> &Vec<ScanEntry>) -> Option<ScanEntry> {
         let find = |r: &ScanResult| {
-            r.plugins
+            list(r)
                 .iter()
                 .find(|p| {
                     p.format == format
@@ -215,12 +428,38 @@ impl Plugins {
         find(&self.scan(false))
     }
 
+    /// Where to load a project's VST3 from: its saved path, or, when nothing is there any
+    /// more, the installed plugin with the same class id. A plugin that comes with Synkopa moves
+    /// with the installation (another user or computer, a new AppImage mount on every start),
+    /// and a project must not lose it for that.
+    fn vst3_path(&self, p: &PluginRef) -> String {
+        if std::path::Path::new(&p.path).exists() {
+            return p.path.clone();
+        }
+        let find = |r: &ScanResult| {
+            r.instruments
+                .iter()
+                .chain(&r.plugins)
+                .find(|e| e.format == PluginRef::VST3 && e.cid.eq_ignore_ascii_case(&p.cid) && std::path::Path::new(&e.path).exists())
+                .map(|e| e.path.clone())
+        };
+        let known = self.known.lock().as_ref().map(find);
+        known.unwrap_or_else(|| find(&self.scan(false))).unwrap_or_else(|| p.path.clone())
+    }
+
     fn handle(&self, fx: Id) -> Result<Handle, String> {
-        self.handles.lock().get(&fx).cloned().ok_or_else(|| format!("effect {fx} is not a loaded plugin"))
+        self.handles.lock().get(&fx).cloned().ok_or_else(|| format!("{fx} is not a loaded plugin effect or instrument"))
     }
 
     pub fn params(&self, fx: Id) -> Result<Vec<ParamInfo>, String> {
         Ok(self.handle(fx)?.params())
+    }
+
+    /// A live plugin's current state (base64, as a project stores it): what a copy of the
+    /// effect or instrument channel needs to sound the same before the project is saved.
+    pub fn state(&self, fx: Id) -> Result<String, String> {
+        let b = self.handle(fx)?.state()?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(b))
     }
 
     pub fn set_param(&self, fx: Id, id: u32, v: f64) -> Result<(), String> {
@@ -230,35 +469,63 @@ impl Plugins {
         self.handle(fx)?.set_param(id, v)
     }
 
-    pub fn editor(&self, app: &tauri::AppHandle, fx: Id, open: bool) -> Result<(), String> {
-        let h = match self.handle(fx)? {
-            Handle::Vst3(h) => h,
-            Handle::Lv2(_) if !open => return Ok(()),
-            Handle::Lv2(_) => {
-                return Err("LV2 plugins are edited in WAVE's parameter list (their own editor windows are not supported yet)".into())
-            }
-        };
-        if open && !h.has_editor() {
-            return Err("this plugin has no editor; use the parameter list".into());
-        }
+    /// Whether the plugin's own window is open (the user may have closed it with its X).
+    pub fn editor_open(&self, fx: Id) -> Result<bool, String> {
+        Ok(match self.handle(fx)? {
+            Handle::Vst3(h) => h.is_editor_open(),
+            Handle::Lv2(h) => h.is_editor_open(),
+        })
+    }
+
+    /// Open (or bring forward) or close the plugin's own window, under Synkopa's header showing
+    /// `label`, pinned on top of the app when `pinned`. The window lives on the UI thread; this
+    /// waits for it.
+    pub fn editor(
+        &self,
+        app: &tauri::AppHandle,
+        fx: Id,
+        open: bool,
+        label: wave_plugin_windows::Label,
+        pinned: bool,
+    ) -> Result<(), String> {
+        let h = self.handle(fx)?;
         if open {
-            // The editor's own edits and its close button, forwarded so the effect
-            // window's parameter list and editor button follow along.
+            let has = match &h {
+                Handle::Vst3(h) => h.has_editor(),
+                Handle::Lv2(h) => h.has_editor(),
+            };
+            if !has {
+                return Err(NO_EDITOR.into());
+            }
+        }
+        if let (true, Handle::Vst3(vst3)) = (open, &h) {
+            // The editor's own edits and its close button, forwarded so the plugin's
+            // parameter list and editor button follow along. (LV2 UIs report neither yet;
+            // the UI's poll notices their close.)
             let events = app.clone();
-            h.set_editor_observer(Some(std::sync::Arc::new(move |event| {
+            vst3.set_editor_observer(Some(std::sync::Arc::new(move |event| {
                 let _ = events.emit("plugin-editor", PluginEditorEvent::new(fx, event));
             })));
         }
         let (tx, rx) = std::sync::mpsc::channel();
         let a = app.clone();
         app.run_on_main_thread(move || {
-            let r = if open {
-                let w = a.state::<wave_plugin_windows::Service>();
-                h.open_editor(&w)
-            } else {
-                h.close_editor()
+            let w = a.state::<wave_plugin_windows::Service>();
+            let r = match (&h, open) {
+                (Handle::Vst3(h), true) => h.open_editor(&w, &label).map_err(vst3_editor_error),
+                (Handle::Vst3(h), false) => h.close_editor().map_err(vst3_editor_error),
+                (Handle::Lv2(h), true) => h.open_editor(&w, &label),
+                (Handle::Lv2(h), false) => h.close_editor(),
             };
-            let _ = tx.send(r.map_err(|e| e.to_string()));
+            if open && r.is_ok() {
+                match &h {
+                    Handle::Vst3(h) => {
+                        let _ = h.set_editor_pinned(pinned);
+                    }
+                    Handle::Lv2(h) => h.set_editor_pinned(pinned),
+                }
+            }
+            let _ = tx.send(r);
         })
         .map_err(|e| e.to_string())?;
         rx.recv().map_err(|e| e.to_string())?
@@ -288,6 +555,63 @@ impl PluginEditorEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The plugins that were live when the last session died are the next session's crash
+    /// suspects; a clean exit names none, and a released plugin leaves the marker.
+    #[test]
+    fn crash_suspects_come_from_the_marker_a_crashed_session_left_behind() {
+        let dir = std::env::temp_dir().join(format!("wave-suspects-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("live-plugins.json");
+        let vitalium = CrashSuspect {
+            format: PluginRef::VST3.into(),
+            cid: "Vitalium".repeat(8)[..32].to_owned(),
+            name: "Vitalium".into(),
+            path: "/vst3/Vitalium.vst3".into(),
+        };
+        // the "crashed" session left Vitalium in the marker
+        write_marker_at(&marker, std::slice::from_ref(&vitalium));
+        let plugins =
+            Plugins::open(Some(marker.clone()), crate::plugin_probe::Safety::with(None, wave_plugin_scan::WorkerSpawn::InProcess));
+        assert_eq!(plugins.crash_suspects(), vec![vitalium.clone()]);
+        // this session starts clean: the marker no longer names anybody
+        assert_eq!(read_marker_at(&marker), vec![]);
+        plugins.clear_crash_suspects();
+        assert!(plugins.crash_suspects().is_empty());
+        // a live load lands in the marker, and its release takes it out again
+        let p = PluginRef {
+            format: PluginRef::VST3.into(),
+            path: "/vst3/Vitalium.vst3".into(),
+            cid: vitalium.cid.clone(),
+            name: "Vitalium".into(),
+            vendor: String::new(),
+            state: None,
+        };
+        plugins.live_loaded(7, &p);
+        assert_eq!(read_marker_at(&marker), vec![vitalium.clone()]);
+        plugins.live_released(7);
+        assert_eq!(read_marker_at(&marker), vec![]);
+        // a normal exit with a plugin still loaded leaves no suspect for the next start
+        plugins.live_loaded(8, &p);
+        plugins.clean_exit();
+        assert_eq!(read_marker_at(&marker), vec![]);
+        // a refused load (the factory's error path) never entered the marker
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn block_writes_the_formats_block_list_for_future_scans() {
+        let dir = std::env::temp_dir().join(format!("wave-block-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("vst3-blocklist.txt");
+        let module = std::path::Path::new("/vst3/BadActor.vst3");
+        wave_plugin_scan::BlockList::with_file(&file).block(module);
+        let list = wave_plugin_scan::BlockList::with_file(&file);
+        assert!(list.contains(module));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn editor_events_reach_the_ui_as_open_and_edited_flags() {

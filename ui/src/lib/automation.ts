@@ -122,6 +122,49 @@ export function readTarget(p: Project, t: AutoTarget): number | null {
   }
 }
 
+/**
+ * The ops that set the control to plain value `x` (the inverse of `readTarget`), or null when the
+ * project does not hold the value (a hosted plugin's parameter) or the target is gone.
+ */
+export function writeTargetOps(p: Project, t: AutoTarget, x: number): Op[] | null {
+  if (!isFinite(x)) return null;
+  const chan = (id: Id, f: (c: Channel) => Channel | null): Op[] | null => {
+    const c = chanOf(p, id), n = c && f(c);
+    return n ? [{ op: 'putChannel', channel: n }] : null;
+  };
+  const insert = (id: Id, patch: Partial<Project['inserts'][number]>): Op[] | null => {
+    const m = p.inserts.find(q => q.id === id);
+    return m ? [{ op: 'putInsert', insert: { ...m, ...patch } }] : null;
+  };
+  const fx = (id: Id, f: (fx: Project['inserts'][number]['fx'][number]) => Project['inserts'][number]['fx'][number] | null): Op[] | null => {
+    const ff = fxOf(p, id), n = ff && f(ff.f);
+    return ff && n ? [{ op: 'putFx', insertId: ff.m.id, fx: n }] : null;
+  };
+  switch (t.kind) {
+    case 'plugin': return null;
+    case 'mix': return fx(t.fxId, f => ({ ...f, mix: x }));
+    case 'insertVol': return insert(t.id, { vol: x });
+    case 'insertPan': return insert(t.id, { pan: x });
+    case 'trackVol': { const tr = p.tracks.find(q => q.id === t.id); return tr ? [{ op: 'putTrack', track: { ...tr, vol: x } }] : null; }
+    case 'chanVol': return chan(t.id, c => ({ ...c, vol: x }));
+    case 'chanPan': return chan(t.id, c => ({ ...c, pan: x }));
+    case 'clipGain': case 'clipPan': {
+      const c = clipOf(p, t.id);
+      return c ? [{ op: 'putClips', clips: [{ ...c, [t.kind === 'clipGain' ? 'gain' : 'pan']: x }] }] : null;
+    }
+    case 'keys': return chan(t.chanId, c => (c.kind === 'keys' ? { ...c, keys: { ...c.keys, [t.param]: x } } : null));
+    case 'synth': return chan(t.chanId, c => (c.kind === 'synth' ? { ...c, synth: { ...c.synth, params: { ...c.synth.params, [t.param]: x } } } : null));
+    case 'fx': {
+      const b = parseBandParam(t.param);
+      return fx(t.fxId, f => {
+        if (!b) return { ...f, params: { ...f.params, [t.param]: x } };
+        if (!f.bands?.[b.i]) return null;
+        return { ...f, bands: f.bands.map((band, i) => (i === b.i ? { ...band, [b.k]: x } : band)) };
+      });
+    }
+  }
+}
+
 /** `(e^(s·x) − 1) / (e^s − 1)`: 0 at 0, 1 at 1, slow start for s > 0, straight at s = 0. */
 const bend = (x: number, s: number) => (Math.abs(s) < 1e-6 ? x : Math.expm1(s * x) / Math.expm1(s));
 /** Steps of a `stairs` segment for `tension` −1..1: 2..16 (model.rs `stairs_of`). */
@@ -166,33 +209,66 @@ export function automatedKeys(p: Project): Set<string> {
   return s;
 }
 
+/** An automation clip of one target: beats [start, end) play `points` from `offset` on. */
+export type AutoSpan = { start: number; end: number; offset: number; points: AutoPoint[] };
+
 /**
- * Normalised value driving `target` at `beat` (the last unmuted clip under the playhead wins),
- * or null when no automation clip covers it.
+ * The value a target's automation clips give it at `beat` (engine `drive_value`, rt.rs): the clip
+ * under the playhead (the latest-starting one where clips overlap); between clips, where the last
+ * one before ended; before the first clip, where that clip begins. `spans` sorted by start.
+ */
+export function spansValue(spans: AutoSpan[], beat: number): number | null {
+  let covering: AutoSpan | null = null, ended: AutoSpan | null = null;
+  for (const s of spans) {
+    if (s.start > beat) break;
+    if (beat < s.end) covering = s;
+    else if (!ended || s.end >= ended.end) ended = s;
+  }
+  if (covering) return valueAt(covering.points, beat - covering.start + covering.offset);
+  if (ended) return valueAt(ended.points, ended.end - ended.start + ended.offset);
+  const f = spans[0];
+  return f ? valueAt(f.points, f.offset) : null;
+}
+
+/** The unmuted automation clips of each target key, sorted by start (stable, like the engine). */
+export function automationSpans(p: Project): Map<string, AutoSpan[]> {
+  const autos = new Map((p.automations ?? []).map(a => [a.id, a]));
+  const m = new Map<string, AutoSpan[]>();
+  for (const c of p.clips) {
+    if (c.kind !== 'auto' || c.muted) continue;
+    const a = autos.get(c.ref); if (!a) continue;
+    const k = targetKey(a.target);
+    let l = m.get(k); if (!l) m.set(k, l = []);
+    l.push({ start: c.start, end: c.start + c.len, offset: c.offset, points: a.points });
+  }
+  for (const l of m.values()) l.sort((a, b) => a.start - b.start);
+  return m;
+}
+
+/**
+ * Normalised value driving `target` at `beat` (see `spansValue`: also before, between and after
+ * its clips), or null when no unmuted automation clip drives it.
  */
 export function automatedValue(p: Project, target: AutoTarget, beat: number): number | null {
-  const key = targetKey(target);
-  let out: number | null = null;
-  for (const c of p.clips) {
-    if (c.kind !== 'auto' || c.muted || beat < c.start || beat >= c.start + c.len) continue;
-    const a = p.automations?.find(x => x.id === c.ref);
-    if (!a || targetKey(a.target) !== key) continue;
-    const v = valueAt(a.points, beat - c.start + c.offset);
-    if (v != null) out = v;
-  }
-  return out;
+  return spansValue(automationSpans(p).get(targetKey(target)) ?? [], beat);
 }
 
 /** A track to put a new automation clip on: an empty track (no clips at all), else a new one at the end. */
-export function trackForAutomation(p: Project): { index: number; ops: Op[] } {
-  const used = new Set(p.clips.map(c => c.track));
-  for (let i = 0; i < p.tracks.length; i++) if (!used.has(i) && !p.tracks[i].arm) return { index: i, ops: [] };
-  return { index: p.tracks.length, ops: [] };
+/**
+ * The track an automation clip over beats [start, start + len) goes on: the first one with nothing
+ * in that span (FL's playlist tracks hold any kind of clip; the rest of the track may be in use),
+ * never an armed one; `p.tracks.length` (a new track at the bottom) when every track is busy there.
+ */
+export function trackForAutomation(p: Project, start: number, len: number): number {
+  const end = start + len, busy = new Set<number>();
+  for (const c of p.clips) if (c.start < end - 1e-9 && c.start + c.len > start + 1e-9) busy.add(c.track);
+  for (let i = 0; i < p.tracks.length; i++) if (!busy.has(i) && !p.tracks[i].arm) return i;
+  return p.tracks.length;
 }
 
 /**
  * Ops that create an automation for `target` holding `value` (plain units): the envelope with two
- * points, a clip of `len` beats at `start`, on an empty or new track.
+ * points, a clip of `len` beats at `start`, on a track free over that span or a new one.
  */
 export function createAutomationOps(p: Project, cat: Catalog | null, target: AutoTarget, name: string, color: string, start: number, len: number, alloc: () => Id, current?: number): { ops: Op[]; clipId: Id; autoId: Id; track: number } {
   const cur = target.kind === 'plugin'
@@ -202,7 +278,7 @@ export function createAutomationOps(p: Project, cat: Catalog | null, target: Aut
   const autoId = alloc();
   const auto: Automation = { id: autoId, name, color, target, points: [{ t: 0, v }, { t: len, v }] };
   const ops: Op[] = [{ op: 'putAutomation', automation: auto }];
-  let track = trackForAutomation(p).index;
+  let track = trackForAutomation(p, start, len);
   if (track >= p.tracks.length) {
     const tid = alloc();
     ops.push(...insertTrackOps(structuredClone(p), p.tracks.length, tid));
@@ -262,7 +338,7 @@ export function autoValueText(p: Project, cat: Catalog | null, t: AutoTarget, v:
     case 'clipGain': return dbText(x);
     case 'mix': return Math.round(x * 100) + '%';
     case 'synth': { const d = cat && synthParam(cat.synth, t.param); return d ? pFmt(d, x) : Math.round(v * 100) + '%'; }
-    case 'keys': return t.param === 'release' ? x.toFixed(2) + ' s' : Math.round(x * 100) + '%';
+    case 'keys': return t.param === 'release' ? Math.round(x) + ' ms' : Math.round(x) + '%'; // release is in ms, dynamics in percent (KEYS_RELEASE, KEYS_DYNAMICS)
     case 'plugin': return Math.round(x * 100) + '%';
     case 'fx': {
       const b = parseBandParam(t.param);
@@ -281,7 +357,11 @@ export function autoValueText(p: Project, cat: Catalog | null, t: AutoTarget, v:
 export function parseAutoValue(p: Project, cat: Catalog | null, t: AutoTarget, text: string): number | null {
   const vol = t.kind === 'insertVol' || t.kind === 'trackVol' || t.kind === 'chanVol';
   if (vol && /-?inf|∞/i.test(text)) return 0;
-  const m = /^\s*([-+]?\d*[.,]?\d+)\s*(k)?/i.exec(text);
+  const pan = t.kind === 'insertPan' || t.kind === 'chanPan' || t.kind === 'clipPan';
+  // a centred pan reads "C" (panText): typing C, centre or center means the middle
+  if (pan && /^\s*(c|cent(er|re))\s*$/i.test(text)) return normalize(p, cat, t, 0);
+  // a label in front of the number (an EQ band's "Q 0.71") is read past
+  const m = /^\s*(?:[a-z]+\s+)?([-+]?\d*[.,]?\d+)\s*(k)?/i.exec(text);
   if (!m) return null;
   let x = parseFloat(m[1].replace(',', '.')) * (m[2] ? 1000 : 1);
   if (!isFinite(x)) return null;

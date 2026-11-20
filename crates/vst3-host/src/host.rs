@@ -1,10 +1,11 @@
-//! The COM objects WAVE implements *for* a VST3 plugin.
+//! The COM objects Synkopa implements *for* a VST3 plugin.
 //!
 //! | object | given to | why it cannot be null |
 //! | --- | --- | --- |
 //! | [`HostContext`] | `initialize` on both halves, `setComponentHandler` | plugins ask for the host's name, and the editor reports knob moves through `IComponentHandler` |
 //! | [`ParameterChanges`] | `ProcessData::{input,output}ParameterChanges` | how parameter moves reach the processor; nominally optional, dereferenced anyway |
 //! | [`EmptyEventList`] | `ProcessData::inputEvents` | effects with an event bus dereference it too |
+//! | [`NoteEventList`] | `ProcessData::inputEvents` of an instrument | how notes reach it |
 //! | [`PlugFrame`] | `IPlugView::setFrame` | how an editor asks for a size |
 //! | [`MemoryStream`] | `getState` / `setState` | there is no other way to move a state blob |
 //!
@@ -18,6 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
+use vst3::Steinberg::Linux::IRunLoop;
 use vst3::Steinberg::Vst::{
     Event, IComponentHandler, IComponentHandlerTrait, IEventList, IEventListTrait, IHostApplication, IHostApplicationTrait,
     IParamValueQueue, IParamValueQueueTrait, IParameterChanges, IParameterChangesTrait, ParamID, ParamValue, String128,
@@ -29,9 +31,10 @@ use vst3::Steinberg::{
 use vst3::{Class, ComWrapper};
 
 use crate::module::write_utf16;
+use crate::run_loop::RunLoop;
 
 /// Host identity handed to every plugin.
-pub(crate) const HOST_NAME: &str = "WAVE";
+pub(crate) const HOST_NAME: &str = "Synkopa";
 
 /// Largest state blob accepted from, or handed to, a plugin. Guards against a
 /// plugin that streams without end.
@@ -41,7 +44,7 @@ pub const MAX_STATE_BYTES: usize = 64 * 1024 * 1024;
 /// the mailbox for the next block, never dropped.
 pub(crate) const MAX_CHANGES_PER_BLOCK: usize = 64;
 
-/// Points one queue holds. Input queues use one (WAVE sends no ramps); output
+/// Points one queue holds. Input queues use one (Synkopa sends no ramps); output
 /// queues take what the plugin writes, up to this.
 const POINTS_PER_QUEUE: usize = 16;
 
@@ -194,21 +197,25 @@ const PARAMS_CHANGED: int32 = (1 << 2) | (1 << 4);
 /// The host context both plugin halves are initialised with, and the component
 /// handler the controller reports edits through.
 ///
-/// `createInstance` (for `IMessage`/`IAttributeList`) answers
-/// `kNotImplemented`: legal and tolerated by every plugin, but a
-/// dual-component plugin that relies on `IConnectionPoint` messaging will have
-/// an editor that hears less from its processor.
-pub(crate) struct HostContext {
+/// `createInstance` makes `IMessage`s and `IAttributeList`s ([`crate::message`]), so
+/// a dual-component plugin's processor and controller can talk over the
+/// `IConnectionPoint`s Synkopa connects.
+///
+/// `RUN_LOOP`: whether it also answers `Linux::IRunLoop` (see [`crate::run_loop`]). Only
+/// where the UI thread really runs a loop: a plugin that is offered one stops its own
+/// message thread.
+pub(crate) struct HostContext<const RUN_LOOP: bool = false> {
     /// Host -> processor mailbox. Set once the controller has listed its
     /// parameters; an edit reported before that (during `initialize`) has no
     /// processor to reach yet and is dropped.
     inbox: OnceLock<Arc<ParamMailbox>>,
     flags: Arc<HostFlags>,
+    run_loop: Arc<RunLoop>,
 }
 
-impl HostContext {
-    pub(crate) fn new(flags: Arc<HostFlags>) -> ComWrapper<Self> {
-        ComWrapper::new(Self { inbox: OnceLock::new(), flags })
+impl<const RUN_LOOP: bool> HostContext<RUN_LOOP> {
+    fn make(flags: Arc<HostFlags>, run_loop: Arc<RunLoop>) -> Self {
+        Self { inbox: OnceLock::new(), flags, run_loop }
     }
 
     pub(crate) fn connect_inbox(&self, inbox: Arc<ParamMailbox>) {
@@ -216,11 +223,57 @@ impl HostContext {
     }
 }
 
-impl Class for HostContext {
+impl Class for HostContext<false> {
     type Interfaces = (IHostApplication, IComponentHandler);
 }
 
-impl IHostApplicationTrait for HostContext {
+impl Class for HostContext<true> {
+    type Interfaces = (IHostApplication, IComponentHandler, IRunLoop);
+}
+
+crate::run_loop::forward_run_loop!(HostContext<true>, run_loop);
+
+/// An instance's host context, with or without a run loop.
+pub(crate) enum Context {
+    Plain(ComWrapper<HostContext<false>>),
+    Looped(ComWrapper<HostContext<true>>),
+}
+
+impl Context {
+    /// A context that offers `run_loop` to the plugin when this platform has `IRunLoop`
+    /// (Linux) and the calling thread runs an installed loop.
+    pub(crate) fn new(flags: Arc<HostFlags>, run_loop: &Arc<RunLoop>) -> Self {
+        if cfg!(target_os = "linux") && crate::run_loop::available() {
+            Self::Looped(ComWrapper::new(HostContext::make(flags, Arc::clone(run_loop))))
+        } else {
+            Self::Plain(ComWrapper::new(HostContext::make(flags, Arc::clone(run_loop))))
+        }
+    }
+
+    /// The `FUnknown` a plugin's `initialize` is given.
+    pub(crate) fn ptr(&self) -> *mut FUnknown {
+        match self {
+            Self::Plain(c) => c.as_com_ref::<IHostApplication>().map_or(std::ptr::null_mut(), |h| h.as_ptr().cast()),
+            Self::Looped(c) => c.as_com_ref::<IHostApplication>().map_or(std::ptr::null_mut(), |h| h.as_ptr().cast()),
+        }
+    }
+
+    pub(crate) fn handler(&self) -> *mut IComponentHandler {
+        match self {
+            Self::Plain(c) => c.as_com_ref::<IComponentHandler>().map_or(std::ptr::null_mut(), |h| h.as_ptr()),
+            Self::Looped(c) => c.as_com_ref::<IComponentHandler>().map_or(std::ptr::null_mut(), |h| h.as_ptr()),
+        }
+    }
+
+    pub(crate) fn connect_inbox(&self, inbox: Arc<ParamMailbox>) {
+        match self {
+            Self::Plain(c) => c.connect_inbox(inbox),
+            Self::Looped(c) => c.connect_inbox(inbox),
+        }
+    }
+}
+
+impl<const RUN_LOOP: bool> IHostApplicationTrait for HostContext<RUN_LOOP> {
     unsafe fn getName(&self, name: *mut String128) -> tresult {
         if name.is_null() {
             return kInvalidArgument;
@@ -229,15 +282,13 @@ impl IHostApplicationTrait for HostContext {
         kResultOk
     }
 
-    unsafe fn createInstance(&self, _cid: *mut TUID, _iid: *mut TUID, obj: *mut *mut c_void) -> tresult {
-        if !obj.is_null() {
-            *obj = std::ptr::null_mut();
-        }
-        kNotImplemented
+    /// Messages and attribute lists for the plugin's processor <-> controller channel.
+    unsafe fn createInstance(&self, cid: *mut TUID, iid: *mut TUID, obj: *mut *mut c_void) -> tresult {
+        crate::message::create_instance(cid, iid, obj)
     }
 }
 
-impl IComponentHandlerTrait for HostContext {
+impl<const RUN_LOOP: bool> IComponentHandlerTrait for HostContext<RUN_LOOP> {
     unsafe fn beginEdit(&self, _id: ParamID) -> tresult {
         kResultOk
     }
@@ -270,11 +321,6 @@ impl IComponentHandlerTrait for HostContext {
     }
 }
 
-/// The `FUnknown` a plugin's `initialize` is given.
-pub(crate) fn host_context_ptr(context: &ComWrapper<HostContext>) -> *mut FUnknown {
-    context.as_com_ref::<IHostApplication>().map_or(std::ptr::null_mut(), |host| host.as_ptr().cast::<FUnknown>())
-}
-
 // ---------------------------------------------------------------------------
 // IPlugFrame
 // ---------------------------------------------------------------------------
@@ -300,20 +346,30 @@ impl GuiRequests {
     }
 }
 
-/// The frame an editor is given. `kResultOk` means "acknowledged", not "done".
+/// The frame an editor is given. `kResultOk` means "acknowledged", not "done". On Linux it
+/// is also the editor's `IRunLoop` (the instance's registrations).
 pub(crate) struct PlugFrame {
     requests: Arc<GuiRequests>,
+    run_loop: Arc<RunLoop>,
 }
 
 impl PlugFrame {
-    pub(crate) fn new(requests: Arc<GuiRequests>) -> ComWrapper<Self> {
-        ComWrapper::new(Self { requests })
+    pub(crate) fn new(requests: Arc<GuiRequests>, run_loop: Arc<RunLoop>) -> ComWrapper<Self> {
+        ComWrapper::new(Self { requests, run_loop })
     }
 }
 
+#[cfg(target_os = "linux")]
+impl Class for PlugFrame {
+    type Interfaces = (IPlugFrame, IRunLoop);
+}
+
+#[cfg(not(target_os = "linux"))]
 impl Class for PlugFrame {
     type Interfaces = (IPlugFrame,);
 }
+
+crate::run_loop::forward_run_loop!(PlugFrame, run_loop);
 
 impl IPlugFrameTrait for PlugFrame {
     unsafe fn resizeView(&self, _view: *mut IPlugView, new_size: *mut ViewRect) -> tresult {
@@ -455,6 +511,34 @@ impl ParameterChanges {
         }
     }
 
+    /// Add one point at `offset` for parameter `id` (a MIDI controller mapped through
+    /// `IMidiMapping`), after anything [`fill`](Self::fill) put there. RT-safe. `false` when
+    /// the block has no room left for it.
+    pub(crate) fn add_point(&self, id: ParamID, offset: int32, value: ParamValue) -> bool {
+        let used = self.count.get();
+        let queue = match self.queues[..used].iter().find(|queue| queue.id.get() == id) {
+            Some(queue) => queue,
+            None if used < self.queues.len() => {
+                let queue = &self.queues[used];
+                queue.id.set(id);
+                queue.count.set(0);
+                self.count.set(used + 1);
+                queue
+            }
+            None => return false,
+        };
+        let count = queue.count.get();
+        if count >= POINTS_PER_QUEUE {
+            return false;
+        }
+        // points of one queue must be in time order; a value already queued at 0 by the
+        // mailbox is the state before this point
+        let offset = count.checked_sub(1).map_or(offset, |last| offset.max(queue.points[last].get().0));
+        queue.points[count].set((offset, value));
+        queue.count.set(count + 1);
+        true
+    }
+
     /// Hand every parameter's final value to `sink` (processor -> host feedback).
     pub(crate) fn for_each_last(&self, mut sink: impl FnMut(ParamID, ParamValue)) {
         for queue in &self.queues[..self.count.get()] {
@@ -505,7 +589,7 @@ impl IParameterChangesTrait for ParameterChanges {
 // IEventList
 // ---------------------------------------------------------------------------
 
-/// An input event list that is always empty: WAVE hosts effects and sends
+/// An input event list that is always empty: Synkopa hosts effects and sends
 /// them no events, but a plugin with an event bus may not check for null.
 pub(crate) struct EmptyEventList;
 
@@ -526,6 +610,73 @@ impl IEventListTrait for EmptyEventList {
 
     unsafe fn getEvent(&self, _index: int32, _event: *mut Event) -> tresult {
         kInvalidArgument
+    }
+
+    /// The host's input list must not grow under the audio thread.
+    unsafe fn addEvent(&self, _event: *mut Event) -> tresult {
+        kNotImplemented
+    }
+}
+
+/// An instrument's input events for one block, preallocated: the audio thread refills it
+/// before every `process` and nothing here allocates after [`new`](Self::new).
+pub(crate) struct NoteEventList {
+    events: std::cell::UnsafeCell<Vec<Event>>,
+}
+
+// SAFETY: as for `ValueQueue`: owned by one instrument, filled and read inside the same
+// `process` call on the thread that owns it.
+unsafe impl Send for NoteEventList {}
+unsafe impl Sync for NoteEventList {}
+
+impl NoteEventList {
+    pub(crate) fn new(capacity: usize) -> ComWrapper<Self> {
+        ComWrapper::new(Self { events: std::cell::UnsafeCell::new(Vec::with_capacity(capacity)) })
+    }
+
+    /// Empty the list, keeping its storage. RT-safe.
+    pub(crate) fn clear(&self) {
+        // SAFETY: no plugin call is in progress (see the `Send` note); no reference into the
+        // vector outlives this call.
+        unsafe { (*self.events.get()).clear() }
+    }
+
+    /// Append an event; `false` (nothing added) when the list is full. RT-safe.
+    pub(crate) fn push(&self, event: Event) -> bool {
+        // SAFETY: as in `clear`.
+        let events = unsafe { &mut *self.events.get() };
+        if events.len() == events.capacity() {
+            return false;
+        }
+        events.push(event);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        // SAFETY: as in `clear`.
+        unsafe { (*self.events.get()).len() }
+    }
+}
+
+impl Class for NoteEventList {
+    type Interfaces = (IEventList,);
+}
+
+impl IEventListTrait for NoteEventList {
+    unsafe fn getEventCount(&self) -> int32 {
+        (*self.events.get()).len() as int32
+    }
+
+    unsafe fn getEvent(&self, index: int32, event: *mut Event) -> tresult {
+        let events = &*self.events.get();
+        match (usize::try_from(index).ok().and_then(|i| events.get(i)), event.is_null()) {
+            (Some(found), false) => {
+                std::ptr::copy_nonoverlapping(found, event, 1);
+                kResultOk
+            }
+            _ => kInvalidArgument,
+        }
     }
 
     /// The host's input list must not grow under the audio thread.
@@ -651,7 +802,8 @@ impl IBStreamTrait for MemoryStream {
 pub(crate) struct Counters {
     pub(crate) feedback_dropped: AtomicU64,
     pub(crate) process_errors: AtomicU64,
-    pub(crate) ok_calls: AtomicU64,
+    /// Instrument events that did not fit a block's event list.
+    pub(crate) events_dropped: AtomicU64,
 }
 
 #[cfg(test)]
@@ -673,10 +825,14 @@ mod tests {
         out
     }
 
-    fn context() -> (ComWrapper<HostContext>, Arc<ParamMailbox>, Unlisted, Arc<HostFlags>) {
+    fn plain_context(flags: Arc<HostFlags>, run_loop: Arc<RunLoop>) -> ComWrapper<HostContext<false>> {
+        ComWrapper::new(HostContext::make(flags, run_loop))
+    }
+
+    fn context() -> (ComWrapper<HostContext<false>>, Arc<ParamMailbox>, Unlisted, Arc<HostFlags>) {
         let (inbox, unlisted) = mailbox(&[7]);
         let flags = Arc::new(HostFlags::default());
-        let context = HostContext::new(Arc::clone(&flags));
+        let context = plain_context(Arc::clone(&flags), RunLoop::new());
         context.connect_inbox(Arc::clone(&inbox));
         (context, inbox, unlisted, flags)
     }
@@ -735,7 +891,7 @@ mod tests {
 
     #[test]
     fn edits_before_the_mailbox_exists_are_dropped_not_crashed_on() {
-        let context = HostContext::new(Arc::new(HostFlags::default()));
+        let context = plain_context(Arc::new(HostFlags::default()), RunLoop::new());
         let handler: ComPtr<IComponentHandler> = context.to_com_ptr().unwrap();
         // SAFETY: plain scalars.
         assert_eq!(unsafe { handler.performEdit(1, 0.5) }, kResultOk);
@@ -782,9 +938,21 @@ mod tests {
     }
 
     #[test]
+    fn only_a_looped_context_and_a_linux_frame_answer_irunloop() {
+        let plain: ComPtr<IHostApplication> = plain_context(Arc::default(), RunLoop::new()).to_com_ptr().unwrap();
+        assert!(plain.cast::<IRunLoop>().is_none(), "no loop offered where none is pumped");
+        let looped: ComPtr<IHostApplication> =
+            ComWrapper::new(HostContext::<true>::make(Arc::default(), RunLoop::new())).to_com_ptr().unwrap();
+        assert!(looped.cast::<IRunLoop>().is_some());
+        assert!(looped.cast::<IComponentHandler>().is_some());
+        let frame: ComPtr<IPlugFrame> = PlugFrame::new(Arc::default(), RunLoop::new()).to_com_ptr().unwrap();
+        assert_eq!(frame.cast::<IRunLoop>().is_some(), cfg!(target_os = "linux"));
+    }
+
+    #[test]
     fn a_plug_frame_records_the_size_asked_for_and_refuses_null() {
         let requests = Arc::new(GuiRequests::default());
-        let frame: ComPtr<IPlugFrame> = PlugFrame::new(Arc::clone(&requests)).to_com_ptr().unwrap();
+        let frame: ComPtr<IPlugFrame> = PlugFrame::new(Arc::clone(&requests), RunLoop::new()).to_com_ptr().unwrap();
         let mut rect = ViewRect { left: 10, top: 20, right: 810, bottom: 620 };
         // SAFETY: `rect` is live for the call; the view is unused.
         unsafe {
@@ -866,6 +1034,53 @@ mod tests {
             assert_eq!(list.getEvent(0, &mut event), kInvalidArgument);
             assert_eq!(list.addEvent(&mut event), kNotImplemented);
         }
+    }
+
+    #[test]
+    fn mapped_controllers_add_timed_points_after_the_mailbox_values() {
+        let (inbox, mut unlisted) = mailbox(&[5]);
+        let changes = ParameterChanges::new();
+        assert!(inbox.post(5, 0.2));
+        changes.fill(&inbox, &mut unlisted);
+        assert!(changes.add_point(5, 40, 0.9));
+        assert!(changes.add_point(77, 10, 1.0), "a controller parameter not posted this block");
+        assert_eq!(changes.len(), 2);
+        // SAFETY: indices in range, live out-params.
+        unsafe {
+            let queue = ComRef::<IParamValueQueue>::from_raw(changes.getParameterData(0)).unwrap();
+            assert_eq!(queue.getPointCount(), 2);
+            let (mut offset, mut value) = (-1, 0.0);
+            assert_eq!(queue.getPoint(1, &mut offset, &mut value), kResultOk);
+            assert_eq!((offset, value), (40, 0.9));
+        }
+        for n in 0..POINTS_PER_QUEUE {
+            let _ = changes.add_point(77, 20 + n as i32, 0.5);
+        }
+        assert!(!changes.add_point(77, 99, 0.5), "a full queue refuses instead of growing");
+    }
+
+    #[test]
+    fn the_note_event_list_hands_out_copies_and_never_grows() {
+        let list = NoteEventList::new(2);
+        let com: ComPtr<IEventList> = list.to_com_ptr().unwrap();
+        // SAFETY: zeroed events are valid values; out-pointers are live locals.
+        unsafe {
+            let mut e: Event = std::mem::zeroed();
+            e.sampleOffset = 5;
+            assert!(list.push(e));
+            e.sampleOffset = 6;
+            assert!(list.push(e));
+            assert!(!list.push(e), "full");
+            assert_eq!(com.getEventCount(), 2);
+            let mut out: Event = std::mem::zeroed();
+            assert_eq!(com.getEvent(1, &mut out), kResultOk);
+            assert_eq!(out.sampleOffset, 6);
+            assert_eq!(com.getEvent(2, &mut out), kInvalidArgument);
+            assert_eq!(com.getEvent(0, std::ptr::null_mut()), kInvalidArgument);
+            assert_eq!(com.addEvent(&mut out), kNotImplemented);
+        }
+        list.clear();
+        assert_eq!(list.len(), 0);
     }
 
     #[test]

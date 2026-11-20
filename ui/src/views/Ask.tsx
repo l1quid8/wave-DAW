@@ -1,11 +1,11 @@
-// "Ask AI": a question about WAVE goes to an AI assistant that reads WAVE's open-source code.
+// "Ask AI": a question about Synkopa goes to an AI assistant that reads Synkopa's open-source code.
 // ChatGPT gets the whole prompt in its link; DeepWiki's links take no question, so the question
 // is copied and the user pastes it there (as with a ChatGPT question too long for a link).
 import { createSignal, For, Show } from 'solid-js';
 import { be } from '../api/backend';
 import { askPrompt, askUrl, type AskService } from '../lib/askLink';
 import { t } from '../lib/i18n';
-import { say, U } from '../state/ui';
+import { say, tucked, U } from '../state/ui';
 import { rackFloating, rollFloating } from '../state/pattern';
 import { APP_GLYPH } from '../ui/menuIcons';
 
@@ -26,6 +26,8 @@ export const openAsk = () => {
   setOpen(true);
   if (version == null) be().appInfo().then(i => { version = i.version; }).catch(() => {});
 };
+/** Opens the Ask dialog with `text` as the question (the command palette's "Ask AI"): the user reads where it goes and sends it there. */
+export const askAbout = (text: string) => { setQuestion(text); openAsk(); };
 export const toggleAsk = () => (open() ? setOpen(false) : openAsk());
 const close = () => { if (!busy()) setOpen(false); };
 
@@ -35,12 +37,12 @@ function setService(s: AskService) {
   try { localStorage.setItem(SERVICE_KEY, s); } catch { /* private window */ }
 }
 
-/** What the user is looking at, in English for the prompt (names as WAVE's menus show them). */
+/** What the user is looking at, in English for the prompt (names as Synkopa's menus show them). */
 function currentView(): string {
   const parts = [U.mixView ? 'Mix view (F9)' : 'Playlist'];
   if (U.rackWin || rackFloating()) parts.push('Channel rack');
   if (U.rollWin || rollFloating()) parts.push('Piano roll');
-  if (U.plugs.length && !U.plugsHidden) parts.push('an effect window');
+  if (U.plugs.some(p => !tucked(p.z))) parts.push('an effect window');
   return parts.join(', ');
 }
 

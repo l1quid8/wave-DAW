@@ -5,7 +5,7 @@
 // (absent = the channel's root); `v` velocity 0..1 (absent = 1).
 import { t, type TranslationKey } from './i18n';
 import { migrateSatParams } from './saturator';
-import { KEYS_RELEASE, SAMPLE_ROOT, SAMPLER, TOTAL_BEATS, type Channel, type Id, type Note, type Op, type Pattern, type Project, type SamplerState } from '../api/types';
+import { KEYS_RELEASE, SAMPLE_ROOT, SAMPLER, samplerDefault, TOTAL_BEATS, type Channel, type Id, type Note, type Op, type Pattern, type Project, type SamplerState } from '../api/types';
 import { addStarterKit } from './factory';
 import { SYNTH_CATALOG } from '../api/synthCatalog';
 import { synthError } from './synth';
@@ -20,13 +20,18 @@ export function samplerError(s: SamplerState | undefined): string | null {
   const within = (v: number, lo: number, hi: number) => Number.isFinite(v) && v >= lo && v <= hi;
   if (!(within(s.start, 0, 1) && within(s.end, 0, 1) && s.end - s.start >= SAMPLER.minSpan - 1e-6)) return 'sampler start and end are fractions 0..1 of the file, start before end';
   if (!(Number.isInteger(s.semi) && within(s.semi, SAMPLER.semi.min, SAMPLER.semi.max) && within(s.fine, SAMPLER.fine.min, SAMPLER.fine.max))) return 'sampler pitch is -24..24 semitones and -100..100 cents';
-  if (!(within(s.attack, SAMPLER.attack.min, SAMPLER.attack.max) && within(s.decay, SAMPLER.decay.min, SAMPLER.decay.max) && within(s.sustain, 0, 1) && within(s.release, SAMPLER.release.min, SAMPLER.release.max))) return 'sampler envelope: attack 0..2000 ms, decay 0..5000 ms, sustain 0..1, release 1..5000 ms';
+  if (!(within(s.delay, SAMPLER.delay.min, SAMPLER.delay.max) && within(s.attack, SAMPLER.attack.min, SAMPLER.attack.max) && within(s.hold, SAMPLER.hold.min, SAMPLER.hold.max)
+    && within(s.decay, SAMPLER.decay.min, SAMPLER.decay.max) && within(s.sustain, 0, 1) && within(s.release, SAMPLER.release.min, SAMPLER.release.max)))
+    return 'sampler envelope: delay 0..5000 ms, attack 0..2000 ms, hold 0..5000 ms, decay 0..5000 ms, sustain 0..1, release 1..5000 ms';
+  if (![s.attackTension, s.decayTension, s.releaseTension].every(k => within(k, -1, 1))) return 'sampler envelope tensions are -1..1';
   if (!(within(s.fadeInMs ?? 0, 0, SAMPLER.fadeMaxMs) && within(s.fadeOutMs ?? 0, 0, SAMPLER.fadeMaxMs))) return 'sampler fades must be 0..5000 ms';
   if (!(Number.isInteger(s.cut) && within(s.cut, 0, SAMPLER.cutGroups))) return 'sampler cut group is 0 (none) or 1..8';
   return null;
 }
 export const keyOf = (n: Note, c: Channel | undefined) => n.p ?? c?.root ?? SAMPLE_ROOT;
 export const velOf = (n: Note) => n.v ?? 1;
+/** A note's own pan, -1 (left) .. 1 (right); 0 when it has none. */
+export const panOf = (n: Note) => n.pan ?? 0;
 /** Number of 16ths in the pattern. */
 export const stepsOf = (p: Pattern) => Math.max(1, Math.round(p.len * 4));
 /** Channel Rack step grid: extra px between groups of four steps (beats), like FL's. */
@@ -70,10 +75,29 @@ export class PatternOpError extends Error {}
 
 const bump = (p: Project, id: Id) => { if (id >= p.nextId) p.nextId = id + 1; };
 
+/** Drops the fields the engine's serde omits on write: swing only when non-zero, a note's
+ * `v` only when it is not exactly 1 (`skip_serializing_if`). */
+export function stripPatternDefaults(pt: Pattern): void {
+  if (!pt.swing) delete pt.swing;
+  for (const n of pt.notes) if (n.v === 1) delete n.v;
+}
+
 /** Project.migrate: derived pattern lengths, the starter kit when the Channel Rack is empty. */
+/**
+ * A sampler saved before the volume-envelope switch (engine `migrate_sampler_envelopes`): it had a `gate` mode
+ * and always applied attack, decay and sustain, so a gated or shaped one opens with its envelope on.
+ */
+export function migrateSamplerEnvelope(s: SamplerState & { gate?: boolean }) {
+  if (typeof s.env !== 'boolean') s.env = !!s.gate || (s.attack ?? 0) > 0 || (s.sustain ?? 1) < 1;
+  delete s.gate;
+  const d = samplerDefault();
+  for (const k of ['delay', 'hold', 'attackTension', 'decayTension', 'releaseTension'] as const) s[k] ??= d[k];
+}
+
 export function migrateProject(p: Project) {
   for (const pt of p.patterns) fitLen(pt);
   if (!p.channels?.length) addStarterKit(p);
+  for (const c of p.channels ?? []) if (c.kind === 'sample' && c.sampler) migrateSamplerEnvelope(c.sampler);
   // saturator parameters from before the character saturator
   for (const ins of p.inserts) for (const fx of ins.fx) if (fx.type === 'sat' && migrateSatParams(fx.params)) fx.preset = null;
 }
@@ -102,12 +126,12 @@ export function applyPatternOp(p: Project, op: Op, strict: boolean, adopt: <T ex
         if (!(n.step >= 0 && n.len > 0 && isFinite(n.step) && isFinite(n.len))) fail(`pattern ${pt.id}: a note has an invalid step/len`);
         if ((n.step + n.len) > TOTAL_BEATS * 4) fail(`pattern ${pt.id}: notes must end within ${TOTAL_BEATS} beats`);
         if (n.v != null && !(n.v >= 0 && n.v <= 1)) fail('note velocity `v` must be 0..1');
+        if (n.p != null && !(n.p >= 0 && n.p <= 127)) fail('note key `p` must be 0..127');
         if (n.trig != null && typeof n.trig !== 'boolean') fail('note `trig` must be a boolean');
         if (!n.ch) fail('every note needs `ch`');
       }
       if (strict) { const bad = pt.notes.find(n => !(p.channels ?? []).some(c => c.id === n.ch)); if (bad) fail(`no channel with id ${bad.ch}`); }
-      if (!pt.swing) delete pt.swing;
-      for (const n of pt.notes) if (n.v === 1) delete n.v;
+      stripPatternDefaults(pt);
       fitLen(pt);
       bump(p, pt.id);
       const i = p.patterns.findIndex(x => x.id === pt.id);
@@ -122,6 +146,8 @@ export function applyPatternOp(p: Project, op: Op, strict: boolean, adopt: <T ex
       const c = structuredClone(op.channel);
       if (!(c.vol >= 0 && c.vol <= 1)) fail('channel vol is a fader position 0..1');
       if (!(c.pan >= -1 && c.pan <= 1)) fail('channel pan must be -1..1');
+      if (c.root > 127) fail('channel root must be 0..127');
+      if (c.group != null && (!c.group.trim() || [...c.group].length > 40)) fail('channel group: 1..40 characters (absent = unsorted)');
       if (c.kind === 'sample') {
         if (!p.sources.some(s => s.id === c.source)) fail(`no source with id ${c.source}`);
         const e = samplerError(c.sampler); if (e) fail(e);
@@ -130,6 +156,10 @@ export function applyPatternOp(p: Project, op: Op, strict: boolean, adopt: <T ex
       if (c.kind === 'keys') {
         if (!(c.keys?.release >= KEYS_RELEASE.min && c.keys.release <= KEYS_RELEASE.max)) fail(`keys release must be ${KEYS_RELEASE.min}..${KEYS_RELEASE.max} ms`);
         if (!(c.keys.dynamics >= 0 && c.keys.dynamics <= 100)) fail('keys dynamics must be 0..100 %');
+      }
+      if (c.kind === 'plugin') {
+        if (c.plugin?.format !== 'vst3') fail(`${c.plugin?.format === 'lv2' ? 'LV2' : 'these'} instruments are not supported (VST3 only)`);
+        if (!c.plugin.cid?.trim() || !c.plugin.path?.trim()) fail("a plugin instrument needs the plugin's path and class id");
       }
       if (c.insert != null && !p.inserts.some(m => m.id === c.insert)) fail(`no insert with id ${c.insert}`);
       const chans = p.channels ?? (p.channels = []);
@@ -163,10 +193,11 @@ export function applyPatternOp(p: Project, op: Op, strict: boolean, adopt: <T ex
 
 // ---------------------------------------------------------------- step sequencer
 
-const onStep = (n: Note, ch: Id, s: number) => n.ch === ch && Math.abs(n.step - s) < EPS;
+/** A note of channel `ch` starting in cell [s, s+1): on the step, or off the grid inside it (a triplet). */
+const onStep = (n: Note, ch: Id, s: number) => n.ch === ch && n.step >= s - EPS && n.step < s + 1 - EPS;
 export const isStepOn = (notes: readonly Note[], ch: Id, s: number) => notes.some(n => onStep(n, ch, s));
 
-/** Notes with step `s` of channel `ch` set on (a trigger at the root) or off (every note starting there). */
+/** Notes with step `s` of channel `ch` set on (a trigger at the root) or off (every note starting in its cell). */
 export function setStep(notes: readonly Note[], ch: Id, s: number, on: boolean): Note[] {
   const has = isStepOn(notes, ch, s);
   if (on === has) return notes as Note[];
@@ -217,19 +248,35 @@ export function pasteChannelNotes(notes: readonly Note[], ch: Id, clip: ChannelC
 }
 
 /**
- * A row with held notes, off-grid events or chords needs the mini piano roll.
- * Legacy rows keep their previous step-grid layout and playback until edited.
+ * A row with held notes or chords needs the mini piano roll. Triggers off the 16th grid (a
+ * triplet written in the Piano roll) stay steps, drawn at their place inside the cell.
+ * Legacy rows (no `trig` flag) keep their previous layout: off the grid, they are a roll.
  */
 export function isRollRow(notes: readonly Note[], c: Channel): boolean {
   const seen = new Set<number>();
   for (const n of notes) {
     if (n.ch !== c.id) continue;
-    const r = Math.round(n.step);
     const isStep = n.trig ?? Math.abs(n.len - 1) <= EPS;
-    if (!isStep || Math.abs(n.step - r) > EPS || seen.has(r)) return true;
-    seen.add(r);
+    const onGrid = Math.abs(n.step - Math.round(n.step)) <= EPS;
+    const at = Math.round(n.step * 1000);
+    if (!isStep || (!onGrid && n.trig !== true) || seen.has(at)) return true;
+    seen.add(at);
   }
   return false;
+}
+
+/**
+ * How wide each of a step row's triggers is drawn, in steps: its whole cell, or less when the
+ * row's next trigger comes sooner (a 16th triplet puts two in one cell).
+ */
+export function stepSpans(notes: readonly Note[]): number[] {
+  const starts = notes.map(n => n.step).sort((a, b) => a - b);
+  return notes.map(n => {
+    // the first start after this one (binary search; starts within EPS are the same time)
+    let lo = 0, hi = starts.length;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (starts[m] <= n.step + EPS) lo = m + 1; else hi = m; }
+    return lo < starts.length ? Math.min(1, starts[lo] - n.step) : 1;
+  });
 }
 
 /** Set the key of the channel's notes that start in cell [s, s+1) (`root` = no key of its own). */
@@ -248,25 +295,60 @@ export function setVelAt(notes: readonly Note[], ch: Id, s: number, v: number): 
   return notes.map(n => n.ch === ch && n.step >= s - EPS && n.step < s + 1 - EPS ? { ...n, v: vv } : n);
 }
 
+/** The latest a step may be shifted inside its cell (FL's graph editor Shift), in steps. */
+export const MAX_SHIFT = 0.9;
+/** How far into its cell a note starts (0 = on the grid), in steps. */
+export const shiftOf = (n: Note) => Math.max(0, n.step - Math.floor(n.step + EPS));
+
+/** Set the pan (−1 left … 1 right) of the channel's notes that start in cell [s, s+1); centre clears it. */
+export function setPanAt(notes: readonly Note[], ch: Id, s: number, pan: number): Note[] {
+  const p = Math.round(Math.min(1, Math.max(-1, pan)) * 100) / 100;
+  return notes.map(n => {
+    if (n.ch !== ch || n.step < s - EPS || n.step >= s + 1 - EPS) return n;
+    const { pan: _p, ...rest } = n;
+    return Math.abs(p) < 0.03 ? rest : { ...rest, pan: p };
+  });
+}
+
+/** Shift the channel's notes in cell [s, s+1) to start `shift` steps (0 … MAX_SHIFT) after the cell's start. */
+export function setShiftAt(notes: readonly Note[], ch: Id, s: number, shift: number): Note[] {
+  const d = Math.round(Math.min(MAX_SHIFT, Math.max(0, shift)) * 100) / 100;
+  // an old step without the trigger flag becomes an explicit trigger: off the grid, a plain note
+  // would turn the row into a Piano roll row (`isRollRow`)
+  return notes.map(n => (n.ch === ch && n.step >= s - EPS && n.step < s + 1 - EPS ? { ...n, step: s + d, ...(d > 0 && n.trig == null ? { trig: true } : {}) } : n));
+}
+
 // ---------------------------------------------------------------- piano roll
 
-/** Piano-roll snap choices, in steps (16ths). */
-export const ROLL_SNAPS: [string, number][] = [['1/4', 4], ['1/8', 2], ['1/16', 1], ['1/32', 0.5]];
+/**
+ * Piano-roll snap choices, in steps (16ths), named as fractions of a whole note. The triplet
+ * grids split a straight value in three where it splits in two: 1/6 = a quarter-note triplet
+ * (three in the time of two quarters), 1/12 = eighth triplet, 1/24 = 16th triplet, 1/48 = 32nd.
+ */
+export const ROLL_SNAPS: [string, number][] = [
+  ['1/1', 16], ['1/2', 8], ['1/4', 4], ['1/8', 2], ['1/16', 1], ['1/32', 0.5], ['1/64', 0.25],
+];
+export const ROLL_SNAPS_TRIPLET: [string, number][] = [['1/6', 8 / 3], ['1/12', 4 / 3], ['1/24', 2 / 3], ['1/48', 1 / 3]];
+/** The grid's name ('1/16', '1/12'), or undefined when `steps` is not one of the snap choices. */
+export const rollSnapName = (steps: number) => [...ROLL_SNAPS, ...ROLL_SNAPS_TRIPLET].find(x => Math.abs(x[1] - steps) < 1e-4)?.[0];
+/** The "auto" grid, in steps: the finest of 1/64 … 1/1 whose cell is at least 24 px wide at `pps` px a step. */
+export const autoRollSnap = (pps: number) => [0.25, 0.5, 1, 2, 4, 8, 16].find(u => u * pps >= 24) ?? 16;
 /** Round (or floor) `x` steps to the grid; `unit` 0 = free (1/128 resolution). */
 export function snapStep(x: number, unit: number, floor = false): number {
   if (!unit) return Math.round(x * 32) / 32;
-  return (floor ? Math.floor(x / unit + 1e-9) : Math.round(x / unit)) * unit;
+  // rounded to 1e-6: a triplet grid (2/3 step) would otherwise leave float noise in the step
+  return Math.round((floor ? Math.floor(x / unit + 1e-6) : Math.round(x / unit)) * unit * 1e6) / 1e6;
 }
 
 /**
- * Moves notes `idx` by `dStep` steps and `dKey` semitones from their `orig` positions. The time
- * move is snapped so the first note lands on the grid (relative positions stay), clamped at 0;
- * keys stay within 0..127.
+ * Moves notes `idx` by `dStep` steps and `dKey` semitones from their `orig` positions. The move
+ * itself is snapped, in whole grid units (FL): a note off the grid keeps its offset, so a drag
+ * straight up or down never shifts its timing. Clamped at 0; keys stay within 0..127.
  */
 export function moveNotes(orig: readonly Note[], idx: readonly number[], dStep: number, dKey: number, unit: number, chan: Channel | undefined): Note[] {
   const sel = idx.map(i => orig[i]);
   const first = Math.min(...sel.map(n => n.step));
-  let d = snapStep(first + dStep, unit) - first;
+  let d = snapStep(dStep, unit);
   d = Math.max(d, -first);
   const keys = sel.map(n => keyOf(n, chan));
   const dk = Math.max(-Math.min(...keys), Math.min(127 - Math.max(...keys), dKey));

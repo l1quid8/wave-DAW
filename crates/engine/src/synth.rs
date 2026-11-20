@@ -10,8 +10,9 @@ use crate::rt::{ChanRt, InsertRt};
 
 pub const MAX_VOICES: usize = 96;
 
-/// How a scheduled note ends. Sampler triggers ring out; explicit held sampler notes
-/// have an upper bound, while auditions and legacy notes use the channel's release mode.
+/// How a scheduled note ends. Sampler triggers have no note-off; explicit held sampler notes
+/// stop at their end (envelope off) or release from it (envelope on), while auditions and
+/// legacy notes ring out (envelope off) or release (envelope on).
 #[derive(Clone, Copy)]
 pub enum NoteEnd {
     Natural,
@@ -31,13 +32,15 @@ impl NoteEnd {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum VoiceKind {
     /// The sample of the voice's channel, pitched by the note and shaped by the channel's
-    /// sampler settings (part of the file, direction, envelope, one-shot or gate).
+    /// sampler settings (part of the file, direction, fades, volume envelope).
     Sample,
-    /// WAVE Keys: a recording of the channel's piano, picked by key and velocity; it rings
+    /// Synkopa Keys: a recording of the channel's piano, picked by key and velocity; it rings
     /// for the note's length, then fades over the channel's release time.
     Keys,
     /// A synth channel: its notes go to the channel's `poly::SynthInst`, not this pool.
     Synth,
+    /// A plugin-instrument channel: its notes go to the channel's `plug::PlugInst`.
+    Plugin,
     Click {
         accent: bool,
     },
@@ -67,6 +70,8 @@ pub struct Voice {
     pub chan_id: Id,
     /// Note velocity (gain).
     vel: f32,
+    /// The note's own pan, added to its channel's (-1..=1).
+    pan: f32,
     /// Sampler: read position in source frames and step per output sample.
     pos: f64,
     rate: f64,
@@ -92,7 +97,50 @@ pub struct Voice {
     /// own time at which a note of that group cuts it (`u32::MAX` = not cut).
     cut: u8,
     cut_at: u32,
+    /// Sampler in slice mode: the slice this note plays ([`NO_SLICE`] = the channel's region).
+    slice: u16,
+    /// Slide notes: the pitch offset in semitones now, where its glide ends, the step per
+    /// sample and samples left of it.
+    st: f32,
+    st_goal: f32,
+    st_step: f32,
+    st_left: u32,
+    /// A slide waiting to start: the voice's own time it starts at (`u32::MAX` = none), the
+    /// offset it glides to and over how many samples.
+    slide_at: u32,
+    slide_to: f32,
+    slide_len: u32,
 }
+
+impl Voice {
+    /// One sample of a slide: the playback-rate factor of the pitch offset now.
+    #[inline]
+    fn slide_tick(&mut self) -> f64 {
+        if self.t == self.slide_at {
+            self.slide_at = u32::MAX;
+            self.st_goal = self.slide_to;
+            if self.slide_len == 0 {
+                self.st = self.slide_to;
+                self.st_left = 0;
+            } else {
+                self.st_left = self.slide_len;
+                self.st_step = (self.slide_to - self.st) / self.slide_len as f32;
+            }
+        }
+        if self.st_left > 0 {
+            self.st_left -= 1;
+            self.st = if self.st_left == 0 { self.st_goal } else { self.st + self.st_step };
+        }
+        if self.st == 0.0 {
+            1.0
+        } else {
+            (self.st as f64 / 12.0).exp2()
+        }
+    }
+}
+
+/// A sampler voice that plays the channel's region, not a slice.
+const NO_SLICE: u16 = u16::MAX;
 
 impl Voice {
     fn dead() -> Self {
@@ -102,6 +150,7 @@ impl Voice {
             chan: NO_CHAN,
             chan_id: 0,
             vel: 1.0,
+            pan: 0.0,
             pos: 0.0,
             rate: 1.0,
             delay: 0,
@@ -117,11 +166,19 @@ impl Voice {
             env: 1.0,
             cut: 0,
             cut_at: u32::MAX,
+            slice: NO_SLICE,
+            st: 0.0,
+            st_goal: 0.0,
+            st_step: 0.0,
+            st_left: 0,
+            slide_at: u32::MAX,
+            slide_to: 0.0,
+            slide_len: 0,
         }
     }
 }
 
-/// Output level of WAVE Keys against its recordings (−12 dB). The Salamander bank is
+/// Output level of Synkopa Keys against its recordings (−12 dB). The Salamander bank is
 /// levelled hot: one full-velocity note peaks at +1 dBFS, ten keys at +10.5 dBFS. With this
 /// headroom a loud note sits near −11 dBFS and a ten-note chord near −1.8 dBFS, so chords sum
 /// linearly instead of being squashed by a limiter (which made them pump and change tone).
@@ -151,8 +208,8 @@ pub fn pan_gains(pan: f32) -> (f32, f32) {
     (if pan > 0.0 { 1.0 - pan } else { 1.0 }, if pan < 0.0 { 1.0 + pan } else { 1.0 })
 }
 
-/// Ends a held voice: its release (the channel's release time) starts now. A one-shot
-/// sample ignores it and rings out.
+/// Ends a held voice: its release (the channel's release time) starts now. A sampler with its
+/// envelope off ignores it and rings out.
 fn release(v: &mut Voice) {
     v.held = false;
     v.sus = false;
@@ -163,6 +220,9 @@ fn release(v: &mut Voice) {
 const CUT_SECONDS: f32 = 0.006;
 /// Fade at a trimmed edge of a sample, where the waveform does not start or end at zero.
 const EDGE_SECONDS: f32 = 0.0015;
+/// Fades at the start and the end of a slice, seconds.
+const SLICE_HEAD_SECONDS: f32 = 0.0004;
+const SLICE_TAIL_SECONDS: f32 = 0.005;
 
 impl VoicePool {
     pub fn new(sr: f32) -> Self {
@@ -185,7 +245,7 @@ impl VoicePool {
     pub fn note_on(&mut self, ch: &ChanRt, idx: usize, dest: Dest, key: u8, vel: f32) -> bool {
         // the same key struck again releases its previous note
         self.release_where(|v| v.held && v.chan_id == ch.id && v.key == key);
-        let Some(i) = self.note_slot(ch, idx, dest, 0, NoteEnd::Release(3600.0), key, vel, 1.0) else { return false };
+        let Some(i) = self.note_slot(ch, idx, dest, 0, NoteEnd::Release(3600.0), key, vel, 1.0, 0.0) else { return false };
         let v = &mut self.voices[i];
         v.held = true;
         v.key = key;
@@ -249,19 +309,82 @@ impl VoicePool {
     /// velocity 0..1 and `gain` level on top of it (the track gain when the channel skips the track).
     /// Returns false when nothing can play (a sampler channel without audio).
     #[allow(clippy::too_many_arguments)]
-    pub fn note(&mut self, ch: &ChanRt, idx: usize, dest: Dest, delay: u32, end: NoteEnd, key: u8, vel: f32, gain: f32) -> bool {
-        self.note_slot(ch, idx, dest, delay, end, key, vel, gain).is_some()
+    pub fn note(&mut self, ch: &ChanRt, idx: usize, dest: Dest, delay: u32, end: NoteEnd, key: u8, vel: f32, gain: f32, pan: f32) -> bool {
+        self.note_slot(ch, idx, dest, delay, end, key, vel, gain, pan).is_some()
+    }
+
+    /// A slide note of channel `chan_id`, `delay` samples from now: the channel's sampler and
+    /// piano voices that sound then (started, not yet at their end) glide by the distance from
+    /// the highest of them to `key`, over `len` samples. A slice plays at the file's pitch, so
+    /// it does not slide.
+    pub fn slide(&mut self, chan_id: Id, delay: u32, key: u8, len: u32) {
+        let at = |v: &Voice| v.t.saturating_add(delay - v.delay);
+        let sounding = |v: &Voice| {
+            v.alive
+                && v.chan_id == chan_id
+                && matches!(v.kind, VoiceKind::Sample | VoiceKind::Keys)
+                && v.slice == NO_SLICE
+                && v.delay <= delay
+                && v.cut_at == u32::MAX
+                && at(v) < v.len
+        };
+        // where each voice is headed: a slide still waiting, else the end of its glide
+        let goal = |v: &Voice| if v.slide_at != u32::MAX { v.slide_to } else { v.st_goal };
+        let Some(top) = self.voices.iter().filter(|v| sounding(v)).map(|v| v.key as f32 + goal(v)).max_by(f32::total_cmp) else {
+            return;
+        };
+        let by = key as f32 - top;
+        for v in self.voices.iter_mut().filter(|v| sounding(v)) {
+            // a second slide before the first began: the first jumps to its end there
+            if v.slide_at != u32::MAX {
+                v.st = v.slide_to;
+                v.st_goal = v.slide_to;
+                v.st_left = 0;
+            }
+            v.slide_at = at(v);
+            v.slide_to = goal(v) + by;
+            v.slide_len = len;
+        }
     }
 
     /// Like [`Self::note`], returning the voice slot that was started.
     #[allow(clippy::too_many_arguments)]
-    fn note_slot(&mut self, ch: &ChanRt, idx: usize, dest: Dest, delay: u32, end: NoteEnd, key: u8, vel: f32, gain: f32) -> Option<usize> {
+    fn note_slot(
+        &mut self,
+        ch: &ChanRt,
+        idx: usize,
+        dest: Dest,
+        delay: u32,
+        end: NoteEnd,
+        key: u8,
+        vel: f32,
+        gain: f32,
+        pan: f32,
+    ) -> Option<usize> {
         let level = vel * gain;
         match ch.kind {
             VoiceKind::Sample => {
                 let a = ch.sample.as_ref()?;
                 let m = &ch.smp;
-                let rate = a.sr as f64 / self.sr as f64 * 2f64.powf((key as f64 - ch.root as f64) / 12.0) * m.rate;
+                // slice mode: the key picks the slice (root = the first), the pitch stays the file's
+                let slice = match &ch.slices {
+                    Some(sl) => {
+                        let i = key as i32 - ch.root as i32;
+                        if i < 0 || i as usize >= sl.len() {
+                            return None;
+                        }
+                        // a new slice cuts the one sounding (chops play one at a time, as on an MPC)
+                        for v in self.voices.iter_mut().filter(|v| {
+                            v.alive && v.kind == VoiceKind::Sample && v.chan_id == ch.id && v.slice != NO_SLICE && v.cut_at == u32::MAX
+                        }) {
+                            v.cut_at = v.t.saturating_add(delay.saturating_sub(v.delay));
+                        }
+                        i as u16
+                    }
+                    None => NO_SLICE,
+                };
+                let pitch = if slice == NO_SLICE { key as f64 - ch.root as f64 } else { 0.0 };
+                let rate = a.sr as f64 / self.sr as f64 * 2f64.powf(pitch / 12.0) * m.rate;
                 // a note of a cut group silences what the group is playing, when it starts
                 if m.cut != 0 {
                     for v in
@@ -271,11 +394,16 @@ impl VoicePool {
                     }
                 }
                 let i = self.trigger(VoiceKind::Sample, dest, idx, ch.id, delay, end, level, rate);
-                let (lo, hi) = region(m.start, m.end, a.frames);
+                let (lo, hi) = match &ch.slices {
+                    Some(sl) if slice != NO_SLICE => slice_region(sl, slice, a.frames),
+                    _ => region(m.start, m.end, a.frames),
+                };
                 let v = &mut self.voices[i];
                 v.pos = if m.reverse { hi - 1.0 } else { lo };
                 v.cut = m.cut;
                 v.key = key;
+                v.slice = slice;
+                v.pan = pan;
                 Some(i)
             }
             VoiceKind::Keys => {
@@ -292,9 +420,10 @@ impl VoicePool {
                 let i = self.trigger(VoiceKind::Keys, dest, idx, ch.id, delay, end, hit * gain * KEYS_HEADROOM, rate);
                 self.voices[i].zone = zone;
                 self.voices[i].key = key;
+                self.voices[i].pan = pan;
                 Some(i)
             }
-            VoiceKind::Synth | VoiceKind::Click { .. } => None,
+            VoiceKind::Synth | VoiceKind::Plugin | VoiceKind::Click { .. } => None,
         }
     }
 
@@ -323,7 +452,15 @@ impl VoicePool {
 
     /// Adds every live voice into its destination: a track buffer, an insert's input, or
     /// the click bus. Samples are stereo (the channel's pan is a balance).
-    pub fn render(&mut self, n: usize, tracks: &mut [(Vec<f32>, Vec<f32>)], inserts: &mut [InsertRt], click: &mut [f32], chans: &[ChanRt]) {
+    pub fn render(
+        &mut self,
+        n: usize,
+        tracks: &mut [(Vec<f32>, Vec<f32>)],
+        inserts: &mut [InsertRt],
+        click: &mut [f32],
+        chans: &[ChanRt],
+        track_dirty: &mut [bool],
+    ) {
         let sr = self.sr;
         let bend = self.bend;
         for v in self.voices.iter_mut().filter(|v| v.alive) {
@@ -339,7 +476,7 @@ impl VoicePool {
                         c.pan,
                         c.gain0 * on,
                         c.pan0,
-                        c.sample.as_deref().map(|a| (a, c.smp)),
+                        c.sample.as_deref().map(|a| (a, c.smp, c.slices.as_deref())),
                         c.keys.as_deref().map(|b| (b, c.keys_release)),
                     )
                 }
@@ -349,6 +486,8 @@ impl VoicePool {
                     continue;
                 }
             };
+            // the note's own pan moves it from where the channel sits
+            let (pan, pan0) = ((pan + v.pan).clamp(-1.0, 1.0), (pan0 + v.pan).clamp(-1.0, 1.0));
             let (pl, pr) = pan_gains(pan);
             let (gl, gr) = (g * pl, g * pr);
             // an automated channel gain or pan glides from the previous block's value
@@ -363,14 +502,20 @@ impl VoicePool {
                 // the click bus is mono
                 Dest::Click => (&mut click[..], &mut []),
                 Dest::Track(t) => match tracks.get_mut(t) {
-                    Some((l, r)) => (&mut l[..], &mut r[..]),
+                    Some((l, r)) => {
+                        track_dirty[t] = true;
+                        (&mut l[..], &mut r[..])
+                    }
                     None => {
                         v.alive = false;
                         continue;
                     }
                 },
                 Dest::Insert(k) => match inserts.get_mut(k) {
-                    Some(ins) => (&mut ins.l[..], &mut ins.r[..]),
+                    Some(ins) => {
+                        ins.dirty = true;
+                        (&mut ins.l[..], &mut ins.r[..])
+                    }
                     None => {
                         v.alive = false;
                         continue;
@@ -404,58 +549,91 @@ impl VoicePool {
                     if stereo {
                         out_r[i] += y * gr * fade;
                     }
-                    v.pos += v.rate * bend as f64;
+                    v.pos += v.rate * bend as f64 * v.slide_tick();
                     v.t += 1;
                 }
                 continue;
             }
             if v.kind == VoiceKind::Sample {
-                let Some((a, m)) = sample else {
+                let Some((a, m, slices)) = sample else {
                     v.alive = false;
                     continue;
                 };
-                let (lo, hi) = region(m.start, m.end, a.frames);
-                let (att, dec) = (m.attack * sr, m.decay * sr);
-                let rel = fall(m.release, sr);
+                // a slice whose markers moved or vanished while it played: the channel's region
+                let slice = slices.filter(|sl| (v.slice as usize) < sl.len());
+                let (lo, hi) = match slice {
+                    Some(sl) => slice_region(sl, v.slice, a.frames),
+                    None => region(m.start, m.end, a.frames),
+                };
+                let (del, att, hold, dec, rel) = (m.delay * sr, m.attack * sr, m.hold * sr, m.decay * sr, m.release * sr);
+                // the envelope's level `t` samples into the note, before its note-off
+                let held = |t: f32| -> f32 {
+                    let t = t - del;
+                    if t < 0.0 {
+                        0.0
+                    } else if t < att {
+                        curve(t / att, m.attack_bend)
+                    } else if t < att + hold {
+                        1.0
+                    } else if t < att + hold + dec {
+                        1.0 - (1.0 - m.sustain) * curve((t - att - hold) / dec, m.decay_bend)
+                    } else {
+                        m.sustain
+                    }
+                };
+                let shaped = del + att + hold + dec;
+                // a note-off (`len`) starts the release from wherever the envelope was
+                let released = m.env && v.len != u32::MAX;
+                let from = if released { held(v.len as f32) } else { 0.0 };
                 let cut = fall(CUT_SECONDS, sr);
                 // a trimmed or reversed part starts and ends inside the waveform: fade its edges
                 let edge = EDGE_SECONDS * sr;
+                // a slice ends inside a sound (a kick's tail): a longer fade than the start's, which
+                // must keep the attack sharp
+                let edge_tail = if slice.is_some() { SLICE_TAIL_SECONDS * sr } else { edge };
+                // and its start a shorter one than a trimmed region's: the attack is right there
+                let edge_head = if slice.is_some() { SLICE_HEAD_SECONDS * sr } else { edge };
                 let note_edge = (edge.min(v.len as f32)).recip();
-                let (edge_in, edge_out) = (m.reverse || m.start > 0.0, m.reverse || m.end < 1.0);
+                let (edge_in, edge_out) = (slice.is_some() || m.reverse || m.start > 0.0, slice.is_some() || m.reverse || m.end < 1.0);
                 let step = v.rate * bend as f64;
                 let span = (hi - lo - 1.0).max(0.0);
                 let fade_in = (m.fade_in * a.sr as f64).min(span);
                 let fade_out = (m.fade_out * a.sr as f64).min(span);
                 let in_scale = if fade_in > 0.0 { fade_in.recip() } else { 0.0 };
                 let out_scale = if fade_out > 0.0 { fade_out.recip() } else { 0.0 };
+                // without the envelope a sized note stops at its end (declicked); with it, it releases
+                let stops = v.timed && !m.env;
                 for i in start..n {
-                    if (v.timed && v.t >= v.len) || v.pos < lo || v.pos >= hi {
+                    if (stops && v.t >= v.len) || v.pos < lo || v.pos >= hi {
                         v.alive = false;
                         break;
                     }
                     let t = v.t as f32;
-                    let shape = if t < att {
-                        t / att
-                    } else if t < att + dec {
-                        1.0 - (1.0 - m.sustain) * (t - att) / dec
+                    let shape = if !m.env {
+                        1.0
+                    } else if released && v.t >= v.len {
+                        let x = (t - v.len as f32) / rel.max(1.0);
+                        if x >= 1.0 {
+                            v.alive = false;
+                            break;
+                        }
+                        from * (1.0 - curve(x, m.release_bend))
                     } else {
-                        m.sustain
+                        held(t)
                     };
                     if v.t >= v.cut_at {
                         v.env *= cut;
-                    } else if m.gate && v.t >= v.len {
-                        v.env *= rel;
                     }
-                    // decayed to nothing, released or cut: the voice is over
-                    if v.env < 1e-4 || (m.sustain <= 0.0 && t >= att + dec) {
+                    // decayed to nothing or cut: the voice is over
+                    if v.env < 1e-4 || (m.env && m.sustain <= 0.0 && t >= shaped) {
                         v.alive = false;
                         break;
                     }
                     let mut fade = shape * v.env;
                     let from_start = if m.reverse { hi - 1.0 - v.pos } else { v.pos - lo };
                     let to_end = if m.reverse { v.pos - lo } else { hi - v.pos };
-                    let edge_start = if edge_in { (t / edge).min(1.0) } else { 1.0 };
-                    let edge_end = if edge_out { (to_end / step.max(1e-9) / edge as f64).min(1.0) as f32 } else { 1.0 };
+                    let edge_start = if edge_in { (t / edge_head).min(1.0) } else { 1.0 };
+                    let edge_end = if edge_out { (to_end / step.max(1e-9) / edge_tail as f64).min(1.0) as f32 } else { 1.0 };
                     let fade_start = if in_scale > 0.0 { (from_start * in_scale).clamp(0.0, 1.0) as f32 } else { 1.0 };
                     let fade_end = if out_scale > 0.0 {
                         let remaining = if m.reverse { to_end } else { to_end - 1.0 };
@@ -464,7 +642,7 @@ impl VoicePool {
                         1.0
                     };
                     fade *= edge_start.min(fade_start);
-                    let note_end = if v.timed { ((v.len - v.t) as f32 * note_edge).min(1.0) } else { 1.0 };
+                    let note_end = if stops { ((v.len - v.t) as f32 * note_edge).min(1.0) } else { 1.0 };
                     fade *= edge_end.min(fade_end).min(note_end);
                     let (x, y) = a.sample(v.pos);
                     let (gl, gr) = side(i);
@@ -472,6 +650,7 @@ impl VoicePool {
                     if stereo {
                         out_r[i] += y * gr * fade;
                     }
+                    let step = step * v.slide_tick();
                     v.pos += if m.reverse { -step } else { step };
                     v.t += 1;
                 }
@@ -503,6 +682,20 @@ impl VoicePool {
     }
 }
 
+/// The bend factor of an envelope tension −1..1 for [`curve`]: 1 is straight, 1/8..8 the extremes.
+#[inline]
+pub fn bend(tension: f32) -> f32 {
+    8f32.powf(tension.clamp(-1.0, 1.0))
+}
+
+/// A segment's progress 0..1 at `x` 0..1 of its time, bent by `g` (1 = straight, below 1 rises
+/// early, above 1 rises late). One division, so it is cheap per sample.
+#[inline]
+pub fn curve(x: f32, g: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    x / (x + g * (1.0 - x))
+}
+
 /// Per-sample factor that falls 60 dB in `seconds`.
 #[inline]
 fn fall(seconds: f32, sr: f32) -> f32 {
@@ -511,6 +704,13 @@ fn fall(seconds: f32, sr: f32) -> f32 {
 
 /// The frames `[lo, hi)` a sampler plays: fractions of the file, at least one frame.
 #[inline]
+/// Frames of slice `i`: from its marker to the next one (the last one to the end of the file).
+fn slice_region(slices: &[f32], i: u16, frames: usize) -> (f64, f64) {
+    let i = i as usize;
+    let end = slices.get(i + 1).copied().unwrap_or(1.0);
+    region(slices[i], end, frames)
+}
+
 fn region(start: f32, end: f32, frames: usize) -> (f64, f64) {
     let n = frames as f64;
     let lo = (start as f64 * n).floor().clamp(0.0, (n - 1.0).max(0.0));

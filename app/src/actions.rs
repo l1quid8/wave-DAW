@@ -1,7 +1,7 @@
 //! Everything the GUI and the CLI can ask for, implemented once.
 //!
 //! The actions run against a [`Host`]: the running app (`App`), or a project file opened
-//! by `wave --project FILE` with no window and no audio device (`headless::Headless`).
+//! by `synkopa --project FILE` with no window and no audio device (`headless::Headless`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,13 +34,15 @@ pub trait Host {
     fn cli_json(&self) -> Value;
     /// Why the installed RMVPE model could not be used, if it could not.
     fn model_error(&self) -> Option<String>;
-    /// Before an offline bounce: the WAVE Keys piano the project plays is loaded.
+    /// After an install attempt: remember why the model still cannot be used, or clear it.
+    fn set_model_error(&self, _e: Option<String>) {}
+    /// Before an offline bounce: the Synkopa Keys piano the project plays is loaded.
     fn wait_keys(&self) -> R<()>;
     /// Before pitch work or a bounce of pitch-edited clips: the pitch model is in place.
     fn ensure_pitch_model(&self) {}
     /// Before VST3 parameter access: the project's plugins run as live instances.
     fn ensure_live_plugins(&self) {}
-    /// The WAVE Keys piano recordings are on this computer (an import gives piano parts to it).
+    /// The Synkopa Keys piano recordings are on this computer (an import gives piano parts to it).
     fn keys_installed(&self) -> bool {
         false
     }
@@ -55,9 +57,9 @@ pub const LIVE_ONLY: &[&str] = &["play", "stop", "pattern_play", "pattern_loop",
 
 fn live_only_error(cmd: &str) -> String {
     let why = match cmd {
-        "undo" | "redo" => "a project file has no undo history (each `wave --project` call starts fresh; edit with `apply` and keep the file under version control, or use --dry-run / --save-as to try an edit)",
+        "undo" | "redo" => "a project file has no undo history (each `synkopa --project` call starts fresh; edit with `apply` and keep the file under version control, or use --dry-run / --save-as to try an edit)",
         "open" => "pass the file with --project instead",
-        _ => "it plays through the audio device; render with `wave --project FILE render --out x.wav` to listen",
+        _ => "it plays through the audio device; render with `synkopa --project FILE render --out x.wav` to listen",
     };
     format!("NEEDS_APP: `{cmd}` needs the running app: {why}")
 }
@@ -92,7 +94,7 @@ pub(crate) fn opt_f64(a: &Value, k: &str) -> Option<f64> {
 
 pub fn parse_kind(s: &str) -> R<FxKind> {
     serde_json::from_value(json!(s)).map_err(|_| {
-        format!("unknown effect type `{s}` (eq, comp, sat, delay, half, warp, chorus, phaser, reverb, limit, fet, deess, tune, denoise, voice, rider)")
+        format!("unknown effect type `{s}` (eq, comp, sat, delay, half, warp, chorus, phaser, stereo, multiband, analyzer, reverb, limit, fet, deess, tune, denoise, voice, rider)")
     })
 }
 
@@ -113,6 +115,106 @@ pub fn add_fx(app: &dyn Host, insert_id: u64, kind: FxKind, preset: Option<usize
     }
     let rev = app.engine().apply(&[Op::PutFx { insert_id, fx, index }], false, None).map_err(|e| e.to_string())?;
     Ok((id, rev))
+}
+
+/// Mixer routing (FL Studio style): insert `from` sends to insert `to` at `gain` (linear,
+/// 0..2; a send that exists gets the new level). `to` = 0 (the master) turns the output into
+/// the master back on. `only`: the output goes only where it sends, no longer to the master
+/// ("route to this track only"). A send that would close a loop is refused.
+pub fn route(app: &dyn Host, from: u64, to: u64, gain: Option<f32>, only: bool, if_revision: Option<u64>) -> R<u64> {
+    let p = app.engine().project();
+    let mut m = p.insert(from).cloned().ok_or(format!("no insert {from}"))?;
+    if from == 0 {
+        return Err("the master is the output: it sends nowhere".into());
+    }
+    if to == 0 {
+        m.master = true;
+    } else {
+        if p.insert(to).is_none() {
+            return Err(format!("no insert {to}"));
+        }
+        match m.sends.iter_mut().find(|s| s.to == to) {
+            Some(s) => s.gain = gain.unwrap_or(s.gain),
+            None => m.sends.push(wave_engine::model::InsertSend { to, gain: gain.unwrap_or(1.0) }),
+        }
+        if only {
+            m.master = false;
+        }
+    }
+    app.engine().apply(&[Op::PutInsert { insert: m }], false, if_revision).map_err(|e| e.to_string())
+}
+
+/// Removes insert `from`'s send to `to`; `to` = 0 stops its output into the master (it then
+/// goes only where it sends, so it must send somewhere).
+pub fn unroute(app: &dyn Host, from: u64, to: u64, if_revision: Option<u64>) -> R<u64> {
+    let p = app.engine().project();
+    let mut m = p.insert(from).cloned().ok_or(format!("no insert {from}"))?;
+    if to == 0 {
+        if m.sends.is_empty() {
+            return Err(format!("insert {from} sends nowhere else: it would fall silent (mute it instead)"));
+        }
+        m.master = false;
+    } else {
+        let n = m.sends.len();
+        m.sends.retain(|s| s.to != to);
+        if m.sends.len() == n {
+            return Err(format!("insert {from} does not send to insert {to}"));
+        }
+        // nothing left to go to: back to the master rather than silence
+        if m.sends.is_empty() {
+            m.master = true;
+        }
+    }
+    app.engine().apply(&[Op::PutInsert { insert: m }], false, if_revision).map_err(|e| e.to_string())
+}
+
+/// The clip's source was already baked: its name ends " (rider)". The chain then leaves the
+/// rider out (it is in the audio) and no second bake is made — same guard as the app.
+fn already_baked(e: &Engine, clip_id: u64) -> bool {
+    let p = e.project();
+    p.clips
+        .iter()
+        .find(|c| c.id == clip_id)
+        .and_then(|c| p.sources.iter().find(|s| s.id == c.source))
+        .map(|s| s.name.ends_with(" (rider)"))
+        .unwrap_or(false)
+}
+
+/// The Auto Vocal plan as ops on `insert`: the insert's effects of the kinds the chain brings
+/// (and any old rider) are removed — others, e.g. an EQ, stay in front — then each stage is put
+/// with its calibrated params (full param sets over the defaults, the stage's mix, bypassed when
+/// not enabled, not a preset). The plan leaves the vocal far under the limiter, so the level
+/// suggestion is folded into the limiter's gain to bring it to mix level (what the app does).
+/// Returns the ops and the ids the chain stages will get.
+fn chain_ops(e: &Engine, insert: u64, plan: &wave_engine::autovocal::AutoVocalPlan) -> (Vec<Op>, Vec<u64>) {
+    let p = e.project();
+    let makeup = plan.track_gain_db.unwrap_or(-18.0 - plan.stages.lufs_after);
+    let makeup = (makeup.clamp(0.0, 24.0) * 10.0).round() / 10.0;
+    let mut kinds = plan.chain.iter().map(|f| f.kind).collect::<std::collections::HashSet<_>>();
+    kinds.insert(FxKind::Rider);
+    let mut ops: Vec<Op> = p
+        .insert(insert)
+        .into_iter()
+        .flat_map(|m| m.fx.iter())
+        .filter(|f| kinds.contains(&f.kind))
+        .map(|f| Op::RemoveFx { fx_id: f.id })
+        .collect();
+    let mut ids = Vec::with_capacity(plan.chain.len());
+    for (n, stage) in plan.chain.iter().enumerate() {
+        let id = p.next_id + n as u64;
+        let mut fx = new_fx(id, stage.kind, p.bpm);
+        fx.params.extend(stage.params.iter().map(|(k, v)| (k.clone(), *v)));
+        fx.mix = stage.mix as f32;
+        fx.preset = None;
+        fx.bypass = !stage.enabled;
+        if stage.kind == FxKind::Limit {
+            let gain = fx.params.get("gain").copied().unwrap_or(0.0) + makeup;
+            fx.params.insert("gain".into(), gain.clamp(0.0, 24.0));
+        }
+        ops.push(Op::PutFx { insert_id: insert, fx, index: None });
+        ids.push(id);
+    }
+    (ops, ids)
 }
 
 pub fn set_param(app: &dyn Host, fx_id: u64, param: &str, value: f64, if_revision: Option<u64>) -> R<u64> {
@@ -143,11 +245,32 @@ pub fn preset(app: &dyn Host, fx_id: u64, index: usize) -> R<u64> {
     app.engine().apply(&[Op::PutFx { insert_id: m.id, fx: f, index: None }], false, None).map_err(|e| e.to_string())
 }
 
+/// "Load anyway": the effect or plugin channel `id` (and every other use of the same plugin)
+/// loads although Synkopa's safety check refused it, from now on. Not an edit (no undo step).
+pub fn plugin_load_anyway(app: &dyn Host, id: u64) -> R<()> {
+    let p = app.engine().project();
+    let (plugin, instrument) = match p.find_fx(id) {
+        Some((_, f)) => (f.plugin.clone().ok_or("that effect is not a hosted plugin")?, false),
+        None => match p.channel(id).and_then(wave_engine::Channel::plugin) {
+            Some(pl) => (pl.clone(), true),
+            None => return Err(format!("no plugin effect or plugin channel has id {id}")),
+        },
+    };
+    app.plugins().trust(&plugin, instrument);
+    app.ensure_live_plugins();
+    app.engine().retry_plugins();
+    Ok(())
+}
+
 /// Put a scanned plugin (`format` `vst3` or `lv2`; LV2 plugins are found by `cid`, their
 /// URI, and `path` may be empty) on an insert.
 pub fn plugin_add(app: &dyn Host, insert_id: u64, format: &str, path: &str, cid: &str, index: Option<usize>) -> R<(u64, u64)> {
     if format != PluginRef::VST3 && format != PluginRef::LV2 {
         return Err(format!("unknown plugin format `{format}` (vst3, lv2)"));
+    }
+    // an LV2 plugin is named by its URI alone; a VST3 needs its module path to be unambiguous
+    if format == PluginRef::VST3 && path.is_empty() {
+        return Err("`path` is required for a VST3 plugin".into());
     }
     let p = app.engine().project();
     if p.insert(insert_id).is_none() {
@@ -246,6 +369,9 @@ impl WavEncoding {
 
 /// How many slices the live waveform of an export has (`ExportStatus::wave`).
 pub const WAVE_SLICES: usize = 240;
+
+/// Sample rate of the audio *Export in place* writes.
+pub const IN_PLACE_RATE: u32 = 48_000;
 
 /// What an export is doing right now, for the progress readout (`export-progress`).
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -383,6 +509,8 @@ pub struct Bounce {
     pub tail: f64,
     pub rate: u32,
     pub wrap: bool,
+    /// Render this pattern alone, as PAT mode plays it (`from..to` is then its range), not the song.
+    pub pattern: Option<u64>,
 }
 
 impl Bounce {
@@ -395,7 +523,9 @@ impl Bounce {
     ) -> R<Vec<f32>> {
         use wave_engine::RenderTail;
         let tail = if self.wrap { RenderTail::Wrap } else { RenderTail::Seconds(self.tail) };
-        engine.render_export_with(insert, self.from, self.to, tail, self.rate, cancel, &mut |p| tracker.on(p)).map_err(|e| e.to_string())
+        engine
+            .render_bounce(insert, self.pattern, self.from, self.to, tail, self.rate, cancel, &mut |p| tracker.on(p))
+            .map_err(|e| e.to_string())
     }
 
     fn tail_seconds(self) -> f64 {
@@ -407,7 +537,7 @@ impl Bounce {
     }
 }
 
-/// Offline bounce shared by the GUI export dialog and `wave render`. `progress` hears what it is
+/// Offline bounce shared by the GUI export dialog and `synkopa render`. `progress` hears what it is
 /// doing (throttled while rendering).
 pub fn render_to_file(
     app: &dyn Host,
@@ -440,6 +570,7 @@ pub fn render_to_file(
         "toBeat": bounce.to,
         "tail": bounce.tail_seconds(),
         "wrapTail": bounce.wrap,
+        "pattern": bounce.pattern,
         "format": fmt.extension(),
         "stats": stats(&audio, bounce.rate),
     }))
@@ -465,6 +596,29 @@ pub fn safe_file_stem(name: &str) -> String {
         format!("_{cleaned}")
     } else {
         cleaned
+    }
+}
+
+/// Where "save new version" writes next to `current`: `Beat.synkopa` → `Beat_2.synkopa`,
+/// `Beat_2` → `Beat_3` (FL Studio's Ctrl+N). A name already taken is skipped, so an earlier
+/// version is never overwritten; `taken` says whether a path exists.
+pub fn next_version_path(current: &Path, taken: impl Fn(&Path) -> bool) -> PathBuf {
+    let stem = current.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Song".into());
+    let ext = current.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_else(|| "synkopa".into());
+    // a trailing `_<number>` is the version; anything else (also `Beat_final`) starts at 2
+    let (base, from) = match stem.rsplit_once('_') {
+        Some((b, n)) if !b.is_empty() && !n.is_empty() && n.len() <= 6 && n.bytes().all(|c| c.is_ascii_digit()) => {
+            (b.to_string(), n.parse::<u32>().unwrap_or(1).saturating_add(1))
+        }
+        _ => (stem, 2),
+    };
+    let mut n = from.max(2);
+    loop {
+        let p = current.with_file_name(format!("{base}_{n}.{ext}"));
+        if !taken(&p) {
+            return p;
+        }
+        n = n.saturating_add(1);
     }
 }
 
@@ -504,7 +658,10 @@ pub fn render_stems_to_dir(
     if bounce.to <= bounce.from {
         return Err("`to` must be after `from`".into());
     }
-    let project = engine.project();
+    let project = match bounce.pattern {
+        Some(id) => wave_engine::pattern_project(engine.project(), id),
+        None => engine.project(),
+    };
     // (insert id — None is the master mix, display name)
     let mut jobs: Vec<(Option<u64>, String)> = vec![];
     if include_master {
@@ -568,6 +725,7 @@ pub fn render_stems_to_dir(
         "toBeat": bounce.to,
         "tail": bounce.tail_seconds(),
         "wrapTail": bounce.wrap,
+        "pattern": bounce.pattern,
         "format": ext,
         "files": files,
         "skipped": skipped,
@@ -580,12 +738,19 @@ pub fn render(app: &dyn Host, a: &Value) -> R<Value> {
     let wrap = arg(a, "wrapTail").and_then(Value::as_bool).unwrap_or(false);
     let from = opt_f64(a, "from");
     let to = opt_f64(a, "to");
-    let (from, to) = match (wrap, p.loop_range) {
-        (true, Some(l)) if l.b > l.a => (from.unwrap_or(l.a), to.unwrap_or(l.b)),
-        (true, _) => from.zip(to).ok_or("wrap tail requires a project loop or both `from` and `to`")?,
-        (false, range) => (from.unwrap_or(0.0), to.unwrap_or_else(|| range.map_or_else(|| p.song_end(), |l| l.b))),
+    let pattern = opt_f64(a, "pattern").map(|v| v as u64);
+    let (from, to) = match (pattern, wrap, p.loop_range) {
+        (Some(_), true, _) => return Err("wrap tail is for a loop of the song, not a pattern export".into()),
+        (Some(id), false, _) => {
+            let (a0, b0) = wave_engine::Engine::pattern_range(&p, id).ok_or_else(|| format!("no pattern {id}"))?;
+            (from.unwrap_or(a0), to.unwrap_or(b0))
+        }
+        (None, true, Some(l)) if l.b > l.a => (from.unwrap_or(l.a), to.unwrap_or(l.b)),
+        (None, true, _) => from.zip(to).ok_or("wrap tail requires a project loop or both `from` and `to`")?,
+        (None, false, range) => (from.unwrap_or(0.0), to.unwrap_or_else(|| range.map_or_else(|| p.song_end(), |l| l.b))),
     };
-    let bounce = Bounce { from, to, tail: opt_f64(a, "tail").unwrap_or(2.0), rate: opt_f64(a, "rate").unwrap_or(48000.0) as u32, wrap };
+    let bounce =
+        Bounce { from, to, tail: opt_f64(a, "tail").unwrap_or(2.0), rate: opt_f64(a, "rate").unwrap_or(48000.0) as u32, wrap, pattern };
     let wav_bits = arg(a, "wavBits")
         .map(|value| match value.as_f64() {
             Some(16.0) => Ok(16),
@@ -654,6 +819,7 @@ pub fn context(app: &dyn Host, full: bool) -> Value {
         })).collect::<Vec<_>>(),
         "inserts": p.inserts.iter().map(|m| json!({
             "id": m.id, "name": m.name, "volume": db(m.vol), "pan": m.pan, "muted": m.muted, "solo": m.solo,
+            "toMaster": m.master, "sends": m.sends.iter().map(|s| json!({"to": s.to, "gain": s.gain})).collect::<Vec<_>>(),
             "fx": m.fx.iter().map(|f| json!({
                 "id": f.id, "type": f.kind, "name": f.plugin.as_ref().map(|x| x.name.clone()).unwrap_or_else(|| catalog::type_name(f.kind).into()),
                 "bypass": f.bypass, "preset": f.preset.and_then(|i| catalog::presets(f.kind).get(i as usize).map(|p| p.name)),
@@ -673,20 +839,21 @@ pub fn schema() -> Value {
     json!({
         "automation": "an automation plays through a clip of kind `auto` whose `ref` is the automation id; points t = beats from the automation start, v = 0..1 normalised (log params normalised logarithmically); optional per point, for the segment ending there: tension -1..1 (0 = straight) and shape curve|double|hold|stairs (stairs: tension sets 2..16 steps)",
         "units": "time in beats (quarter notes); pattern len in beats (4 = 1 bar, derived from the notes, at least minLen), note step/len in sixteenths, note v (velocity) 0..1, swing 0..1; fades in seconds; vol = fader 0..1 (0.7937 = 0 dB); clip gain in dB; pan -1..1",
-        "patterns": "channels are global (Channel Rack rows, `wave channels`); a pattern note plays channel `ch`; trig = true for a step trigger without sampler note-off; p = MIDI key (absent = the channel's root, the key at which a sampler plays its file unpitched); swing delays notes on odd 16ths by swing × ½ step; the pattern length is derived: the end of the last note rounded up to a bar, at least `minLen` beats (a `len` you send is ignored); when it changes, clips that show exactly one whole pass (offset 0) follow. Easier: `wave pattern --id N --ch C --steps \"x...x...x...x...\"`",
+        "patterns": "channels are global (Channel Rack rows, `synkopa channels`); a pattern note plays channel `ch`; trig = true for a step trigger without sampler note-off; p = MIDI key (absent = the channel's root, the key at which a sampler plays its file unpitched); swing delays notes on odd 16ths by swing × ½ step; the pattern length is derived: the end of the last note rounded up to a bar, at least `minLen` beats (a `len` you send is ignored); when it changes, clips that show exactly one whole pass (offset 0) follow. Easier: `synkopa pattern --id N --ch C --steps \"x...x...x...x...\"`",
         "ids": "take new ids from context.nextId and count up",
+        "routing": "an insert's output goes to the master (`master`: true, the default) and/or, post-fader, to other inserts through `sends` [{to, gain 0..2 linear}] (a bus, a shared reverb). `master` false = only where it sends. Loops and sends to itself or to the master (id 0) are refused. Easier: `synkopa route --from 3 --to 1 [--gain 0.5] [--only true]`, `synkopa unroute --from 3 --to 1`",
         "stretch": "audio clips only: `stretch` 0.25..4 = how many times longer the clip plays its audio (2 = half speed); `offset` and `len` are beats of the stretched audio, so stretching a clip from s0 to s1 multiplies its len and offset by s1/s0. Pitch is kept (rendered in the background; the clip plays resampled until it is ready, see state `stretching`) unless `resample` is true (speed and pitch change together, like a turntable)",
         "ops": {
             "putClips": {"clips": [{"id": 0, "track": 0, "start": 0, "len": 4, "offset": 0, "kind": "pat|audio|auto|comp", "ref": "pattern, source, automation or comp id", "muted": false, "gain": 0, "fadeIn": 0, "fadeOut": 0, "pan": 0, "norm": false, "rev": false, "stretch": 1, "resample": false}]},
             "removeClips": {"ids": [0]},
             "putTrack": {"track": {"id": 0, "name": "", "color": "#4f8ef7", "muted": false, "solo": false, "arm": false, "vol": 0.7937, "h": 56, "insert": 1}},
-            "putInsert": {"insert": {"id": 0, "name": "", "color": "#8b93a1", "vol": 0.7937, "pan": 0, "muted": false, "solo": false, "fx": []}},
+            "putInsert": {"insert": {"id": 0, "name": "", "color": "#8b93a1", "vol": 0.7937, "pan": 0, "muted": false, "solo": false, "fx": [], "sends": [{"to": 2, "gain": 1}], "master": true}},
             "removeInsert": {"id": 0},
             "putFx": {"insertId": 1, "fx": {"id": 0, "type": "comp", "bypass": false, "params": {"thr": -18}}, "index": null},
             "removeFx": {"fxId": 0},
             "moveFx": {"fxId": 0, "to": 0},
             "putPattern": {"pattern": {"id": 0, "name": "", "color": "#4f8ef7", "minLen": 4, "swing": 0, "notes": [{"ch": "channel id", "step": 0, "len": 1, "p": 36, "v": 1}]}},
-            "putChannel": {"channel": {"id": 0, "name": "Kick", "color": "#4f8ef7", "kind": "sample|synth|keys", "source": "source id (kind sample)", "sampler": "kind sample, optional: {start, end (0..1 of the file), reverse, norm, semi, fine, gate (false = one-shot), attack, decay, release, fadeInMs, fadeOutMs (ms), sustain (0..1), cut (0 = none, 1..8)}", "vol": 0.7937, "pan": 0, "mute": false, "solo": false, "insert": "insert id or null (= the clip's track)", "root": 60}, "index": null},
+            "putChannel": {"channel": {"id": 0, "name": "Kick", "color": "#4f8ef7", "kind": "sample|synth|keys", "source": "source id (kind sample)", "sampler": "kind sample, optional: {start, end (0..1 of the file), reverse, norm, semi, fine, env (volume envelope on), delay, attack, hold, decay, release, fadeInMs, fadeOutMs (ms), sustain (0..1), attackTension, decayTension, releaseTension (-1..1), cut (0 = none, 1..8)}", "slices": "kind sample, optional: slice mode, increasing fractions of the file in 0..1 where each slice starts (at most 128); key root plays slice 1, root+1 slice 2, ...; a slice plays to the next at the file's pitch and cuts the one sounding; omit or [] = off", "vol": 0.7937, "pan": 0, "mute": false, "solo": false, "insert": "insert id or null (= the clip's track)", "root": 60, "group": "Channel Rack filter group, optional (absent = unsorted)"}, "index": null},
             "removeChannel": {"id": 0},
             "removePattern": {"id": 0},
             "putSource": {"source": "rename/recolour an existing source"},
@@ -695,16 +862,16 @@ pub fn schema() -> Value {
             "setLoop": {"loop": {"a": 0, "b": 16}},
             "putAutomation": {"automation": {"id": 0, "name": "Reverb mix", "color": "#e0a44a", "target": {"kind": "fx|mix|insertVol|insertPan|trackVol|chanVol|chanPan|synth|keys|clipGain|clipPan", "fxId": 0, "chanId": 0, "param": "fx: mix or band:<i>:f|g|q; synth: catalog id; keys: release|dynamics", "id": "insert/track/channel/clip id for vol/pan/gain"}, "points": [{"t": 0, "v": 0.2}, {"t": 8, "v": 0.8, "tension": -0.4}, {"t": 12, "v": 0.5, "shape": "hold"}]}},
             "removeAutomation": {"id": 0},
-            "transformNotes": {"pattern": 1, "verb": {"kind": "humanize|quantize|euclidFill|strum|euclidDrums|melody", "timing": 0.3, "velocity": 0.2, "grid": 1, "amount": 1, "scaleAware": false, "ch": 0, "k": 4, "n": 16, "rotate": 0, "vel": 0.7, "width": 0.5, "ramp": 0.05, "voices": [{"ch": 0, "k": 4, "n": 16, "rotate": 0, "vel": 0.7}], "bars": 2, "density": 0.5, "repeat": 1}, "seed": 7, "select": {"kind": "indices|range", "indices": [1, 2], "from": 0, "to": 16, "ch": 0}},
+            "transformNotes": {"pattern": 1, "verb": {"kind": "humanize|quantize|euclidFill|strum|chop|glue|arpeggiate|euclidDrums|melody|chord|progression", "len": 1, "mode": "up|down|upDown|random", "rate": 1, "gate": 0.9, "octaves": 1, "timing": 0.3, "velocity": 0.2, "grid": 1, "amount": 1, "scaleAware": false, "ch": 0, "k": 4, "n": 16, "rotate": 0, "vel": 0.7, "width": 0.5, "ramp": 0.05, "voices": [{"ch": 0, "k": 4, "n": 16, "rotate": 0, "vel": 0.7}], "bars": 2, "density": 0.5, "repeat": 1, "harmony": "diatonic|maj|min|7|maj7|min7", "template": "pop|pop2|minloop|trap|iivI|doowop|andalusian|blues|canon|chance", "voiceLead": true, "degrees": [0, 5, 2, 6]}, "seed": 7, "select": {"kind": "indices|range", "indices": [1, 2], "from": 0, "to": 16, "ch": 0}},
             "setKey": {"key": 2, "scale": 1},
             "putComp": {"comp": {"id": 0, "name": "Comp 1", "xfade": 0.01, "takes": [{"id": 0, "name": "Take 1", "ref": "source id", "start": 0, "len": 8, "offset": 0}], "regions": [{"take": 0, "from": 0, "to": 4, "xfade": 0.02}]}},
             "removeComp": {"id": 0},
-            "editTune": {"clip": 412, "edit": {"base": "segmentation fingerprint from `wave pitch inspect` (optional; refused as STALE_NOTES when the notes changed)", "init": "[[start, end], …] seconds: the analysis' notes, used only when the clip has no notes of its own yet (`pitch edit` adds it)", "notes": [{"i": 3, "shift": -20, "shiftBy": 0, "drift": 0.2, "formant": 0, "gain": 0, "speed": 60}], "reset": [5], "split": [{"i": 7, "at": 12.35}], "merge": [9], "clear": false, "erasePencil": [[1.0, 1.5]], "pencil": [[2.0, 64.0], [2.02, 64.1]]}},
+            "editTune": {"clip": 412, "edit": {"base": "segmentation fingerprint from `synkopa pitch inspect` (optional; refused as STALE_NOTES when the notes changed)", "init": "[[start, end], …] seconds: the analysis' notes, used only when the clip has no notes of its own yet (`pitch edit` adds it)", "notes": [{"i": 3, "shift": -20, "shiftBy": 0, "drift": 0.2, "formant": 0, "gain": 0, "speed": 60}], "reset": [5], "split": [{"i": 7, "at": 12.35}], "merge": [9], "clear": false, "erasePencil": [[1.0, 1.5]], "pencil": [[2.0, 64.0], [2.02, 64.1]]}},
             "putNotebook": {"notebook": {"pages": [{"id": 0, "name": "Zwrotka 1", "startBar": 1, "text": "[Zwrotka]\nfirst bar\n\nthird bar"}]}},
         },
-        "notebook": "lyrics notebook (text only, never played): pages in tab order; each line of `text` is one bar counted from `startBar` (1-based, bar = 4 beats), an empty line is a bar of rest, a line wrapped in [brackets] is a header and takes no bar. putNotebook replaces all pages; the full text is in `wave context --full`",
-        "comps": "take lanes: a clip of kind `comp` plays comp `ref`; takes/regions are in comp beats (comp beat = clip.offset + timeline beat − clip.start); regions sorted, non-overlapping, gaps are silent; xfade in seconds (equal-power crossfade centred on each region start, default 0.01). Easier: `wave takes --track N`, `wave comp --track N --set '[{\"take\":ID,\"from\":B,\"to\":B}]'` (timeline beats)",
-        "pitchEdits": "editTune changes only a clip's pitch edits (the pitch editor's notes): indices name the notes as `wave pitch inspect` lists them (before this op), whatever order the parts are in; they apply as clear, reset, notes, split, merge, erasePencil, pencil. shift/formant in cents (within 2400), drift 0..1, gain -24..12 dB, speed 0..1000 ms (null = the reference's, else immediate). Easier: `wave pitch edit`",
+        "notebook": "lyrics notebook (text only, never played): pages in tab order; each line of `text` is one bar counted from `startBar` (1-based, bar = 4 beats), an empty line is a bar of rest, a line wrapped in [brackets] is a header and takes no bar. putNotebook replaces all pages; the full text is in `synkopa context --full`",
+        "comps": "take lanes: a clip of kind `comp` plays comp `ref`; takes/regions are in comp beats (comp beat = clip.offset + timeline beat − clip.start); regions sorted, non-overlapping, gaps are silent; xfade in seconds (equal-power crossfade centred on each region start, default 0.01). Easier: `synkopa takes --track N`, `synkopa comp --track N --set '[{\"take\":ID,\"from\":B,\"to\":B}]'` (timeline beats)",
+        "pitchEdits": "editTune changes only a clip's pitch edits (the pitch editor's notes): indices name the notes as `synkopa pitch inspect` lists them (before this op), whatever order the parts are in; they apply as clear, reset, notes, split, merge, erasePencil, pencil. shift/formant in cents (within 2400), drift 0..1, gain -24..12 dB, speed 0..1000 ms (null = the reference's, else immediate). Easier: `synkopa pitch edit`",
         "example": [{"op": "setBpm", "bpm": 140}, {"op": "removeClips", "ids": [3]}],
     })
 }
@@ -721,8 +888,10 @@ pub fn import(app: &dyn Host, a: &Value) -> R<Value> {
         (None, Some(b)) => Some((0, b)),
         _ => None,
     };
-    let (s, c) = app.engine().import_audio(&paths, place).map_err(|e| e.to_string())?;
-    Ok(json!({ "sourceIds": s, "clipIds": c }))
+    // `step: false`: the file is loaded for an edit that follows (a sampler channel), which is the undo step
+    let step = arg(a, "step").and_then(Value::as_bool).unwrap_or(true);
+    let (s, c, errors) = app.engine().import_audio_with(&paths, place, step).map_err(|e| e.to_string())?;
+    Ok(json!({ "sourceIds": s, "clipIds": c, "errors": errors }))
 }
 
 // ---------------------------------------------------------------- missing audio
@@ -773,17 +942,21 @@ fn channel_json(p: &wave_engine::Project, c: &wave_engine::Channel) -> Value {
     use wave_engine::ChannelSrc;
     let g = c.gain();
     let (kind, what) = match &c.src {
-        ChannelSrc::Sample { source, sampler } => (
+        ChannelSrc::Sample { source, sampler, slices } => (
             "sample",
-            json!({ "source": source, "sourceName": p.sources.iter().find(|s| s.id == *source).map(|s| s.name.clone()), "sampler": sampler }),
+            json!({ "source": source, "sourceName": p.sources.iter().find(|s| s.id == *source).map(|s| s.name.clone()), "sampler": sampler, "slices": slices }),
         ),
         ChannelSrc::Synth { synth } => ("synth", json!({ "preset": synth.preset })),
         ChannelSrc::Keys { keys } => ("keys", json!({ "release": keys.release, "dynamics": keys.dynamics })),
+        ChannelSrc::Plugin { plugin } => (
+            "plugin",
+            json!({ "plugin": { "format": plugin.format, "name": plugin.name, "vendor": plugin.vendor, "path": plugin.path, "cid": plugin.cid } }),
+        ),
     };
     let mut v = json!({
         "id": c.id, "index": p.channels.iter().position(|x| x.id == c.id), "name": c.name, "kind": kind,
         "volume": if g < 1e-6 { "-inf".to_string() } else { format!("{:+.1} dB", 20.0 * g.log10()) }, "vol": c.vol, "pan": c.pan,
-        "mute": c.mute, "solo": c.solo, "insert": c.insert, "root": c.root,
+        "mute": c.mute, "solo": c.solo, "insert": c.insert, "root": c.root, "group": c.group,
         "notes": p.patterns.iter().map(|pt| pt.notes.iter().filter(|n| n.ch == c.id).count()).sum::<usize>(),
     });
     if let (Value::Object(m), Value::Object(w)) = (&mut v, what) {
@@ -795,10 +968,10 @@ fn channel_json(p: &wave_engine::Project, c: &wave_engine::Channel) -> Value {
 /// A channel by id, by name (case-insensitive) or by built-in instrument name.
 fn find_channel<'a>(p: &'a wave_engine::Project, v: &Value) -> R<&'a wave_engine::Channel> {
     if let Some(id) = as_index(v) {
-        return p.channel(id).ok_or(format!("no channel {id} (see `wave channels`)"));
+        return p.channel(id).ok_or(format!("no channel {id} (see `synkopa channels`)"));
     }
     let s = v.as_str().ok_or("`ch` is a channel id or name")?.to_lowercase();
-    p.channels.iter().find(|c| c.name.to_lowercase() == s).ok_or(format!("no channel named `{s}` (see `wave channels`)"))
+    p.channels.iter().find(|c| c.name.to_lowercase() == s).ok_or(format!("no channel named `{s}` (see `synkopa channels`)"))
 }
 
 pub fn channels(app: &dyn Host, a: &Value, if_revision: Option<u64>) -> R<Value> {
@@ -812,14 +985,16 @@ pub fn channels(app: &dyn Host, a: &Value, if_revision: Option<u64>) -> R<Value>
         // ".flac"), its display name, or the start of either ("kick" = the first kick)
         let want = k.to_lowercase();
         let stem = |f: &factory::FactoryFile| f.file.trim_end_matches(".flac").to_string();
-        let files = factory::files();
-        let f = files
-            .iter()
-            .find(|f| stem(f) == want.trim_end_matches(".flac") || f.name.to_lowercase() == want)
-            .or_else(|| files.iter().find(|f| stem(f).starts_with(&want) || f.name.to_lowercase().starts_with(&want)))
+        // the samples the Library tab lists come first; a hidden one (kept for older songs) only
+        // by its exact name, so "kick-trap" is one of the listed trap kicks, not the old hidden file
+        let exact = |f: &&factory::FactoryFile| stem(f) == want.trim_end_matches(".flac") || f.name.to_lowercase() == want;
+        let f = factory::listed_files()
+            .find(exact)
+            .or_else(|| factory::listed_files().find(|f| stem(f).starts_with(&want) || f.name.to_lowercase().starts_with(&want)))
+            .or_else(|| factory::files().iter().find(exact))
             .ok_or(format!("no standard-library sample `{k}`: try kick-808, snare-studio, hat-808-open, bass-808, marimba ... (the browser's Library tab lists them all)"))?;
         // the import adds the project source (or finds the one already there)
-        let (srcs, _) = e.import_audio(&[PathBuf::from(factory::lib_path(f.file))], None).map_err(|x| x.to_string())?;
+        let (srcs, ..) = e.import_audio_with(&[PathBuf::from(factory::lib_path(f.file))], None, false).map_err(|x| x.to_string())?;
         p = e.project();
         let mut ch = Channel::sampler(p.next_id, f.name, factory::color(f), srcs[0]);
         ch.root = f.root;
@@ -827,7 +1002,7 @@ pub fn channels(app: &dyn Host, a: &Value, if_revision: Option<u64>) -> R<Value>
         ops.push(Op::PutChannel { channel: ch, index: None });
     }
     if let Some(src) = arg(a, "sample").and_then(as_index) {
-        let s = p.sources.iter().find(|s| s.id == src).ok_or(format!("no source {src} (see `wave context`)"))?;
+        let s = p.sources.iter().find(|s| s.id == src).ok_or(format!("no source {src} (see `synkopa context`)"))?;
         let id = p.next_id + ops.len() as u64;
         let ch = Channel::sampler(id, &s.name, &s.color, src);
         added = Some(id);
@@ -839,7 +1014,7 @@ pub fn channels(app: &dyn Host, a: &Value, if_revision: Option<u64>) -> R<Value>
         let synth = if name.is_empty() {
             wave_engine::SynthState::default()
         } else {
-            wave_engine::poly::preset_state(name).ok_or(format!("no synth preset `{name}` (see `wave catalog`)"))?
+            wave_engine::poly::preset_state(name).ok_or(format!("no synth preset `{name}` (see `synkopa catalog`)"))?
         };
         let bass = wave_engine::poly::presets::all().iter().any(|x| x.name == name && matches!(x.category, "808" | "Bas"));
         let label = if name.is_empty() { "Synth".to_string() } else { name.to_string() };
@@ -847,10 +1022,41 @@ pub fn channels(app: &dyn Host, a: &Value, if_revision: Option<u64>) -> R<Value>
         added = Some(id);
         ops.push(Op::PutChannel { channel: ch, index: None });
     }
-    if arg(a, "keys").and_then(Value::as_bool).unwrap_or(false) {
-        // a WAVE Keys channel: the sampled grand piano
+    if let Some(want) = arg(a, "plugin").and_then(Value::as_str) {
+        // a hosted VST3 instrument from the last plugin scan: its class id, or its name
+        // (case-insensitive; the start of it picks the first match)
+        let r = app.plugins().scan(false);
+        let w = want.to_lowercase();
+        let entry = r
+            .instruments
+            .iter()
+            .find(|i| i.cid.eq_ignore_ascii_case(want) || i.name.to_lowercase() == w)
+            .or_else(|| r.instruments.iter().find(|i| i.name.to_lowercase().starts_with(&w)))
+            .ok_or(format!(
+                "no scanned VST3 instrument `{want}`{}",
+                if r.instruments.is_empty() {
+                    " (none is scanned: run `synkopa plugin_scan --rescan`)".to_string()
+                } else {
+                    format!("; installed: {}", r.instruments.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(", "))
+                }
+            ))?;
         let id = p.next_id + ops.len() as u64;
-        let ch = Channel::new(id, "WAVE Keys", "#e0a44a", ChannelSrc::Keys { keys: Default::default() });
+        let plugin = wave_engine::PluginRef {
+            format: entry.format.clone(),
+            path: entry.path.clone(),
+            cid: entry.cid.clone(),
+            name: entry.name.clone(),
+            vendor: entry.vendor.clone(),
+            state: None,
+        };
+        let ch = Channel::new(id, &entry.name, "#9b7cf8", ChannelSrc::Plugin { plugin });
+        added = Some(id);
+        ops.push(Op::PutChannel { channel: ch, index: None });
+    }
+    if arg(a, "keys").and_then(Value::as_bool).unwrap_or(false) {
+        // a Synkopa Keys channel: the sampled grand piano
+        let id = p.next_id + ops.len() as u64;
+        let ch = Channel::new(id, "Synkopa Keys", "#e0a44a", ChannelSrc::Keys { keys: Default::default() });
         added = Some(id);
         ops.push(Op::PutChannel { channel: ch, index: None });
     }
@@ -861,7 +1067,7 @@ pub fn channels(app: &dyn Host, a: &Value, if_revision: Option<u64>) -> R<Value>
             return Err(format!("channel `{}` is not a synth", c.name));
         }
         c.src = ChannelSrc::Synth {
-            synth: wave_engine::poly::preset_state(name).ok_or(format!("no synth preset `{name}` (see `wave catalog`)"))?,
+            synth: wave_engine::poly::preset_state(name).ok_or(format!("no synth preset `{name}` (see `synkopa catalog`)"))?,
         };
         ops.push(Op::PutChannel { channel: c, index: None });
     }
@@ -872,14 +1078,20 @@ pub fn channels(app: &dyn Host, a: &Value, if_revision: Option<u64>) -> R<Value>
         match &mut c.src {
             ChannelSrc::Synth { synth } => {
                 let i = wave_engine::poly::params::index_of(param)
-                    .ok_or(format!("the synth has no parameter `{param}` (see `wave catalog`)"))?;
+                    .ok_or(format!("the synth has no parameter `{param}` (see `synkopa catalog`)"))?;
                 synth.params.insert(param.to_string(), wave_engine::poly::params::clamp(i, value) as f64);
                 synth.preset = None;
+            }
+            ChannelSrc::Plugin { plugin } => {
+                return Err(format!(
+                    "`{}` is a plugin instrument: list its parameters with `synkopa plugin_params --fxId {}` and set one with `synkopa plugin_set_param`",
+                    plugin.name, c.id
+                ))
             }
             ChannelSrc::Keys { keys } => match param {
                 "release" => keys.release = (value as f32).clamp(wave_engine::keys::RELEASE_MS.0, wave_engine::keys::RELEASE_MS.1),
                 "dynamics" => keys.dynamics = (value as f32).clamp(0.0, 100.0),
-                _ => return Err(format!("WAVE Keys has no parameter `{param}` (release in ms, dynamics in %)")),
+                _ => return Err(format!("Synkopa Keys has no parameter `{param}` (release in ms, dynamics in %)")),
             },
             ChannelSrc::Sample { sampler, .. } => {
                 let (v, on) = (value as f32, value != 0.0);
@@ -890,18 +1102,34 @@ pub fn channels(app: &dyn Host, a: &Value, if_revision: Option<u64>) -> R<Value>
                     "norm" => sampler.norm = on,
                     "semi" => sampler.semi = value.round().clamp(-128.0, 127.0) as i8,
                     "fine" => sampler.fine = v,
-                    "gate" => sampler.gate = on,
+                    // `gate`: the envelope switch's name in older scripts
+                    "env" | "gate" => sampler.env = on,
+                    "delay" => sampler.delay = v,
                     "attack" => sampler.attack = v,
+                    "hold" => sampler.hold = v,
                     "decay" => sampler.decay = v,
                     "sustain" => sampler.sustain = v,
                     "release" => sampler.release = v,
+                    "attackTension" => sampler.attack_tension = v,
+                    "decayTension" => sampler.decay_tension = v,
+                    "releaseTension" => sampler.release_tension = v,
                     "fadeInMs" => sampler.fade_in_ms = v,
                     "fadeOutMs" => sampler.fade_out_ms = v,
                     "cut" => sampler.cut = value.round().clamp(0.0, 255.0) as u8,
-                    _ => return Err(format!("the sampler has no parameter `{param}` (start, end: 0..1; reverse, norm, gate: 0 or 1; semi, fine; attack, decay, release, fadeInMs, fadeOutMs in ms; sustain 0..1; cut 0..8)")),
+                    _ => return Err(format!("the sampler has no parameter `{param}` (start, end: 0..1; reverse, norm, env: 0 or 1; semi, fine; delay, attack, hold, decay, release, fadeInMs, fadeOutMs in ms; sustain 0..1; attackTension, decayTension, releaseTension -1..1; cut 0..8)")),
                 }
             }
         }
+        ops.push(Op::PutChannel { channel: c, index: None });
+    }
+    if let (Some(v), Some(g)) = (arg(a, "ch"), arg(a, "group").and_then(Value::as_str)) {
+        // the Channel Rack filter group ("" = none)
+        let mut c = find_channel(&p, v)?.clone();
+        let g = g.trim();
+        if g.chars().count() > 40 {
+            return Err("a group name has at most 40 characters".into());
+        }
+        c.group = (!g.is_empty()).then(|| g.to_string());
         ops.push(Op::PutChannel { channel: c, index: None });
     }
     if let Some(v) = arg(a, "remove") {
@@ -966,7 +1194,14 @@ fn pattern_json(p: &wave_engine::Project, pt: &wave_engine::Pattern) -> Value {
             if !simple {
                 row["notes"] = json!(notes
                     .iter()
-                    .map(|n| json!({ "step": n.step, "len": n.len, "p": n.p.unwrap_or(c.root), "v": n.v, "trig": n.trig.unwrap_or(false) }))
+                    .map(|n| {
+                        let mut j =
+                            json!({ "step": n.step, "len": n.len, "p": n.p.unwrap_or(c.root), "v": n.v, "trig": n.trig.unwrap_or(false) });
+                        if n.slide {
+                            j["slide"] = json!(true);
+                        }
+                        j
+                    })
                     .collect::<Vec<_>>());
             }
             row
@@ -975,7 +1210,7 @@ fn pattern_json(p: &wave_engine::Project, pt: &wave_engine::Pattern) -> Value {
     json!({ "id": pt.id, "name": pt.name, "color": pt.color, "bars": pt.len / 4.0, "lenBeats": pt.len, "minBars": pt.min_len / 4.0, "swing": (pt.swing * 100.0).round(), "rows": rows })
 }
 
-/// `wave pattern`: show a pattern as step strings, or edit it (one undo step).
+/// `synkopa pattern`: show a pattern as step strings, or edit it (one undo step).
 pub fn pattern(app: &dyn Host, a: &Value, if_revision: Option<u64>) -> R<Value> {
     use wave_engine::{Note, Pattern};
     let e = app.engine();
@@ -1029,6 +1264,9 @@ pub fn pattern(app: &dyn Host, a: &Value, if_revision: Option<u64>) -> R<Value> 
     }
     let steps = arg(a, "steps").and_then(Value::as_str);
     let notes = arg(a, "notes");
+    let stamp = arg(a, "stamp");
+    // stamp is handled below on its own: it replaces only its target step, so it must
+    // not enter the channel-wide replacement path
     if steps.is_some() || notes.is_some() || arg(a, "clear").and_then(Value::as_bool).unwrap_or(false) {
         let ch = find_channel(&p, arg(a, "ch").ok_or("--ch (channel id or name) is required with --steps / --notes / --clear")?)?.id;
         pt.notes.retain(|n| n.ch != ch);
@@ -1040,16 +1278,45 @@ pub fn pattern(app: &dyn Host, a: &Value, if_revision: Option<u64>) -> R<Value> 
             pt.notes.extend(parse_steps(s, vel)?.into_iter().map(|(k, v)| Note { v, ..Note::trigger(ch, k, None) }));
         }
         if let Some(ns) = notes {
-            let list = ns.as_array().ok_or("--notes is a JSON array of {step, len, p?, v?, trig?}")?;
+            let list = ns.as_array().ok_or("--notes is a JSON array of {step, len, p?, v?, trig?, slide?}")?;
             for n in list {
                 let step = opt_f64(n, "step").ok_or("each note needs `step` (16ths)")? as f32;
                 let len = opt_f64(n, "len").unwrap_or(1.0) as f32;
                 let key = arg(n, "p").and_then(as_index).map(|k| k.min(127) as u8);
                 let v = opt_f64(n, "v").unwrap_or(1.0) as f32;
                 let trigger = arg(n, "trig").map(|v| v.as_bool().ok_or("note `trig` must be a boolean")).transpose()?.unwrap_or(false);
-                pt.notes.push(Note { v, trig: Some(trigger), ..Note::new(ch, step, len, key) });
+                let slide = arg(n, "slide").map(|v| v.as_bool().ok_or("note `slide` must be a boolean")).transpose()?.unwrap_or(false);
+                if slide && trigger {
+                    return Err("a slide note is held for its length (the glide time): it cannot be a trigger".into());
+                }
+                pt.notes.push(Note { v, trig: Some(trigger), slide, ..Note::new(ch, step, len, key) });
             }
         }
+    }
+    // `synkopa notes stamp` lands here: one chord written through the existing note op
+    let mut stamped: Option<Value> = stamp.map(|st| -> Result<Value, String> {
+        let ch = find_channel(&p, arg(a, "ch").ok_or("--ch (channel id or name) is required with --stamp")?)?.id;
+        let step = opt_f64(st, "step").ok_or("stamp needs `step` (16ths)")? as f32;
+        let root = arg(st, "root").and_then(as_index).filter(|r| *r <= 127).ok_or("stamp needs `root` (a MIDI key 0..127, or a note name)")? as u8;
+        let ty = st.get("type").and_then(Value::as_str).ok_or("stamp needs `type` (a chord id like min7 — see `synkopa schema`)")?;
+        let inv = arg(st, "inv").and_then(as_index).unwrap_or(0);
+        let len = opt_f64(st, "len").unwrap_or(4.0) as f32;
+        if !(step.is_finite() && step >= 0.0 && len.is_finite() && len > 0.0) {
+            return Err("stamp: `step` must be ≥ 0 and `len` > 0".into());
+        }
+        if wave_engine::transform::chord_intervals(ty).is_none() {
+            return Err(format!("stamp: unknown chord type `{}` ({})", ty, wave_engine::transform::CHORD_TYPES.iter().map(|(id, _)| *id).collect::<Vec<_>>().join(", ")));
+        }
+        let pitches = wave_engine::transform::chord_pitches(root, ty, inv as u32)
+            .ok_or_else(|| format!("stamp: root {root} pushes the top voice past MIDI 127"))?;
+        // re-stamping a step replaces its notes on that channel: no pile-up
+        pt.notes.retain(|n| !(n.ch == ch && n.step == step));
+        pt.notes.extend(pitches.iter().map(|&k| Note { v: 0.8, ..Note::new(ch, step, len, Some(k)) }));
+        Ok(json!({ "notes": pitches.iter().map(|&k| json!({ "step": step, "len": len, "p": k, "v": 0.8 })).collect::<Vec<_>>(), "label": wave_engine::transform::chord_name(&pitches) }))
+    }).transpose()?;
+    if let Some(s) = stamped.as_mut() {
+        s["revision"] = json!(e.apply(&[Op::PutPattern { pattern: pt.clone() }], false, if_revision).map_err(|x| x.to_string())?);
+        return Ok(s.clone());
     }
     if !new && pt == before {
         return Ok(pattern_json(&p, &pt));
@@ -1248,14 +1515,14 @@ pub fn tune_ref(app: &dyn Host, a: &Value, if_revision: Option<u64>) -> R<u64> {
 }
 
 /// The CLI entry: one request → JSON data.
-pub fn control(app: &dyn Host, cmd: &str, a: &Value, if_revision: Option<u64>) -> R<Value> {
+pub fn control(app: &dyn Host, cmd: &str, a: &Value, if_revision: Option<u64>, label: Option<&str>) -> R<Value> {
     let e = app.engine();
     let ok_rev = |r: u64| json!({ "revision": r });
     if !app.live() && LIVE_ONLY.contains(&cmd) {
         return Err(live_only_error(cmd));
     }
     match cmd {
-        "pitch_analyze" | "pitch_target" | "tune_ref" | "auto_vocal_plan" | "f0_model" => app.ensure_pitch_model(),
+        "pitch_analyze" | "pitch_target" | "tune_ref" | "auto_vocal_plan" | "auto_vocal" | "f0_model" => app.ensure_pitch_model(),
         c if crate::pitch_actions::COMMANDS.contains(&c) => app.ensure_pitch_model(),
         "vst3_params" | "vst3_set_param" | "plugin_params" | "plugin_set_param" => app.ensure_live_plugins(),
         _ => {}
@@ -1269,6 +1536,9 @@ pub fn control(app: &dyn Host, cmd: &str, a: &Value, if_revision: Option<u64>) -
     if let Some(r) = crate::fx_chains::control(app, cmd, a, if_revision) {
         return r;
     }
+    if let Some(r) = crate::stems_actions::control(app, cmd, a, if_revision) {
+        return r;
+    }
     match cmd {
         "status" => {
             let st = e.state();
@@ -1278,13 +1548,13 @@ pub fn control(app: &dyn Host, cmd: &str, a: &Value, if_revision: Option<u64>) -
         }
         "context" => Ok(context(app, arg(a, "full").and_then(Value::as_bool).unwrap_or(false))),
         "catalog" => Ok(
-            json!({ "effects": catalog::catalog(), "commands": ["status","context","catalog","schema","apply","undo","redo","play","stop","render","import","add_fx","set_param","load_preset","save","open","export_project_zip","pitch_analyze","pitch_target","pitch_inspect","pitch_compare","pitch_suggest","pitch_edit","pitch_render","melody_channels","melody_reference","tune_ref","f0_model","music_analyze","auto_vocal_plan","bake_rider","midi_inspect","midi_import","midi_export","fx_chains","fx_chain_save","fx_chain_load","fx_chain_rename","fx_chain_delete","missing","relink","make_unique","takes","comp","flatten_comp","comp_audition","channels","pattern","pattern_play","pattern_loop","note_audition","plugin_scan","plugin_add","plugin_params","plugin_set_param","vst3_scan","vst3_add","vst3_params","vst3_set_param"] }),
+            json!({ "effects": catalog::catalog(), "commands": ["status","context","catalog","schema","apply","undo","redo","play","stop","render","import","add_fx","route","unroute","set_param","load_preset","save","open","export_project_zip","pitch_analyze","pitch_target","pitch_inspect","pitch_compare","pitch_suggest","pitch_edit","pitch_render","melody_channels","melody_reference","tune_ref","f0_model","f0_model_install","music_analyze","auto_vocal_plan","auto_vocal","bake_rider","midi_inspect","midi_import","midi_export","fx_chains","fx_chain_save","fx_chain_load","fx_chain_rename","fx_chain_delete","missing","relink","set_project","make_unique","export_in_place","stems_model","stems_model_install","extract_stems","takes","comp","flatten_comp","comp_audition","channels","pattern","pattern_play","pattern_loop","note_audition","plugin_scan","plugin_add","plugin_params","plugin_set_param","plugin_load_anyway","vst3_scan","vst3_add","vst3_params","vst3_set_param"] }),
         ),
         "schema" => Ok(schema()),
         "apply" => {
             let ops: Vec<Op> =
                 serde_json::from_value(arg(a, "ops").cloned().unwrap_or(json!([]))).map_err(|er| format!("BAD_OPS: {er}"))?;
-            e.apply(&ops, false, if_revision).map(ok_rev).map_err(|er| er.to_string())
+            e.apply_labeled(&ops, false, if_revision, label).map(ok_rev).map_err(|er| er.to_string())
         }
         "undo" => Ok(json!({ "undone": e.undo() })),
         "redo" => Ok(json!({ "redone": e.redo() })),
@@ -1293,8 +1563,10 @@ pub fn control(app: &dyn Host, cmd: &str, a: &Value, if_revision: Option<u64>) -
             Ok(json!({ "playing": true }))
         }
         "stop" => {
-            e.stop();
-            Ok(json!({ "playing": false }))
+            // the transport stops either way; a recording that could not be written comes
+            // back as the action's error, so the UI can tell the user
+            let t = e.stop().map_err(|e| e.to_string())?;
+            Ok(json!({ "playing": false, "transport": t }))
         }
         "render" => render(app, a),
         "export_project_zip" => export_project_zip(e, Path::new(need_str(a, "out")?), if_revision),
@@ -1304,6 +1576,11 @@ pub fn control(app: &dyn Host, cmd: &str, a: &Value, if_revision: Option<u64>) -
             let (id, rev) = add_fx(app, need_u64(a, "insertId")?, kind, arg(a, "preset").and_then(as_index).map(|x| x as usize), None)?;
             Ok(json!({ "fxId": id, "revision": rev }))
         }
+        "route" => {
+            let only = arg(a, "only").map(|v| v.as_bool().ok_or("`only` must be a boolean")).transpose()?.unwrap_or(false);
+            route(app, need_u64(a, "from")?, need_u64(a, "to")?, opt_f64(a, "gain").map(|g| g as f32), only, if_revision).map(ok_rev)
+        }
+        "unroute" => unroute(app, need_u64(a, "from")?, need_u64(a, "to")?, if_revision).map(ok_rev),
         "set_param" => {
             set_param(app, need_u64(a, "fxId")?, need_str(a, "param")?, opt_f64(a, "value").ok_or("`value` is required")?, if_revision)
                 .map(ok_rev)
@@ -1351,6 +1628,11 @@ pub fn control(app: &dyn Host, cmd: &str, a: &Value, if_revision: Option<u64>) -
         "comp" => comp(app, a, if_revision),
         "missing" => Ok(missing(app)),
         "relink" => relink(app, a),
+        "set_project" => {
+            let p = arg(a, "project").cloned().ok_or("`project`: the whole project, as `context --full` gives it")?;
+            let p = wave_engine::Project::from_json(p).map_err(|x| format!("BAD_PROJECT: {x}"))?;
+            e.set_project(p, if_revision, label).map(ok_rev).map_err(|x| x.to_string())
+        }
         "make_unique" => {
             let ids: Vec<u64> = arg(a, "clipIds")
                 .and_then(Value::as_array)
@@ -1360,6 +1642,18 @@ pub fn control(app: &dyn Host, cmd: &str, a: &Value, if_revision: Option<u64>) -
                 .collect();
             let r = e.make_unique_audio(&ids).map_err(|x| x.to_string())?;
             Ok(json!({ "sourceId": r.source_id, "track": r.track, "insertId": r.insert_id, "revision": e.revision() }))
+        }
+        "export_in_place" => {
+            let ids: Vec<u64> = arg(a, "clipIds")
+                .and_then(Value::as_array)
+                .ok_or("`clipIds` (array of clip ids) is required")?
+                .iter()
+                .filter_map(as_index)
+                .collect();
+            let r = e
+                .export_in_place(&ids, IN_PLACE_RATE, &std::sync::atomic::AtomicBool::new(false), &mut |_| {})
+                .map_err(|x| x.to_string())?;
+            Ok(json!({ "sourceId": r.source_id, "clipId": r.clip_id, "track": r.track, "revision": e.revision() }))
         }
         "flatten_comp" => {
             let clip = comp_clip(&e.project(), a)?;
@@ -1398,6 +1692,22 @@ pub fn control(app: &dyn Host, cmd: &str, a: &Value, if_revision: Option<u64>) -
         }
         "tune_ref" => tune_ref(app, a, if_revision).map(ok_rev),
         "f0_model" => Ok(json!(crate::models::status(e, app.model_error()))),
+        "f0_model_install" => {
+            // the download (~345 MB) is SHA-256 checked inside `install`; blocking is fine here —
+            // session requests run on their own thread (the app path streams progress events instead)
+            crate::models::install(|_, _| {})?;
+            match crate::models::activate(e) {
+                Ok(true) => {
+                    app.set_model_error(None);
+                    Ok(json!(crate::models::status(e, None)))
+                }
+                Ok(false) => Err("the model file is missing after the install".into()),
+                Err(m) => {
+                    app.set_model_error(Some(m.clone()));
+                    Err(m)
+                }
+            }
+        }
         "music_analyze" => {
             let cid = arg(a, "clipId").and_then(as_index);
             let ex = arg(a, "excludeFx").and_then(as_index);
@@ -1421,8 +1731,60 @@ pub fn control(app: &dyn Host, cmd: &str, a: &Value, if_revision: Option<u64>) -
                 Some(v) => serde_json::from_value(v.clone()).map_err(|er| format!("BAD_ARGS: params: {er}"))?,
                 None => Default::default(),
             };
-            let (source, clip) = e.bake_rider(cid, &params).map_err(|x| x.to_string())?;
+            let (source, clip) = e.bake_rider(cid, &params, if_revision).map_err(|x| x.to_string())?;
             Ok(json!({ "clipId": clip, "sourceId": source, "revision": e.revision() }))
+        }
+        "auto_vocal" => {
+            let cid = need_u64(a, "clipId")?;
+            // the guard is checked at entry as well: a stale one refuses before the bake, not
+            // after half of the job is done
+            if let Some(r) = if_revision {
+                if e.revision() != r {
+                    return Err(format!("{} project is at revision {}, not {r}", wave_engine::errors::ERR_REVISION_CONFLICT, e.revision()));
+                }
+            }
+            let insert = e.clip_insert(cid).ok_or("no such clip")?;
+            if insert == 0 {
+                return Err("the clip plays on the master insert; route its track to its own mixer insert first".into());
+            }
+            let style = match arg(a, "style").and_then(Value::as_str) {
+                Some("hard") => wave_engine::autovocal::Style::Hard,
+                _ => wave_engine::autovocal::Style::Natural,
+            };
+            let bake = !arg(a, "noBake").and_then(Value::as_bool).unwrap_or(false);
+            let plan = e.auto_vocal_plan(cid, arg(a, "beatClipId").and_then(as_index), style, bake).map_err(|x| x.to_string())?;
+            // the rider is rendered into the audio instead of living on the insert (no playback
+            // delay); a clip that was baked before is not baked twice (same guard as the app)
+            let mut baked = None;
+            if let Some(rb) = plan.rider_bake.as_ref().filter(|_| !already_baked(e, cid)) {
+                // the engine checks the guard under the commit lock: a project that moved on
+                // while the rider rendered refuses the bake before a source is written
+                let (s, c) = e.bake_rider(cid, &rb.params, if_revision).map_err(|x| x.to_string())?;
+                baked = Some(json!({ "sourceId": s, "clipId": c }));
+            }
+            // the stage ids come from the snapshot below, so the apply is guarded on the
+            // revision read just before it even when the caller gave no guard: a concurrent
+            // edit then conflicts instead of silently overwriting one of those ids
+            let base = e.revision();
+            let (ops, fx_ids) = chain_ops(e, insert, &plan);
+            // our own bake moved the project one step past the caller's guard; a foreign change
+            // still conflicts (the entry check above refuses before anything is done)
+            let guard = Some(if_revision.map_or(base, |r| r + u64::from(baked.is_some())));
+            if let Err(x) = e.apply(&ops, false, guard) {
+                // the bake is already committed (its own undo step): say so, or a retry skips it
+                // as already baked and the caller never learns the audio changed
+                return Err(match &baked {
+                    Some(b) => format!(
+                        "{x} (the rider was already baked into the clip: {b}, project now at revision {}; the effect chain was not added, run auto-vocal again to add it)",
+                        e.revision()
+                    ),
+                    None => x.to_string(),
+                });
+            }
+            Ok(json!({
+                "revision": e.revision(), "clipId": cid, "insertId": insert, "style": plan.style,
+                "riderBaked": baked, "fxIds": fx_ids, "trackGainDb": plan.track_gain_db, "warnings": plan.warnings,
+            }))
         }
         "plugin_scan" => Ok(json!(app.plugins().scan(arg(a, "rescan").and_then(Value::as_bool).unwrap_or(false)))),
         "vst3_scan" => {
@@ -1435,9 +1797,6 @@ pub fn control(app: &dyn Host, cmd: &str, a: &Value, if_revision: Option<u64>) -
             let guess = if cid.contains(":") { PluginRef::LV2 } else { PluginRef::VST3 };
             let format = if cmd == "vst3_add" { PluginRef::VST3 } else { arg(a, "format").and_then(Value::as_str).unwrap_or(guess) };
             let path = arg(a, "path").and_then(Value::as_str).unwrap_or("");
-            if format == PluginRef::VST3 && path.is_empty() {
-                return Err("`path` is required for a VST3 plugin".into());
-            }
             let (id, rev) = plugin_add(app, need_u64(a, "insertId")?, format, path, cid, None)?;
             Ok(json!({ "fxId": id, "revision": rev }))
         }
@@ -1449,11 +1808,15 @@ pub fn control(app: &dyn Host, cmd: &str, a: &Value, if_revision: Option<u64>) -
                 .filter(|p| q.as_ref().map(|q| p.name().to_lowercase().contains(q)).unwrap_or(true))
                 .collect::<Vec<_>>()))
         }
+        "plugin_load_anyway" => {
+            plugin_load_anyway(app, need_u64(a, "fxId")?)?;
+            Ok(json!({}))
+        }
         "plugin_set_param" | "vst3_set_param" => {
             app.plugins().set_param(need_u64(a, "fxId")?, need_u64(a, "id")? as u32, opt_f64(a, "value").ok_or("`value` is required")?)?;
             Ok(json!({}))
         }
-        other => Err(format!("UNKNOWN_COMMAND: `{other}` (see `wave catalog`)")),
+        other => Err(format!("UNKNOWN_COMMAND: `{other}` (see `synkopa catalog`)")),
     }
 }
 
@@ -1484,6 +1847,25 @@ mod tests {
     use std::sync::Arc;
     use wave_engine::{Engine, NoPlugins, Project};
 
+    #[test]
+    fn save_new_version_counts_up_and_never_lands_on_an_existing_file() {
+        use super::next_version_path;
+        use std::path::{Path, PathBuf};
+        let free = |_: &Path| false;
+        let dir = Path::new("songs");
+        assert_eq!(next_version_path(&dir.join("Beat.synkopa"), free), dir.join("Beat_2.synkopa"));
+        assert_eq!(next_version_path(&dir.join("Beat_2.synkopa"), free), dir.join("Beat_3.synkopa"));
+        assert_eq!(next_version_path(&dir.join("Beat_19.wave"), free), dir.join("Beat_20.wave"));
+        // not a version number: a word, a bare number, a leading underscore
+        assert_eq!(next_version_path(&dir.join("Beat_final.synkopa"), free), dir.join("Beat_final_2.synkopa"));
+        assert_eq!(next_version_path(&dir.join("808.synkopa"), free), dir.join("808_2.synkopa"));
+        assert_eq!(next_version_path(&dir.join("_7.synkopa"), free), dir.join("_7_2.synkopa"));
+        // names in use are skipped
+        let used: Vec<PathBuf> = vec![dir.join("Beat_2.synkopa"), dir.join("Beat_3.synkopa")];
+        assert_eq!(next_version_path(&dir.join("Beat.synkopa"), |p| used.iter().any(|u| u == p)), dir.join("Beat_4.synkopa"));
+        assert_eq!(next_version_path(&dir.join("Beat_2.synkopa"), |p| used.iter().any(|u| u == p)), dir.join("Beat_4.synkopa"));
+    }
+
     fn tmp(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("wave-stems-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -1503,7 +1885,7 @@ mod tests {
     }
 
     fn bounce(to: f64) -> Bounce {
-        Bounce { from: 0.0, to, tail: 0.0, rate: 48_000, wrap: false }
+        Bounce { from: 0.0, to, tail: 0.0, rate: 48_000, wrap: false, pattern: None }
     }
 
     #[test]
@@ -1727,3 +2109,7 @@ mod tests {
         assert!(parse_steps("", 1.0).unwrap().is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "autovocal_actions_tests.rs"]
+mod autovocal_tests;

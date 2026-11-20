@@ -16,6 +16,13 @@
 //! view and then destroys the window itself) and frame changes into
 //! [`WindowEvent::Resized`].
 //!
+//! # Title bar
+//!
+//! The editor keeps the native title bar (traffic lights, drag to move) instead of the
+//! software header the Win32 and X11 backends draw: the plugin embeds straight into the
+//! content view, and the title reads "name — subtitle". Pinning raises the window to the
+//! floating level.
+//!
 //! # Units
 //!
 //! Sizes are in **points**, which is what macOS VST3 editors work in; the
@@ -35,12 +42,14 @@ use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{NSBackingStoreType, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask};
+use objc2_app_kit::{
+    NSBackingStoreType, NSFloatingWindowLevel, NSNormalWindowLevel, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+};
 use objc2_foundation::{
     NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer,
 };
 
-use crate::service::{WindowError, WindowEvent, WindowId, WindowOptions, WindowSize, WindowState, MIN_WINDOW_SIZE, PUMP_INTERVAL_MS};
+use crate::service::{WindowError, WindowEvent, WindowId, WindowOptions, WindowSize, WindowState, PUMP_INTERVAL_MS};
 
 /// The "dpi" every macOS window reports: sizes are already in points.
 const REFERENCE_DPI: u32 = 96;
@@ -83,6 +92,15 @@ fn to_size(size: NSSize) -> WindowSize {
 
 fn to_ns_size(size: WindowSize) -> NSSize {
     NSSize::new(f64::from(size.width), f64::from(size.height))
+}
+
+/// The native title: the name, then the subtitle when there is one.
+fn title_for(title: &str, subtitle: &str) -> String {
+    if subtitle.is_empty() {
+        title.to_owned()
+    } else {
+        format!("{title} — {subtitle}")
+    }
 }
 
 fn style_for(resizable: bool) -> NSWindowStyleMask {
@@ -148,6 +166,9 @@ pub(crate) fn create_window(
     size: WindowSize,
     events: Sender<WindowEvent>,
     ticks: Arc<AtomicU64>,
+    // The app window: Win32 owns the editor by it. AppKit stacks a normal window fine
+    // without it, and the app does not hand one over on macOS.
+    _owner: isize,
 ) -> Result<isize, WindowError> {
     // `Service` already checked the thread; this is the AppKit-level proof.
     let mtm = MainThreadMarker::new().ok_or_else(|| WindowError::Native("plugin windows must be created on the main thread".into()))?;
@@ -165,11 +186,12 @@ pub(crate) fn create_window(
     // SAFETY: the window is owned through `Retained`; AppKit must not also
     // release it when it closes.
     unsafe { window.setReleasedWhenClosed(false) };
-    let state = Rc::new(WindowState { events, ticks, min_size: MIN_WINDOW_SIZE, tick: RefCell::new(None) });
-    window.setTitle(&NSString::from_str(&options.title));
+    let state = Rc::new(WindowState::new(options, events, ticks));
+    window.setTitle(&NSString::from_str(&title_for(&options.title, &options.subtitle)));
     window.setContentMinSize(to_ns_size(state.min_size));
     let view = window.contentView().ok_or_else(|| WindowError::Native("the new window has no content view".into()))?;
     let handle = Retained::as_ptr(&view) as isize;
+    state.embed.set(handle);
 
     let delegate = WindowDelegate::new(mtm, handle);
     window.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
@@ -203,6 +225,19 @@ pub(crate) fn destroy_window(handle: isize) {
     drop(entry.delegate);
 }
 
+/// The view the plugin embeds into: the content view itself (there is no header to keep clear).
+pub(crate) fn embed_handle(handle: isize) -> isize {
+    state_of(handle).map_or(0, |state| state.embed.get())
+}
+
+pub(crate) fn set_always_on_top(handle: isize, pinned: bool) {
+    let (Some(state), Some((window, _))) = (state_of(handle), window_of(handle)) else {
+        return;
+    };
+    state.set_pinned_state(pinned);
+    window.setLevel(if pinned { NSFloatingWindowLevel } else { NSNormalWindowLevel });
+}
+
 pub(crate) fn show_window(handle: isize) {
     if let Some((window, _)) = window_of(handle) {
         window.makeKeyAndOrderFront(None);
@@ -231,6 +266,12 @@ pub(crate) fn has_child_window(handle: isize) -> Result<bool, WindowError> {
     Ok(view.subviews().count() > 0)
 }
 
+/// The frame of the view the plugin added (`None` before it added one).
+pub(crate) fn embedded_size(handle: isize) -> Result<Option<WindowSize>, WindowError> {
+    let (_, view) = window_of(handle).ok_or_else(|| WindowError::Native("the window is gone".into()))?;
+    Ok(view.subviews().firstObject().map(|child| to_size(child.frame().size)))
+}
+
 pub(crate) fn client_size(id: WindowId, handle: isize) -> Result<WindowSize, WindowError> {
     let (_, view) = window_of(handle).ok_or(WindowError::Closed(id))?;
     Ok(to_size(view.frame().size))
@@ -251,6 +292,12 @@ mod tests {
         assert!(style_for(true).contains(NSWindowStyleMask::Resizable));
         assert!(!style_for(false).contains(NSWindowStyleMask::Resizable));
         assert!(style_for(false).contains(NSWindowStyleMask::Closable));
+    }
+
+    #[test]
+    fn the_title_carries_the_subtitle_when_there_is_one() {
+        assert_eq!(title_for("Delay", ""), "Delay");
+        assert_eq!(title_for("Delay", "Insert 3"), "Delay — Insert 3");
     }
 
     #[test]

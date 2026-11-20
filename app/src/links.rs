@@ -1,4 +1,4 @@
-//! Links WAVE opens in the system browser. Every URL is built here from a fixed host and a
+//! Links Synkopa opens in the system browser. Every URL is built here from a fixed host and a
 //! checked argument, so the UI can never make the app open an arbitrary address.
 
 /// Where "Ask AI" sends a question.
@@ -12,13 +12,15 @@ pub enum AskService {
     Deepwiki,
 }
 
-/// The longest link WAVE hands to the browser. ChatGPT drops prompts past a short limit
+/// The longest link Synkopa hands to the browser. ChatGPT drops prompts past a short limit
 /// (undocumented), so a longer question goes through the clipboard instead.
 pub const MAX_ASK_URL: usize = 2000;
 
 const CHATGPT_URL: &str = "https://chatgpt.com/?q=";
 const CHATGPT_HOME: &str = "https://chatgpt.com/";
-const DEEPWIKI_URL: &str = "https://deepwiki.com/miskibin/wave-DAW";
+const DEEPWIKI_URL: &str = "https://deepwiki.com/miskibin/synkopa";
+/// The Synkopa community server (Help ▸ Join the Discord). `ui/src/lib/askLink.ts` has the same link.
+pub const DISCORD_URL: &str = "https://discord.gg/zHMjE3fCY";
 
 /// Percent-encodes everything but RFC 3986 unreserved characters (UTF-8 bytes, upper-case hex).
 /// `ui/src/lib/askLink.ts` encodes the same way, so both sides agree on a link's length.

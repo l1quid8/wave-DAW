@@ -1,7 +1,7 @@
 // Pure helpers of the mixer: strip labels, FL-style channel routing (Ctrl+L / Shift+Ctrl+L),
 // the Channel Rack's multi-selection and the Mix view's snapshot of the arrange layout.
 // Tested in mixer.test.ts.
-import type { Id } from '../api/types';
+import { VOL_UNITY, type Id, type Insert, type Op, type Project } from '../api/types';
 import type { UiState } from '../state/ui';
 
 /** A name the app gave an insert ("Insert 7"): the strip shows only its number then. */
@@ -60,11 +60,12 @@ export function toggleSelect(cur: readonly Id[], anchor: Id | null, id: Id): Id[
 }
 
 /** The parts of the layout the Mix view hides and must give back exactly as they were. */
-const ARRANGE_KEYS = ['rackWin', 'rollWin', 'rackDock', 'rollDock', 'rackDockW', 'rollDockH', 'rollMax', 'rackFloat', 'rollFloat',
-  'plugsHidden', 'mixH', 'mixMin', 'pickOpen', 'pickW'] as const;
+const ARRANGE_KEYS = ['rackWin', 'rollWin', 'dock', 'paneSize', 'dockHome', 'rollMax', 'rackFloat', 'rollFloat',
+  'plugsHidden', 'mixMin', 'pickOpen', 'pickW'] as const;
 export type Arrange = Pick<UiState, (typeof ARRANGE_KEYS)[number]>;
 
-const copy = <T>(v: T): T => (v && typeof v === 'object' ? { ...v } : v);
+/** A deep copy (the dock layout nests strips in edges). */
+const copy = <T>(v: T): T => (v && typeof v === 'object' ? (JSON.parse(JSON.stringify(v)) as T) : v);
 /** A detached copy of the arrange layout (window places are copied, not shared with the store). */
 export function takeArrange(u: Arrange): Arrange {
   const a = {} as Record<string, unknown>;
@@ -74,4 +75,36 @@ export function takeArrange(u: Arrange): Arrange {
 /** The patch that puts a taken layout back (fresh copies, so the snapshot stays reusable). */
 export function restoreArrange(a: Arrange): Partial<UiState> {
   return takeArrange(a);
+}
+
+/**
+ * The insert FL's "route to a free mixer track" picks: the first one (in mixer order, never the
+ * Master) that nothing plays into (no channel, playlist track, audio clip or send routed to it),
+ * that no automation moves, and that is still as a new insert is: no effects, no sends of its own,
+ * its default name, the fader at unity and centred, not muted, soloed or narrowed, into the Master.
+ * A muted, renamed or prepared insert is the user's, not free. Null when every insert is in use.
+ */
+export function freeInsert(p: Project): Insert | null {
+  const used = new Set<Id>();
+  for (const c of p.channels ?? []) if (c.insert != null) used.add(c.insert);
+  for (const t of p.tracks) used.add(t.insert);
+  for (const c of p.clips) if (c.insert != null) used.add(c.insert);
+  for (const m of p.inserts) for (const s of m.sends ?? []) used.add(s.to);
+  for (const a of p.automations ?? []) if (a.target.kind === 'insertVol' || a.target.kind === 'insertPan') used.add(a.target.id);
+  const pristine = (m: Insert) => !m.fx.length && !m.sends?.length && (!m.name.trim() || isDefaultInsertName(m.name))
+    && Math.abs(m.vol - VOL_UNITY) < 1e-4 && m.pan === 0 && !m.muted && !m.solo && (m.width ?? 1) === 1 && m.master !== false;
+  return p.inserts.find(m => m.id !== 0 && !used.has(m.id) && pristine(m)) ?? null;
+}
+
+/**
+ * Give `name` (a channel or a sample) a mixer insert of its own: the first free one, else a new one
+ * after the last, named and coloured after it (FL). `route` makes the ops that send it there.
+ * Returns the insert and every op, to commit as one undo step.
+ */
+export function routeToFreeInsert(p: Project, name: string, color: string, newId: () => Id, route: (id: Id) => Op[]): { insert: Insert; ops: Op[]; created: boolean } {
+  const free = freeInsert(p);
+  const insert: Insert = free
+    ? { ...free, name, color }
+    : { id: newId(), name, color, vol: VOL_UNITY, pan: 0, muted: false, solo: false, fx: [] };
+  return { insert, ops: [{ op: 'putInsert', insert }, ...route(insert.id)], created: !free };
 }

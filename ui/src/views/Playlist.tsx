@@ -2,39 +2,49 @@ import { prefs } from '../state/prefs';
 import { t as tl } from '../lib/i18n';
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from 'solid-js';
 import { unwrap } from 'solid-js/store';
-import { InstIcon, trackIcon } from '../ui/instIcons';
+import { InstIcon, laneAutoIcons, trackIcon } from '../ui/instIcons';
 import { STRETCH_MAX, STRETCH_MIN, VOL_UNITY, type Automation, type AutoPoint, type Channel, type Clip, type Comp, type CurveShape, type Id, type Op, type Take, type Track } from '../api/types';
 import { boundaries, boundaryXfade, moveBoundary, setBoundaryXfade, takeEnd, toComp, toTimeline, unusedTakes, usedBeats, writeRange } from '../lib/comp';
 import * as CA from '../state/comp';
 import { compById, LANE_H, takeRow, type TakeRow } from '../state/comp';
-import { clampMove, moveClips, resizeClip, resizeClips, stretchClip, stretchClips, TOTAL } from '../lib/clipOps';
+import { clampMove, moveClips, newTrack, paintCells, placeClipCopy, resizeClip, resizeClips, sliceAcross, stackPatternClips, stretchClip, stretchClips, sharedSound, TOTAL } from '../lib/clipOps';
 import { clamp, fmtPos, volText } from '../lib/format';
 import { snapFloor, snapRes, snapRound } from '../lib/snap';
 import * as A from '../state/actions';
+import { MuteSolo } from '../ui/MuteSolo';
 import { commit, Gesture, wheelEdit } from '../state/edit';
 import { peaksVersion } from '../state/peaks';
 import { allocId, anyTrackSolo, arrVersion, clipSrcLen, onArrangementChange, plain, S, srcLenBeats, srcOf } from '../state/store';
 import { curBeat, recState, tele } from '../state/telemetry';
-import { closeMenu, openMenu, openRename, say, setU, U, type MenuItem } from '../state/ui';
-import { dblCheck, dragCursor, edgeScroller, panDrag, track } from '../ui/drag';
+import { recTarget, recUntil } from '../lib/recTarget';
+import { closeMenu, openMenu, openRename, revealReq, say, setU, U, type MenuItem } from '../state/ui';
+import { showInsert } from '../state/mixView';
+import { openStems } from '../state/stems';
+import { dblCheck, dragCursor, edgeScroller, fineMul, panDrag, track } from '../ui/drag';
 import { fitSpan, zoomScroll, zoomToRange } from '../lib/viewNav';
 import { barsText } from '../lib/pattern';
-import { addFrameTask, fitCanvas, fonts } from '../ui/frameLoop';
+import { addFrameTask, fitCanvas, fonts, shiftCanvas } from '../ui/frameLoop';
 import { drawFades, drawGrid, drawOverlaps, type View } from './playlistDraw';
 import { drawRuler, rulerCursor, rulerDown as rulerPress, RULER_H, type RulerHost } from '../ui/timeRuler';
 import { ZoomScrollbar } from '../ui/ZoomScrollbar';
+import { PlaylistTools } from './PlaylistTools';
 import type { ZRange } from '../lib/zoomBar';
 import { laneOverlaps } from '../lib/overlaps';
 import { damageRects, followScroll, planTile, snapPx, type Rect, type Tile } from './playlistTile';
 import { autoDisplay, isAutomated, paramMenu } from '../state/automation';
 import { autoValueText, parseAutoValue, cyclesOf, stairsOf } from '../lib/automation';
-import { addPoint, deletePoints, dragTension, hitEnv, movePoints, pointsInBox, setShape, type EnvHit } from '../lib/envEdit';
+import { addPoint, deletePoints, dragTension, hitEnv, insetGeom, movePoints, pointsInBox, setShape, type EnvHit } from '../lib/envEdit';
 import { autoById } from '../state/store';
-import { openPattern } from '../state/pattern';
+import { addSampler, openPattern } from '../state/pattern';
 import { rgba, T, theme } from '../ui/theme';
 
 
 /** Shared geometry, so the browser and OS drops can find a beat/track under the pointer. */
+// The clip canvases are NOT `desynchronized` (Chromium's low-latency canvas): that hint is only
+// valid with no DOM element above the canvas, but the fade overlay, the playhead and the marquee
+// sit on top, and Chromium then kept stale pixels after scrolls (a clip or a ghost stayed on
+// screen until something repainted it).
+
 export const geom = { grid: null as HTMLDivElement | null, scroll: null as HTMLDivElement | null, tops: [0] as number[] };
 
 function trackAtY(y: number): number {
@@ -71,9 +81,23 @@ export function dropClipAt(clientX: number, clientY: number, kind: Clip['kind'],
   const p = gridPoint(clientX, clientY);
   if (!p.inside || p.track < 0) return false;
   const len = srcLenBeats(kind, ref), start = clamp(snapFloor(p.beat, unit(alt)), 0, TOTAL - Math.min(len, TOTAL));
-  const nc: Clip = { id: allocId(), track: p.track, start, len: Math.min(len, TOTAL - start), offset: 0, kind, ref, muted: false, gain: 0, fadeIn: 0, fadeOut: 0, pan: 0, norm: false, rev: false };
+  const nc: Clip = { id: allocId(), track: p.track, start, len: Math.min(len, TOTAL - start), offset: 0, kind, ref, muted: false, gain: 0, fadeIn: 0, fadeOut: 0, pan: 0, norm: false, rev: false, ...(kind === 'audio' ? sharedSound(S.project.clips, ref) : {}) };
   commit([{ op: 'putClips', clips: [nc] }], tl('a.pl.insertClip'));
   setU('sel', [nc.id]);
+  return true;
+}
+
+/** Several patterns dropped at a client point: one per track from the one under the pointer (tracks added as needed), one undo step. */
+export function dropPatternsAt(clientX: number, clientY: number, refs: readonly Id[], alt: boolean): boolean {
+  const p = gridPoint(clientX, clientY);
+  if (!p.inside || p.track < 0 || !refs.length) return false;
+  const longest = Math.max(...refs.map(r => srcLenBeats('pat', r)));
+  const start = clamp(snapFloor(p.beat, unit(alt)), 0, TOTAL - Math.min(longest, TOTAL));
+  const n = S.project.tracks.length;
+  const r = stackPatternClips(refs, p.track, start, n, TOTAL, ref => srcLenBeats('pat', ref), allocId);
+  const ops: Op[] = Array.from({ length: r.newTracks }, (_, i) => ({ op: 'putTrack', track: newTrack(allocId(), n + i) }) as Op);
+  commit([...ops, { op: 'putClips', clips: r.clips }], tl('a.pl.insertClips', { n: refs.length }));
+  setU('sel', r.clips.map(c => c.id));
   return true;
 }
 
@@ -85,11 +109,21 @@ function sameDrawnTrack(a: Track | undefined, b: Track): boolean {
 function sameDrawnChannel(a: Channel | undefined, b: Channel): boolean {
   return !!a && a.name === b.name && a.kind === b.kind && a.root === b.root;
 }
+/** True when the Channel Rack already has a sampler channel playing this source. */
+function hasSamplerOf(ref: Id): boolean {
+  return !!S.project.channels?.some(ch => ch.kind === 'sample' && ch.source === ref);
+}
 
 /** `cb`: a comp region boundary (`bnd` = its index in `boundaries(comp.regions)`). */
 interface Hit { c: Clip; edge: 'l' | 'r' | 'fi' | 'fo' | 'cb' | 'menu' | null; bnd?: number }
+/** Trim zone of a clip's edge (px): this far inside the clip, and this far outside it. Together
+ *  14 px, about what REAPER / Ableton give an edge; 6 px inside alone was hard to hit. */
+const EDGE_IN = 8, EDGE_OUT = 6;
 /** A take lane under a track. `cb` = comp beat under the pointer. */
 interface LaneHit extends TakeRow { ti: number; k: number; take: Take; cb: number }
+
+/** The shortest and tallest a lane gets (Alt+wheel, the vertical zoom scrollbar). */
+const LANE_H_MIN = 28, LANE_H_MAX = 220;
 
 export function Playlist() {
   let scrollEl!: HTMLDivElement, gridEl!: HTMLDivElement, gridCv!: HTMLCanvasElement, fadeCv!: HTMLCanvasElement, rulerCv!: HTMLCanvasElement;
@@ -105,14 +139,57 @@ export function Playlist() {
     t.push(y); return t;
   });
   const [bndHover, setBndHover] = createSignal<{ clipId: Id; i: number } | null>(null);
+  // dragging a lane header: past a few px it lifts; the line shows the gap it lands in, the view
+  // scrolls at its top and bottom edge, Esc puts it back
+  laneDragStart = (e, from) => {
+    const col = (e.currentTarget as HTMLElement).closest<HTMLElement>('.lanesCol');
+    if (!col) return;
+    const y0 = e.clientY;
+    let lifted = false, cancelled = false, to = from;
+    const run = (ev: PointerEvent) => {
+      if (cancelled) return;
+      if (!lifted) { if (Math.abs(ev.clientY - y0) < 5) return; lifted = true; dragCursor('grabbing'); }
+      const y = ev.clientY - col.getBoundingClientRect().top, ts = tops(), n = S.project.tracks.length;
+      // the gap nearest the pointer: 0 = above the first lane, n = below the last
+      let gap = 0;
+      for (let k = 1; k <= n; k++) if (Math.abs(ts[k] - y) < Math.abs(ts[gap] - y)) gap = k;
+      to = gap > from ? gap - 1 : gap;
+      setLaneDrag({ from, to, y: ts[gap] });
+      say(to === from ? tl('a.pl.dragTrackSame') : tl('a.pl.dragTrackTo', { name: S.project.tracks[from].name, n: to + 1 }));
+    };
+    const es = edgeScroller(() => scrollEl.getBoundingClientRect(), (_dx, dy) => { const b = scrollEl.scrollTop; scrollEl.scrollTop += dy; return scrollEl.scrollTop !== b; }, run, { y: true });
+    const esc = (ev: KeyboardEvent) => {
+      if (ev.key !== 'Escape' || !lifted) return;
+      ev.preventDefault(); ev.stopPropagation(); cancelled = true; setLaneDrag(null); es.stop(); dragCursor(null); say(tl('a.pl.dragTrackCancel'));
+    };
+    window.addEventListener('keydown', esc, true);
+    track(ev => { run(ev); if (lifted) es.move(ev); }, () => {
+      window.removeEventListener('keydown', esc, true);
+      es.stop();
+      if (lifted) dragCursor(null);
+      setLaneDrag(null);
+      if (lifted && !cancelled && to !== from) A.moveTrackTo(from, to);
+    });
+  };
+  onCleanup(() => { laneDragStart = null; });
   createEffect(() => { geom.tops = tops(); });
   // recording starts: make sure the armed track is on screen (a tall mixer can hide it)
   createEffect(on(() => S.transport.rec && U.playing, rec => {
     if (!rec || !scrollEl) return;
-    const i = S.project.tracks.findIndex(t => t.arm); if (i < 0) return;
+    const r = recTarget(S.project, U.start, recUntil(S.project)), i = r === 'new' ? S.project.tracks.length - 1 : r; if (i < 0) return;
     const y0 = tops()[i], y1 = y0 + S.project.tracks[i].h, top = scrollEl.scrollTop, vis = scrollEl.clientHeight - 30;
     if (y0 < top || y1 > top + vis) scrollEl.scrollTop = Math.max(0, y0 - 10);
   }, { defer: true }));
+  // something made off screen (an automation clip): scroll its track, and its start, into view
+  // (next frame: a new bottom track has to be laid out before the view can scroll to it)
+  createEffect(on(revealReq, r => requestAnimationFrame(() => {
+    if (!r || !scrollEl || !S.project.tracks[r.track]) return;
+    const y0 = tops()[r.track], y1 = y0 + S.project.tracks[r.track].h, top = scrollEl.scrollTop, vis = scrollEl.clientHeight - 30;
+    if (y0 < top || y1 > top + vis) scrollEl.scrollTop = Math.max(0, y1 - vis + 10);
+    const x = r.beat * U.bw, left = scrollEl.scrollLeft, w = scrollEl.clientWidth - U.headW;
+    if (x < left || x > left + w - 40) scrollEl.scrollLeft = Math.max(0, x - 40);
+    syncScroll();
+  }), { defer: true }));
   const gridW = () => TOTAL * U.bw;
   const gridH = () => tops()[tops().length - 1];
   const cw = () => Math.max(1, Math.min(vw() - U.headW, gridW()));
@@ -137,6 +214,24 @@ export function Playlist() {
    * big song). Where a full paint fits in a frame nothing changes: every step is painted sharp.
    */
   let zoomed = false, stretched = false, tileBw = 0, zoomAt = 0;
+  /**
+   * A zoom waiting for the next frame: zoom and scroll are applied together right before that
+   * frame paints. Applied in the input handler, the webview could show a frame between the two
+   * (WebKitGTK does not align wheel events with frames): the new scroll over the canvases still
+   * painted at the old zoom, so the view jumped sideways and back on every wheel step (#160).
+   * Several wheel steps in one frame add up here.
+   */
+  let pendingView: { bw: number; x: number; y: number } | null = null;
+  /** The view as it will be on the next frame (a queued zoom included). */
+  const viewNow = () => pendingView ?? { bw: U.bw, x: scrollEl.scrollLeft, y: scrollEl.scrollTop };
+  const queueView = (bw: number, x: number, y: number) => { pendingView = { bw, x: Math.max(0, x), y: Math.max(0, y) }; };
+  const applyView = () => {
+    const v = pendingView; if (!v) return;
+    pendingView = null;
+    if (v.bw !== U.bw) setU('bw', v.bw);
+    scrollEl.scrollLeft = v.x; scrollEl.scrollTop = v.y;
+    setScroll({ x: scrollEl.scrollLeft, y: scrollEl.scrollTop });
+  };
   /** Frame intervals after the last full paints (ms): their median says whether a full paint fits in a frame. */
   const paintGaps: number[] = [];
   let lastDrawAt = 0, paintedFull = false;
@@ -144,12 +239,17 @@ export function Playlist() {
   const ZOOM_SETTLE_MS = 90;
   /** Bumped when the clip lookups of `drawGrid` (patterns, sources, …) may be stale: not for a clip-only edit. */
   let lookVer = 0;
+  /** The icon a lane header shows when its track has none and its name says nothing: its clips' (one pass per arrangement edit). */
+  const laneIcons = createMemo(() => { arrVersion(); return laneAutoIcons(unwrap(S.project)); }, [] as (string | null)[],
+    { equals: (a, b) => a.length === b.length && a.every((x, i) => x === b[i]) });
   /** The automation clip under the pointer, and the point / tension handle there. */
   const [envHover, setEnvHover] = createSignal<{ clip: Id; hover: EnvHit | null } | null>(null);
   // what the grid canvas depends on (not mixer state), split so a zoom does not re-walk every clip.
   // The view's size is not here either: `planTile` asks for a full paint only when the tile's size changes.
   // Scrolling is not here: the canvases scroll with the content and redraw only strips (`draw`)
   createEffect(() => { U.snap; U.tool; S.transport.rec; S.project.bpm; peaksVersion(); dirtyGrid = true; });
+  // back from the Mix view: paint everything again (a webview may have dropped the hidden canvases' pixels)
+  createEffect(() => { if (!U.mixView) { dirtyGrid = dirtyFade = dirtyRuler = dirtyOv = true; tile = null; } });
   // a zoom step is handled in `draw`: a full paint, or the tile stretched until the zoom settles
   createEffect(on(() => U.bw, () => { zoomed = true; }, { defer: true }));
   // the loop range is shaded on the overlay: moving it repaints no clip
@@ -280,6 +380,7 @@ export function Playlist() {
   };
 
   const draw = (now: number) => {
+    applyView();
     if (U.mixView) return; // under the Mix view: nothing to paint (following catches up on the way back)
     if (paintedFull && lastDrawAt) { paintGaps.push(now - lastDrawAt); if (paintGaps.length > 5) paintGaps.shift(); }
     lastDrawAt = now; paintedFull = false;
@@ -334,11 +435,7 @@ export function Playlist() {
       else {
         if (moved) {
           // shift what is already drawn, then draw only the exposed strips
-          g.save();
-          g.setTransform(1, 0, 0, 1, 0, 0);
-          g.globalCompositeOperation = 'copy';
-          g.drawImage(gridCv, Math.round(plan.dx * dpr), Math.round(plan.dy * dpr));
-          g.restore();
+          shiftCanvas(gridCv, Math.round(plan.dx * dpr), Math.round(plan.dy * dpr));
           for (const r of plan.strips) paintGrid(g, v, t, r, dpr, rec);
         }
         for (const r of rects!) paintGrid(g, v, t, r, dpr, rec);
@@ -415,16 +512,15 @@ export function Playlist() {
   const onWheel = (e: WheelEvent) => {
     if (!e.ctrlKey && !e.metaKey && !e.altKey && (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY))) holdFollow();
     if (e.ctrlKey || e.metaKey) {
-      e.preventDefault();
+      e.preventDefault(); holdFollow();
       const r = scrollEl.getBoundingClientRect(), mx = e.clientX - r.left - U.headW;
-      const beat = (scrollEl.scrollLeft + mx) / U.bw;
-      const bw = clamp(U.bw * (e.deltaY < 0 ? 1.15 : 1 / 1.15), A.BW_MIN, A.BW_MAX);
-      setU('bw', bw);
-      scrollEl.scrollLeft = beat * bw - mx;
+      const v = viewNow(), beat = (v.x + mx) / v.bw;
+      const bw = clamp(v.bw * (e.deltaY < 0 ? 1.15 : 1 / 1.15), A.BW_MIN, A.BW_MAX);
+      queueView(bw, beat * bw - mx, v.y);
     } else if (e.altKey) {
       e.preventDefault();
       const d = e.deltaY < 0 ? 6 : -6;
-      wheelEdit('heights', tl('a.pl.trackHeights'), S.project.tracks.map(t => ({ op: 'putTrack', track: { ...plain(t), h: clamp(t.h + d, 28, 220) } }) as Op));
+      wheelEdit('heights', tl('a.pl.trackHeights'), S.project.tracks.map(t => ({ op: 'putTrack', track: { ...plain(t), h: clamp(t.h + d, LANE_H_MIN, LANE_H_MAX) } }) as Op));
     }
   };
 
@@ -441,6 +537,9 @@ export function Playlist() {
     scrollEl.scrollLeft = x0 + dx; scrollEl.scrollTop = y0 + dy;
     const moved = scrollEl.scrollLeft !== x0 || scrollEl.scrollTop !== y0;
     if (moved) syncScroll();
+    // a drag that carries the view along (edge auto-scroll) is the user moving it: follow pauses.
+    // A plain click or edit on the grid does not (FL keeps following).
+    if (scrollEl.scrollLeft !== x0) holdFollow();
     return moved;
   };
   /**
@@ -461,24 +560,23 @@ export function Playlist() {
   let lastPtr: { x: number; y: number } | null = null;
   /** Views to go back to with a plain Ctrl+right-click (saved before a range zoom, a preset or a fit). */
   const views: { bw: number; x: number; y: number }[] = [];
-  const pushView = () => { views.push({ bw: U.bw, x: scrollEl.scrollLeft, y: scrollEl.scrollTop }); if (views.length > 32) views.shift(); };
-  const setView = (bw: number, x: number, y = scrollEl.scrollTop) => {
-    setU('bw', clamp(bw, A.BW_MIN, A.BW_MAX));
-    scrollEl.scrollLeft = x; scrollEl.scrollTop = y;
-    syncScroll();
+  const pushView = () => { views.push(viewNow()); if (views.length > 32) views.shift(); };
+  const setView = (bw: number, x: number, y = viewNow().y) => {
+    holdFollow(); // every user zoom (pointer steps, presets, fit, zoom box) goes through here
+    queueView(clamp(bw, A.BW_MIN, A.BW_MAX), x, y);
   };
   const viewW = () => Math.max(1, scrollEl.clientWidth - U.headW);
   /** Zoom to `bw` around the pointer when it is over the clips, else around the middle of the view. */
   const zoomTo = (bw: number) => {
-    const nb = clamp(bw, A.BW_MIN, A.BW_MAX); if (nb === U.bw) return;
+    const v = viewNow(), nb = clamp(bw, A.BW_MIN, A.BW_MAX); if (nb === v.bw) return;
     const r = viewRect(), p = lastPtr;
     const anchor = p && p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom ? p.x - r.left : viewW() / 2;
-    setView(nb, zoomScroll(scrollEl.scrollLeft, anchor, U.bw, nb));
+    setView(nb, zoomScroll(v.x, anchor, v.bw, nb), v.y);
   };
-  const barsInView = () => barsText(Math.max(1, Math.round(viewW() / U.bw / 4)));
+  const barsInView = () => barsText(Math.max(1, Math.round(viewW() / viewNow().bw / 4)));
   zoomImpl = {
-    step: f => zoomTo(U.bw * f),
-    preset: i => { const bw = ZOOM_PRESETS[i]; if (bw == null) return; if (bw !== U.bw) { pushView(); zoomTo(bw); } say(tl('a.pl.zoomPreset', { n: i + 1, bars: barsInView() })); },
+    step: f => zoomTo(viewNow().bw * f),
+    preset: i => { const bw = ZOOM_PRESETS[i]; if (bw == null) return; if (bw !== viewNow().bw) { pushView(); zoomTo(bw); } say(tl('a.pl.zoomPreset', { n: i + 1, bars: barsInView() })); },
     fit: () => {
       const span = fitSpan(songEnd(), 4, FIT_MIN_BEATS);
       pushView();
@@ -526,7 +624,37 @@ export function Playlist() {
       const c = cs[i]; if (c.track !== ti) continue;
       const cx = c.start * bw, cwid = Math.max(3, c.len * bw - 1), cy = t[ti] + 1;
       if (x < cx || x > cx + cwid || y < cy || y > cy + tr.h - 2) continue;
-      let edge: Hit['edge'] = null;
+      return clipHit(c, x, y, cx, cwid, cy, spb);
+    }
+    return null;
+  }
+
+  /**
+   * Empty space just outside a clip's start or end (EDGE_OUT px): that edge, so a trim needs no
+   * pixel aim. Only a trim (and an automation point drawn there) uses it; a click, right-click or
+   * double-click there still lands on empty space.
+   */
+  function nearEdge(x: number, y: number): { c: Clip; edge: 'l' | 'r' } | null {
+    if (!editable()) return null;
+    const ti = trackAtY(y); if (ti < 0) return null;
+    const t = tops(), tr = S.project.tracks[ti], bw = U.bw, cy = t[ti] + 1;
+    if (y < cy || y > cy + tr.h - 2) return null;
+    let best: { c: Clip; edge: 'l' | 'r' } | null = null, bd = EDGE_OUT + 1;
+    for (const c of unwrap(S.project).clips) {
+      if (c.track !== ti) continue;
+      const cx = c.start * bw, cwid = Math.max(3, c.len * bw - 1);
+      const dl = cx - x, dr = x - (cx + cwid);
+      if (dl > 0 && dl < bd) { bd = dl; best = { c, edge: 'l' }; }
+      if (dr > 0 && dr < bd) { bd = dr; best = { c, edge: 'r' }; }
+    }
+    return best;
+  }
+
+  /** What a press inside clip `c` lands on: a fade or comp handle, a trim edge, its menu icon, or its body. */
+  function clipHit(c: Clip, x: number, y: number, cx: number, cwid: number, cy: number, spb: number): Hit {
+    const bw = U.bw;
+    let edge: Hit['edge'] = null;
+    {
       if ((c.kind === 'audio' || c.kind === 'comp') && editable() && cwid > 36 && y - cy >= 15 && y - cy <= 25) {
         const fi = cx + c.fadeIn / spb * bw, fo = cx + cwid - c.fadeOut / spb * bw;
         if (x >= fi - 1 && x <= fi + 8) edge = 'fi';
@@ -542,14 +670,14 @@ export function Playlist() {
           }
         }
       }
-      // narrow clips keep a body to grab: the trim zones shrink, and vanish on a sliver
-      const ez = cwid < 14 ? 0 : Math.min(6, cwid / 4);
+      // narrow clips keep a body to grab: the trim zones shrink, and vanish on a sliver (the
+      // zone outside the clip, EDGE_OUT, still trims it)
+      const ez = cwid < 14 ? 0 : Math.min(EDGE_IN, cwid / 4);
       if (!edge) edge = x - cx < ez ? 'l' : cx + cwid - x < ez ? 'r' : null;
       // the icon in the clip's top-left corner opens its menu (FL), with either button
       if (!edge && cwid >= 36 && x - cx < 20 && y - cy < 15) edge = 'menu';
-      return { c, edge };
     }
-    return null;
+    return { c, edge };
   }
 
   /** The take lane under a grid point, if any. */
@@ -562,7 +690,8 @@ export function Playlist() {
   }
   const hover = (e: PointerEvent) => {
     if (e.buttons) return;
-    const p = pt(e), L = laneHit(p.x, p.y), h = L ? null : hit(p.x, p.y);
+    const p = pt(e), L = laneHit(p.x, p.y), h0 = L ? null : hit(p.x, p.y);
+    const near = L || h0 ? null : nearEdge(p.x, p.y), h: Hit | null = h0 ?? near;
     if (L) { CA.compHover.clipId = L.clip.id; CA.compHover.cb = L.cb; }
     else if (h?.c.kind === 'comp') { CA.compHover.clipId = h.c.id; CA.compHover.cb = toComp(h.c, p.beat); }
     else CA.compHover.clipId = null;
@@ -590,11 +719,19 @@ export function Playlist() {
   // ---------- pointer interactions ----------
   const gridDown = (e: PointerEvent) => {
     if (e.button === 1) return; // the scroll view pans
-    holdFollow();
     const modK = e.ctrlKey || e.metaKey;
     if (e.button === 2 && modK) return zoomBoxDrag(e);
     const p = pt(e), h = hit(p.x, p.y), id = h?.c.id ?? null;
     if (h?.c.kind === 'auto' && editable() && (e.button === 0 || e.button === 2) && envDown(e, h.c, p.x, p.y)) return;
+    const near = h || modK || laneHit(p.x, p.y) ? null : nearEdge(p.x, p.y);
+    if (near && (e.button === 0 || e.button === 2)) {
+      // an automation point drawn on the clip's edge reaches past it: the point, not a trim
+      if (near.c.kind === 'auto' && envAt(near.c, p.x, p.y) && envDown(e, near.c, p.x, p.y)) return;
+      if (e.button === 0 && U.tool !== 'erase' && U.tool !== 'mute' && U.tool !== 'slice') {
+        e.preventDefault(); closeMenu();
+        return resizeDrag(e, near.c, near.edge);
+      }
+    }
     if (U.autoSel && (!h || h.c.id !== U.autoSel.clip)) setU('autoSel', null);
     const L = laneHit(p.x, p.y);
     if (L) {
@@ -608,14 +745,15 @@ export function Playlist() {
     if (e.button === 2) return rightDown(e, h, p);
     if (e.button !== 0) return;
     e.preventDefault(); closeMenu();
+    A.songHere();
     const tool = U.tool;
     if (tool === 'erase') return eraseDrag(id);
     if (tool === 'mute') return muteDrag(id);
-    if (tool === 'slice') { if (id) A.sliceAt(id, snapRound(p.beat, unit(e.altKey)), false); return; }
+    if (tool === 'slice') return sliceDrag(e, p, id);
     if (modK || (tool === 'select' && id == null)) return marqueeDrag(e, p, id);
     if (h) {
       const clip = h.c;
-      if (clip.kind !== 'comp') setU('cur', { kind: clip.kind, ref: clip.ref });
+      if (clip.kind !== 'comp') setU('cur', { kind: clip.kind, ref: clip.ref, clipId: clip.id });
       if (h.edge === 'menu') { if (!U.sel.includes(clip.id)) setU('sel', [clip.id]); return openClipMenu(e.clientX, e.clientY, clip, p); }
       if (h.edge === 'fi' || h.edge === 'fo') return fadeDrag(e, clip, h.edge);
       if (h.edge === 'cb') return boundaryDrag(e, clip, h.bnd!);
@@ -624,9 +762,14 @@ export function Playlist() {
     }
     if (p.track < 0) { setU('sel', []); return; }
     const cur = U.cur; if (!cur || !srcOf({ kind: cur.kind, ref: cur.ref } as Clip)) return;
-    const len = srcLenBeats(cur.kind, cur.ref);
+    // Picking an existing clip chooses that region, not just its underlying source.
+    // The ID is resolved at draw time, so trimming it after the first click is respected.
+    const template = cur.clipId == null ? null : S.project.clips.find(c => c.id === cur.clipId && c.kind === cur.kind && c.ref === cur.ref);
+    const len = template?.len ?? srcLenBeats(cur.kind, cur.ref);
     const start = clamp(snapFloor(p.beat, unit(e.altKey)), 0, TOTAL - Math.min(len, TOTAL));
-    const nc: Clip = { id: allocId(), track: p.track, start, len: Math.min(len, TOTAL - start), offset: 0, kind: cur.kind, ref: cur.ref, muted: false, gain: 0, fadeIn: 0, fadeOut: 0, pan: 0, norm: false, rev: false };
+    const nc: Clip = template
+      ? placeClipCopy(plain(template), allocId(), p.track, start)
+      : { id: allocId(), track: p.track, start, len: Math.min(len, TOTAL - start), offset: 0, kind: cur.kind, ref: cur.ref, muted: false, gain: 0, fadeIn: 0, fadeOut: 0, pan: 0, norm: false, rev: false, ...(cur.kind === 'audio' ? sharedSound(S.project.clips, cur.ref) : {}) };
     const g = new Gesture(tool === 'paint' ? tl('a.pl.paintClips') : tl('a.pl.insertClip'));
     g.update([{ op: 'putClips', clips: [nc] }]);
     setU('sel', [nc.id]);
@@ -659,7 +802,8 @@ export function Playlist() {
       moved = true;
       const o = orig.find(c => c.id === lead)!;
       const raw = (ev.clientX - gridLeft() - gx0) / U.bw;
-      const d0 = snapRound(o.start + raw, unit(ev.altKey)) - o.start;
+      // snap the distance moved, not the start: a clip placed off the grid keeps its offset (as FL Studio does)
+      const d0 = snapRound(raw, unit(ev.altKey));
       const dt0 = trackAtYClamped(ev.clientY - gridEl.getBoundingClientRect().top) - t0;
       const [d, dt] = clampMove(orig, d0, dt0, n);
       // most pointer moves land on the same snapped place: nothing to apply, send or repaint
@@ -680,7 +824,8 @@ export function Playlist() {
     const g = new Gesture(tl('a.pl.resizeClip'));
     const o = plain(clip), sx = e.clientX, gx0 = sx - gridLeft();
     const srcLenOf = (c: Clip) => (c.kind === 'audio' || c.kind === 'comp' ? clipSrcLen(c) : Infinity);
-    const minL = Math.max(1 / 16, snapRes(U.snap, U.bw) || 1 / 16);
+    // the shortest a trim leaves a clip: one grid unit; with Alt (off the grid) a 64th, whatever the zoom
+    const minOf = (alt: boolean) => (alt ? 1 / 16 : Math.max(1 / 16, snapRes(U.snap, U.bw) || 1 / 16));
     // the edge of a selected clip trims the whole selection by the same amount (FL / Ableton)
     const others = U.sel.includes(o.id) ? S.project.clips.filter(c => c.id !== o.id && U.sel.includes(c.id)).map(plain) : [];
     let last = [o, ...others].map(c => c.start + ':' + c.len).join('|'), moved = false;
@@ -688,6 +833,7 @@ export function Playlist() {
       if (!moved && Math.abs(ev.clientX - sx) < 3) return; // a click on an edge is not a trim
       moved = true;
       const raw = (ev.clientX - gridLeft() - gx0) / U.bw, edge0 = edge === 'r' ? o.start + o.len : o.start;
+      const minL = minOf(ev.altKey);
       const nc = resizeClip(o, edge, snapRound(edge0 + raw, unit(ev.altKey)), minL, srcLenOf(o));
       const delta = (edge === 'r' ? nc.start + nc.len : nc.start) - edge0;
       const all = [nc, ...resizeClips(others, edge, delta, minL, srcLenOf)];
@@ -704,7 +850,8 @@ export function Playlist() {
   function stretchDrag(e: PointerEvent, clip: Clip, edge: 'l' | 'r') {
     const g = new Gesture(tl('a.pl.stretchClip'));
     const o = plain(clip), sx = e.clientX, gx0 = sx - gridLeft();
-    const minL = Math.max(1 / 16, snapRes(U.snap, U.bw) || 1 / 16);
+    // the shortest a trim leaves a clip: one grid unit; with Alt (off the grid) a 64th, whatever the zoom
+    const minOf = (alt: boolean) => (alt ? 1 / 16 : Math.max(1 / 16, snapRes(U.snap, U.bw) || 1 / 16));
     const others = U.sel.includes(o.id) ? S.project.clips.filter(c => c.id !== o.id && c.kind === 'audio' && U.sel.includes(c.id)).map(plain) : [];
     let last = '', moved = false;
     trackEdge(ev => {
@@ -712,6 +859,7 @@ export function Playlist() {
       moved = true;
       const raw = (ev.clientX - gridLeft() - gx0) / U.bw, edge0 = edge === 'r' ? o.start + o.len : o.start;
       const target = snapRound(edge0 + raw, unit(ev.altKey));
+      const minL = minOf(ev.altKey);
       const nc = stretchClip(o, edge, target, minL);
       const all = [nc, ...stretchClips(others, edge, nc.len / o.len, minL)];
       const key = all.map(c => c.start + ':' + c.len).join('|');
@@ -742,14 +890,52 @@ export function Playlist() {
     }, () => g.end(), 'ew-resize');
   }
 
+  /** Paint (FL): a clip under the pointer wherever it goes — left or right, and onto other lanes. */
   function paintDrag(g: Gesture, first: Clip) {
-    let lastEnd = first.start + first.len;
-    const len = first.len;
+    const taken = new Set<string>([first.track + ':0']);
+    let lastBeat = first.start, lastTrack = first.track;
     trackEdge(ev => {
-      const b = pt(ev).beat, add: Clip[] = [];
-      while (b >= lastEnd && lastEnd + len <= TOTAL) { add.push({ ...first, id: allocId(), start: lastEnd }); lastEnd += len; }
+      const q = pt(ev), tr = q.track < 0 ? lastTrack : q.track, add: Clip[] = [];
+      // every cell along the line from the last pointer sample to this one (beat and lane both), so a
+      // fast sweep leaves no gaps and a diagonal one paints the lanes it crosses, not only the last
+      const steps = Math.max(1, Math.ceil(Math.abs(q.beat - lastBeat) / first.len), Math.abs(tr - lastTrack));
+      for (let k = 1; k <= steps; k++) {
+        const b = lastBeat + (q.beat - lastBeat) * k / steps, lane = Math.round(lastTrack + (tr - lastTrack) * k / steps);
+        for (const cell of paintCells(first, b, lane, S.project.tracks.length, TOTAL, taken)) {
+          taken.add(cell.key);
+          add.push({ ...first, id: allocId(), start: cell.start, track: cell.track });
+        }
+      }
+      lastBeat = q.beat; lastTrack = tr;
       if (add.length) { g.update([{ op: 'putClips', clips: add }]); setU('sel', [...U.sel, ...add.map(c => c.id)]); }
-    }, () => g.end(), 'copy', { x: true });
+    }, () => g.end(), 'copy');
+  }
+
+  /**
+   * Slice (FL): a click cuts the clip under the pointer; dragged down or up, the line cuts every
+   * clip it crosses on the lanes in between, as one undo step.
+   */
+  function sliceDrag(e: PointerEvent, p: { beat: number; track: number; x: number; y: number }, id: Id | null) {
+    const b = snapRound(p.beat, unit(e.altKey)), x = b * U.bw, t0 = p.track;
+    let t1 = t0, dragged = false;
+    trackEdge(ev => {
+      const q = pt(ev);
+      if (!dragged && Math.abs(ev.clientY - e.clientY) < 4) return;
+      dragged = true;
+      if (q.track >= 0) t1 = q.track;
+      setU('marquee', { x0: x, y0: p.y, x1: x, y1: q.y });
+      const n = sliceAcross(unwrap(S.project).clips, b, t0, t1, () => 0).length / 2;
+      say(tl('a.pl.sliceLine', { pos: fmtPos(b), n }));
+    }, ev => {
+      setU('marquee', null);
+      if (ev.type !== 'pointerup') return;
+      if (!dragged) { if (id) A.sliceAt(id, b, false); return; }
+      if (t0 < 0) return;
+      const cut = sliceAcross(S.project.clips.map(plain), b, t0, t1, allocId);
+      if (!cut.length) return;
+      commit([{ op: 'putClips', clips: cut }], tl('a.pl.sliceClips'));
+      say(tl('a.pl.sliceLine', { pos: fmtPos(b), n: cut.length / 2 }));
+    }, 'col-resize', { y: true });
   }
 
   function eraseDrag(id: Id | null) {
@@ -824,7 +1010,8 @@ export function Playlist() {
       dragCursor(null);
       if (g) { g.end(); return; }
       if (h?.edge === 'cb') openBoundaryMenu(sx, sy, h.c, h.bnd!);
-      else openGridMenu(sx, sy, p);
+      // FL: a right-click on empty space only drops the selection, no menu
+      else if (!h && U.sel.length) setU('sel', []);
     });
   }
 
@@ -837,7 +1024,7 @@ export function Playlist() {
       if (a && p.y < envGeom(h.c).by) { setU('autoSel', { clip: h.c.id, idx: a.points.map((_, i) => i) }); say(tl('a.pl.ptsSelected', { n: a.points.length })); }
       return;
     }
-    setU('cur', { kind: h.c.kind, ref: h.c.ref });
+    setU('cur', { kind: h.c.kind, ref: h.c.ref, clipId: h.c.id });
     if (h.c.kind === 'audio') A.openEditor(h.c.id);
     if (h.c.kind === 'pat') openPattern(h.c.ref);
   };
@@ -847,11 +1034,13 @@ export function Playlist() {
     const t = tops(), tr = S.project.tracks[c.track], cy = t[c.track] + 1, by = cy + 15, bh = tr.h - 2 - 15, pad = 3;
     return { by, bh, X: (tt: number) => (c.start + tt - c.offset) * U.bw, Y: (v: number) => by + pad + (1 - v) * (bh - 2 * pad), T: (x: number) => x / U.bw - c.start + c.offset, V: (y: number) => clamp(1 - (y - by - pad) / (bh - 2 * pad), 0, 1) };
   };
+  /** `envGeom` with the points where they are drawn: one on the clip's edge just inside it. */
+  const pickGeom = (c: Clip) => insetGeom(envGeom(c), c.start * U.bw, c.start * U.bw + Math.max(3, c.len * U.bw - 1));
   const sameHit = (a: EnvHit | null, b: EnvHit | null) => a === b || (!!a && !!b && a.kind === b.kind && a.i === b.i);
   /** The point or handle of automation clip `c` under (x, y): none on its header or beyond its envelope. */
   const envAt = (c: Clip, x: number, y: number): EnvHit | null => {
     const a = autoById(c.ref); if (!a) return null;
-    const G = envGeom(c); if (y < G.by || G.bh < 14) return null;
+    const G = pickGeom(c); if (y < G.by || G.bh < 14) return null;
     return hitEnv(a.points, G, x, y);
   };
   const putEnv = (a: Automation, points: AutoPoint[]): Op => ({ op: 'putAutomation', automation: { ...plain(a), points } });
@@ -875,7 +1064,7 @@ export function Playlist() {
     const G = envGeom(c);
     if (y < G.by || G.bh < 14) return false;
     if (e.button === 0 && (U.tool === 'erase' || U.tool === 'mute' || U.tool === 'slice')) return false;
-    const pts = plain(a.points), hit = hitEnv(pts, G, x, y), modK = e.ctrlKey || e.metaKey;
+    const pts = plain(a.points), hit = hitEnv(pts, pickGeom(c), x, y), modK = e.ctrlKey || e.metaKey;
     e.preventDefault(); closeMenu();
     if (!U.sel.includes(c.id)) setU('sel', [c.id]);
     if (e.button === 2) {
@@ -1048,14 +1237,21 @@ export function Playlist() {
     if (!U.sel.includes(c.id)) setU('sel', [c.id]);
     if (c.kind === 'comp') return openCompMenu(x, y, c, p);
     const src = srcOf(c), isPat = c.kind === 'pat';
+    // Rename and the swatches change what the clip plays (the pattern, sample or automation): every
+    // clip of it follows. The menu says so, with how many clips that is (FL: "Rename / color pattern")
+    const copies = S.project.clips.filter(v => v.kind === c.kind && v.ref === c.ref).length;
+    const what = (k: 'pat' | 'audio' | 'auto') => tl(k === 'pat' ? 'a.pl.whatPat' : k === 'audio' ? 'a.pl.whatAudio' : 'a.pl.whatAuto');
+    const scopeLabel = (k: 'pat' | 'audio' | 'auto') => copies > 1 ? tl('a.pl.colourOfN', { what: what(k), n: copies }) : tl('a.pl.colourOf', { what: what(k) });
+    const scopeTip = (k: 'pat' | 'audio' | 'auto') => copies > 1 ? tl('a.pl.scopeTipN', { what: what(k), n: copies }) : tl('a.pl.scopeTip', { what: what(k) });
     if (c.kind === 'auto') {
       const a = autoById(c.ref);
       openMenu(x, y, [
         { t: 'title', label: tl('a.pl.autoPrefix') + (a?.name ?? '') },
-        { t: 'item', label: tl('a.pl.rename'), act: () => openRename(x, y, a?.name ?? '', v => A.setSrcProp(c, { name: v })) },
+        { t: 'item', label: tl('a.pl.renameAuto'), title: scopeTip('auto'), act: () => openRename(x, y, a?.name ?? '', v => A.setSrcProp(c, { name: v })) },
+        { t: 'sec', label: scopeLabel('auto') },
         { t: 'swatches', current: a?.color, pick: col => A.setSrcProp(c, { color: col }) },
         { t: 'sep' },
-        { t: 'item', label: c.muted ? tl('a.pl.unmute') : tl('a.pl.mute'), kbd: 'Ctrl+M', act: A.toggleMuteSel },
+        { t: 'item', label: c.muted ? tl('a.pl.unmute') : tl('a.pl.mute'), kbd: 'Alt+M', act: A.toggleMuteSel },
         { t: 'item', label: tl('a.pl.duplicate'), kbd: 'Ctrl+B', act: A.duplicate },
         { t: 'item', label: tl('a.pl.splitHere'), act: () => A.sliceAt(c.id, snapRound(p.beat, unit(false))) },
         { t: 'item', label: tl('a.pl.selAllAuto'), act: () => setU('sel', S.project.clips.filter(v => v.kind === 'auto' && v.ref === c.ref).map(v => v.id)) },
@@ -1068,10 +1264,11 @@ export function Playlist() {
     const all = () => setU('sel', S.project.clips.filter(v => v.kind === c.kind && v.ref === c.ref).map(v => v.id));
     const items: MenuItem[] = [
       { t: 'title', label: (isPat ? 'Pattern · ' : 'Audio · ') + (src?.name ?? '') },
-      { t: 'item', label: tl('a.pl.rename'), act: () => openRename(x, y, src?.name ?? '', v => A.setSrcProp(c, { name: v })) },
+      { t: 'item', label: tl(isPat ? 'a.pl.renamePat' : 'a.pl.renameAudio'), title: scopeTip(isPat ? 'pat' : 'audio'), act: () => openRename(x, y, src?.name ?? '', v => A.setSrcProp(c, { name: v })) },
+      { t: 'sec', label: scopeLabel(isPat ? 'pat' : 'audio') },
       { t: 'swatches', current: (src as { color?: string } | undefined)?.color, pick: col => A.setSrcProp(c, { color: col }) },
       { t: 'sec', label: tl('a.pl.secEdit') },
-      { t: 'item', label: c.muted ? tl('a.pl.unmute') : tl('a.pl.mute'), kbd: 'Ctrl+M', act: A.toggleMuteSel },
+      { t: 'item', label: c.muted ? tl('a.pl.unmute') : tl('a.pl.mute'), kbd: 'Alt+M', act: A.toggleMuteSel },
       { t: 'item', label: tl('a.pl.duplicate'), kbd: 'Ctrl+B', act: A.duplicate },
       { t: 'sub', label: tl('a.pl.clipboard'), items: [
         { t: 'item', label: tl('a.pl.copy'), kbd: 'Ctrl+C', act: A.copy },
@@ -1093,11 +1290,14 @@ export function Playlist() {
           { t: 'item', label: tl('a.pl.makeUnique'), title: tl('a.pl.makeUniqueAudioTip'), act: () => A.makeUnique(c) } as MenuItem,
           { t: 'item', label: tl('a.pl.editSample'), kbd: tl('a.pl.dblClick'), act: () => A.openEditor(c.id) } as MenuItem,
           { t: 'item', label: tl('a.pl.editPitch'), kbd: c.tune?.notes.length ? tl('a.pl.edited') : '', act: () => A.openPitchEditor(c.id) } as MenuItem,
+          // a playlist drop plays the source directly; this adds the rack entry for it (FL's audio clip channel)
+          { t: 'item', label: tl('a.pl.toSampler'), title: tl(hasSamplerOf(c.ref) ? 'a.pl.toSamplerHave' : 'a.pl.toSamplerTip'), disabled: hasSamplerOf(c.ref), act: () => addSampler(c.ref) } as MenuItem,
           // how a stretch plays (the clip's stretch factor in the label: set it in Stretch mode)
           { t: 'chips', label: tl('a.pl.stretchMethod', { k: (c.stretch ?? 1).toFixed(2) }), options: [tl('a.pl.keepPitch'), tl('a.pl.resample')], active: c.resample ? 1 : 0, pick: (i: number) => A.setStretchMethod(c, i === 1) } as MenuItem,
           ...(S.stretching[c.id] ? [{ t: 'item', label: tl('a.pl.stretchFailed'), title: S.stretching[c.id], disabled: true, act: () => {} } as MenuItem] : []),
           { t: 'item', label: tl('a.pl.detectTempoKey'), act: () => A.openMusicAnalysis({ clipId: c.id }) } as MenuItem,
           { t: 'item', label: tl('a.pl.trimRegion'), title: tl('d.smp.trim.tip'), act: () => void A.trimClip(c.id) } as MenuItem,
+          { t: 'item', label: tl('a.pl.extractStems'), title: tl('a.pl.extractStemsTip'), act: () => openStems(c.id) } as MenuItem,
           { t: 'sub', label: tl('a.pl.autoVocal'), items: [
             { t: 'item', label: tl('a.pl.autoVocalSing'), act: () => void A.autoVocal(c.id, 'natural'), title: tl('a.pl.autoVocalSingTip') },
             { t: 'item', label: tl('a.pl.autoVocalRap'), act: () => void A.autoVocal(c.id, 'hard'), title: tl('a.pl.autoVocalRapTip') },
@@ -1105,6 +1305,7 @@ export function Playlist() {
         ] : []),
       ]),
       { t: 'sec', label: tl('a.pl.secMix') },
+      { t: 'item', label: tl('a.pl.inPlace'), kbd: 'Ctrl+Alt+E', title: tl('a.pl.inPlaceTip'), act: () => void A.exportInPlace(c) },
       { t: 'item', label: tl('a.pl.mixerChannel'), act: () => openRouteMenu(c.track, x, y) },
       { t: 'item', label: tl('a.pl.selAllSource'), act: all },
       { t: 'sep' },
@@ -1123,7 +1324,7 @@ export function Playlist() {
       { t: 'item', label: tl('a.pl.rename'), act: () => openRename(x, y, comp.name, v => CA.renameComp(comp, v)) },
       { t: 'chips', label: 'Crossfade', options: XF.map(v => v * 1000 + ' ms'), active: XF.findIndex(v => Math.abs(v - comp.xfade) < 1e-6), pick: k => CA.setXfade(comp, XF[k]) },
       { t: 'sep' },
-      { t: 'item', label: c.muted ? tl('a.pl.unmute') : tl('a.pl.mute'), kbd: 'Ctrl+M', act: A.toggleMuteSel },
+      { t: 'item', label: c.muted ? tl('a.pl.unmute') : tl('a.pl.mute'), kbd: 'Alt+M', act: A.toggleMuteSel },
       { t: 'item', label: tl('a.pl.duplicate'), kbd: 'Ctrl+B', act: A.duplicate, title: tl('a.pl.dupCompTip') },
       { t: 'item', label: tl('a.pl.copy'), kbd: 'Ctrl+C', act: A.copy },
       { t: 'item', label: tl('a.pl.cut'), kbd: 'Ctrl+X', act: A.cut },
@@ -1140,17 +1341,6 @@ export function Playlist() {
       { t: 'sep' },
       { t: 'item', label: tl('a.pl.delete'), kbd: 'Del', danger: true, act: () => A.delIds(U.sel.includes(c.id) ? [...U.sel] : [c.id]) },
     ], 470);
-  }
-
-  function openGridMenu(x: number, y: number, p: { beat: number; track: number }) {
-    const at = { beat: snapFloor(p.beat, unit(false)), track: clamp(p.track, 0, S.project.tracks.length - 1) };
-    openMenu(x, y, [
-      { t: 'title', label: 'Playlist · ' + fmtPos(at.beat) },
-      { t: 'item', label: tl('a.pl.pasteHere'), kbd: 'Ctrl+V', act: () => A.paste(at), disabled: !A.hasClipboard() },
-      { t: 'item', label: tl('a.pl.setStartHere'), act: () => A.seek(at.beat) },
-      { t: 'item', label: tl('a.pl.selectAll'), kbd: 'Ctrl+A', act: A.selectAll },
-      { t: 'item', label: tl('a.pl.selectTrack'), act: () => setU('sel', S.project.clips.filter(c => c.track === at.track).map(c => c.id)) },
-    ], 180);
   }
 
   // ---------- ruler (ui/timeRuler: the same gestures in the Piano roll and the Pitch editor) ----------
@@ -1199,9 +1389,23 @@ export function Playlist() {
   const ovChange = (r: ZRange) => {
     holdFollow();
     const bw = clamp(cw() / r.len, A.BW_MIN, A.BW_MAX);
-    if (bw !== U.bw) setU('bw', bw);
-    scrollEl.scrollLeft = Math.max(0, r.pos * bw);
-    syncScroll();
+    queueView(bw, Math.max(0, r.pos * bw), viewNow().y);
+  };
+  // FL: the vertical scrollbar zooms the lanes too — drag it to scroll, drag an end to make every
+  // lane taller or shorter (they keep their proportions), Ctrl+wheel over it zooms. Its unit is the
+  // average lane, so a position stays put while the lanes change height. Heights are view state
+  // (no undo step), like Alt+wheel.
+  const laneAvg = () => { const t = S.project.tracks; return t.length ? t.reduce((a, x) => a + x.h, 0) / t.length : 56; };
+  const vRange = (): ZRange => { const a = laneAvg(); return { pos: scroll().y / a, len: ch() / a }; };
+  const vLimits = () => { const a = laneAvg(); return { total: Math.max(gridH() + 40, ch()) / a, minLen: ch() / LANE_H_MAX, maxLen: ch() / LANE_H_MIN }; };
+  const setV = (r: ZRange) => {
+    const a = laneAvg(), want = clamp(ch() / r.len, LANE_H_MIN, LANE_H_MAX);
+    if (S.project.tracks.length && Math.abs(want - a) > 0.25) {
+      const f = want / a;
+      wheelEdit('heights', tl('a.pl.trackHeights'), S.project.tracks.map(t => ({ op: 'putTrack', track: { ...plain(t), h: clamp(t.h * f, LANE_H_MIN, LANE_H_MAX) } }) as Op));
+    }
+    const place = () => { scrollEl.scrollTop = Math.max(0, r.pos * laneAvg()); syncScroll(); };
+    place(); requestAnimationFrame(place); // the taller lanes are laid out by the next frame
   };
   function paintOverview(g: CanvasRenderingContext2D, W: number, H: number, span: number) {
     const P = unwrap(S.project), n = Math.max(1, P.tracks.length);
@@ -1216,21 +1420,17 @@ export function Playlist() {
 
   return (
     <div class="plwrap" onPointerDown={() => A.playlistFront()}>
-      <div class="ovrow" style={{ 'padding-left': U.headW + 'px' }}>
+      <div class="ovrow tools">
+        <PlaylistTools />
         <ZoomScrollbar orient="h" class="ov" range={ovView} limits={ovLimits} onChange={ovChange} title={tl('a.pl.ovTip')}
           paint={paintOverview} paintKey={ovVer} />
       </div>
+      <div class="plbody">
       <div ref={scrollEl} class="plscroll" onPointerDown={panDown} onMouseDown={e => { if (e.button === 1) e.preventDefault(); }}
         onPointerMove={e => { lastPtr = { x: e.clientX, y: e.clientY }; }} onPointerLeave={() => { lastPtr = null; }}>
         <div style={{ width: U.headW + gridW() + 'px', position: 'relative' }}>
           <div class="rulerRow">
             <div class="plhead" style={{ width: U.headW + 'px' }}>
-              {/* what dragging a clip edge does (FL's stretch switch, Shift+M) */}
-              <div class="seg rsz" role="radiogroup" aria-label={tl('a.pl.resizeMode')}>
-                <button role="radio" aria-checked={!U.stretchMode} classList={{ on: !U.stretchMode }} title={tl('a.pl.modeTrimTip')} onClick={() => { if (U.stretchMode) A.toggleStretchMode(); }}>{tl('a.pl.modeTrim')}</button>
-                <button role="radio" aria-checked={U.stretchMode} classList={{ on: U.stretchMode }} title={tl('a.pl.modeStretchTip')} onClick={() => { if (!U.stretchMode) A.toggleStretchMode(); }}>{tl('a.pl.modeStretch')}</button>
-              </div>
-              <span class="mono" style={{ 'font-size': '10px', color: 'var(--fg5)', 'min-width': 0, overflow: 'hidden', 'white-space': 'nowrap', 'margin-left': '6px' }}>{S.project.tracks.length} tr</span>
             </div>
             <div style={{ position: 'relative', width: gridW() + 'px', height: '26px', flex: 'none' }}>
               <div class="phtile"><div ref={phRuler} class="phead" style={{ height: '26px' }} /></div>
@@ -1239,9 +1439,10 @@ export function Playlist() {
 
             </div>
           </div>
-          <div style={{ display: 'flex' }}>
+          <div style={{ display: 'flex', position: 'relative' }}>
+            <Show when={laneDrag()}>{d => <div class="laneDropLine" style={{ top: d().y - 1 + 'px', width: U.headW + gridW() + 'px' }} />}</Show>
             <div class="lanesCol" style={{ width: U.headW + 'px' }}>
-              <For each={S.project.tracks}>{(t, i) => <><LaneHeader t={t} i={i()} /><TakeHeaders i={i()} /></>}</For>
+              <For each={S.project.tracks}>{(t, i) => <><LaneHeader t={t} i={i()} auto={laneIcons()[i()] ?? null} /><TakeHeaders i={i()} /></>}</For>
               <button class="addTrack" onClick={A.addTrack}>{tl('a.pl.addTrack')}</button>
               <div class="hsplit" onPointerDown={headSplit} title={tl('a.pl.headSplitTip')} />
             </div>
@@ -1255,6 +1456,8 @@ export function Playlist() {
             </div>
           </div>
         </div>
+      </div>
+        <ZoomScrollbar orient="v" class="plv" range={vRange} limits={vLimits} onChange={setV} title={tl('a.pl.vbarTip')} />
       </div>
       <Show when={U.dragOver}>
         <div class="dropHint"><span>{tl('a.pl.dropHint')}</span></div>
@@ -1296,19 +1499,26 @@ function openLaneMenu(x: number, y: number, i: number) {
     ] : []),
     { t: 'item', label: tl('a.pl.heightDefault'), act: () => A.setTrack(i, { h: 56 }, tl('a.pl.height')) },
     { t: 'sep' },
+    { t: 'item', label: tl('a.pl.moveUp'), disabled: i === 0, act: () => A.moveTrack(i, -1) },
+    { t: 'item', label: tl('a.pl.moveDown'), disabled: i >= S.project.tracks.length - 1, act: () => A.moveTrack(i, 1) },
     { t: 'item', label: tl('a.pl.insertAbove'), act: () => A.insertTrack(i) },
     { t: 'item', label: tl('a.pl.insertBelow'), act: () => A.insertTrack(i + 1) },
     { t: 'item', label: tl('a.pl.deleteTrack'), danger: true, disabled: S.project.tracks.length < 2, act: () => A.removeTrack(t.id) },
   ], 400);
 }
 
-function LaneHeader(props: { t: Track; i: number }) {
+/** Set by the Playlist: a press on a lane header that may become a drag to reorder (FL / every DAW). */
+let laneDragStart: ((e: PointerEvent, from: number) => void) | null = null;
+const [laneDrag, setLaneDrag] = createSignal<{ from: number; to: number; y: number } | null>(null);
+
+function LaneHeader(props: { t: Track; i: number; auto: string | null }) {
   const t = () => props.t;
+  const icon = () => trackIcon(t()) ?? props.auto;
   const audible = () => !t().muted && (!anyTrackSolo() || t().solo);
   const routeIdx = () => S.project.inserts.findIndex(m => m.id === t().insert);
   const down = (e: PointerEvent) => {
     if (e.button === 2) { e.preventDefault(); return openLaneMenu(e.clientX, e.clientY, props.i); }
-    if (e.button === 0) A.selectInsert(t().insert);
+    if (e.button === 0) { A.selectInsert(t().insert); laneDragStart?.(e, props.i); }
   };
   const resize = (e: PointerEvent) => {
     if (e.button !== 0) return;
@@ -1327,24 +1537,43 @@ function LaneHeader(props: { t: Track; i: number }) {
     if (e.button === 2) { e.preventDefault(); e.stopPropagation(); paramMenu(e.clientX, e.clientY, volTarget(), () => A.setTrack(props.i, { vol: VOL_UNITY }, tl('a.pl.volume')), t().color); return; }
     if (e.button !== 0) return;
     e.preventDefault(); e.stopPropagation();
-    if (dblCheck('lvol' + props.i)) { A.setTrack(props.i, { vol: VOL_UNITY }, tl('a.pl.volume')); say(t().name + ' · 0.0 dB'); return; }
+    if (e.altKey || dblCheck('lvol' + props.i)) { A.setTrack(props.i, { vol: VOL_UNITY }, tl('a.pl.volume')); say(t().name + ' · 0.0 dB'); return; }
     const w = (e.currentTarget as HTMLElement).getBoundingClientRect().width;
     const g = new Gesture(tl('a.pl.trackVolume'));
     let v = t().vol, lx = e.clientX;
     track(ev => {
-      v = clamp(v + (ev.clientX - lx) / w * (ev.shiftKey ? 0.2 : 1), 0, 1); lx = ev.clientX;
+      v = clamp(v + (ev.clientX - lx) / w * fineMul(ev), 0, 1); lx = ev.clientX;
       g.update([{ op: 'putTrack', track: { ...plain(t()), vol: v } }]);
       say(t().name + ' · ' + volText(v));
     }, () => g.end(), 'ew-resize');
   };
   const stop = (e: Event) => e.stopPropagation();
+  // tracks play into the master unless the user sends one to a mixer channel (lane menu); only then is it shown.
+  // It sits beside the volume, so the name has the whole first row; a track too low for a second row keeps it up there.
+  // one click opens the route menu, a double-click shows that insert in the mixer instead (the menu
+  // waits for the second click: opened at once, it covered the button and swallowed the double-click)
+  let routeTimer = 0;
+  onCleanup(() => clearTimeout(routeTimer));
+  const routeClick = (e: MouseEvent) => {
+    if (routeTimer) { clearTimeout(routeTimer); routeTimer = 0; closeMenu(); showInsert(t().insert ?? 0); return; }
+    const x = e.clientX, y = e.clientY;
+    routeTimer = window.setTimeout(() => { routeTimer = 0; openRouteMenu(props.i, x, y); }, 250);
+  };
+  const route = () => (
+    <Show when={routeIdx() > 0}>
+              <button class="mini route" title={tl('a.pl.routeTip', { out: 'Insert ' + routeIdx() })} onPointerDown={stop} onClick={routeClick}>{'Ins ' + routeIdx()}</button>
+            </Show>
+  );
   return (
-    <div class="lane" classList={{ armrec: t().arm && S.transport.rec, dimmed: !audible() }} style={{ height: t().h + 'px' }} onPointerDown={down}>
+    <div class="lane" classList={{ armrec: t().arm && S.transport.rec, dimmed: !audible(), lifted: laneDrag()?.from === props.i }} style={{ height: t().h + 'px' }} onPointerDown={down}
+      title={tl('a.pl.dragTrackTip')}>
       <div class="stripe" style={{ background: t().color }} />
       <div class="body">
         <div class="row" style={{ gap: '6px', 'min-width': 0 }}>
-          <Show when={trackIcon(t())} fallback={<span class="num">{props.i + 1}</span>}>
-            <span class="laneicon" style={{ color: t().color }} title={tl('a.pl.trackTip', { n: props.i + 1 })}><InstIcon id={trackIcon(t())} size={13} /></span>
+          {/* FL: double-click on a track's icon shows the mixer insert it plays into */}
+          <Show when={icon()}>
+            <span class="laneicon" style={{ color: t().color }} title={tl('a.pl.trackTip', { n: props.i + 1 }) + ' · ' + tl('a.pl.numTip')}
+              onDblClick={() => showInsert(t().insert ?? 0)}><InstIcon id={icon()} size={13} /></span>
           </Show>
           <span class="nm" style={{ color: audible() ? 'var(--fg-hi)' : 'var(--fg4)' }} title={tl('a.pl.nameTip')}
             onDblClick={e => openRename(e.clientX, e.clientY, t().name, v => A.setTrack(props.i, { name: v }, tl('a.pl.trackName')))}>{t().name}</span>
@@ -1355,15 +1584,15 @@ function LaneHeader(props: { t: Track; i: number }) {
                 <svg width="7" height="7" viewBox="0 0 8 8" style={{ transform: U.takesOpen[t().id] ? 'rotate(90deg)' : 'none' }}><path d="M2 1l4 3-4 3z" fill="currentColor" /></svg>{r().comp.takes.length}
               </button>
             )}</Show>
-            {/* tracks play into the master unless the user sends one to a mixer channel (lane menu); only then is it shown */}
-            <Show when={routeIdx() > 0}>
-              <button class="mini route" title={tl('a.pl.routeTip', { out: 'Insert ' + routeIdx() })} onPointerDown={stop} onClick={e => openRouteMenu(props.i, e.clientX, e.clientY)}>{'Ins ' + routeIdx()}</button>
+            <Show when={t().h < 50}>{route()}</Show>
+            <MuteSolo muted={t().muted} solo={t().solo} muteTip={tl('a.pl.muteTip')} soloTip={tl('a.pl.soloTip')}
+              onMute={() => A.toggleTrackMute(props.i)} onSolo={add => A.toggleTrackSolo(props.i, add)} />
+            {/* recordings go to the first free track (FL); only a track picked with "Record into this track" shows it */}
+            <Show when={t().arm}>
+              <button class="mini r on" title={tl('a.pl.armedTip')} onPointerDown={stop} onClick={() => A.armTrack(props.i)}>
+                <svg width="7" height="7" viewBox="0 0 8 8"><circle cx="4" cy="4" r="3.5" fill="currentColor" /></svg>
+              </button>
             </Show>
-            <button class="mini m" classList={{ on: t().muted }} title={tl('a.pl.muteTip')} onPointerDown={stop} onClick={() => A.toggleTrackMute(props.i)}>M</button>
-            <button class="mini s" classList={{ on: t().solo }} title={tl('a.pl.soloTip')} onPointerDown={stop} onClick={e => A.toggleTrackSolo(props.i, e.ctrlKey || e.metaKey)}>S</button>
-            <button class="mini r" classList={{ on: t().arm }} title={tl('a.pl.arm')} onPointerDown={stop} onClick={() => A.armTrack(props.i)}>
-              <svg width="7" height="7" viewBox="0 0 8 8"><circle cx="4" cy="4" r="3.5" fill="currentColor" /></svg>
-            </button>
           </div>
         </div>
         <Show when={t().h >= 50}>
@@ -1374,7 +1603,8 @@ function LaneHeader(props: { t: Track; i: number }) {
                 <div class="thumb" style={{ left: shownVol() * 100 + '%' }} />
               </div>
             </div>
-            <span class="mono" style={{ width: '44px', flex: 'none', 'text-align': 'right', 'font-size': '9px', color: 'var(--fg4)' }}>{volText(shownVol())}</span>
+            <span class="mono lvtxt" classList={{ unity: Math.abs(shownVol() - VOL_UNITY) < 1e-4 }}>{volText(shownVol())}</span>
+            {route()}
           </div>
         </Show>
       </div>

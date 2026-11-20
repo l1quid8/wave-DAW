@@ -1,6 +1,6 @@
 [package]
 name = "wave-vst3"
-description = "WAVE: VST3 effects as wave_engine::Processor insert effects, with crash-proof out-of-process scanning and native editor windows."
+description = "Synkopa: VST3 effects as wave_engine::Processor insert effects, with crash-proof out-of-process scanning and native editor windows."
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -49,3 +49,11 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
 
 [dev-dependencies]
 serde_json.workspace = true
+
+# The editor probe example pumps Win32 messages like the app's event loop.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+# tests/editor_gui.rs turns a real plugin's knob like a user does
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+x11rb = { version = "0.13", features = ["xtest"] }

@@ -1,6 +1,6 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } from 'solid-js';
 import { be } from '../api/backend';
-import { PLUGIN_FORMAT_LABEL, type Fx, type FxKind, type Id, type ParamDef, type PluginParam } from '../api/types';
+import { PLUGIN_FORMAT_LABEL, unsafeReason, type Fx, type FxKind, type Id, type ParamDef, type PluginParam, type PluginRef } from '../api/types';
 import { sliderStep } from '../lib/pluginParam';
 import { clamp } from '../lib/format';
 import { lang, t, tName, type TranslationKey } from '../lib/i18n';
@@ -8,12 +8,13 @@ import { NOTE_NAMES } from '../lib/pitch';
 import { knobVal, paramDefs, pFmt, pNorm, presetInfo, presetList } from '../lib/presets';
 import { noteName, stepBeats } from '../lib/beatDiv';
 import * as A from '../state/actions';
-import { autoDisplay, isAutomated, paramMenu } from '../state/automation';
+import { autoDisplay, controlMenu, isAutomated, paramMenu } from '../state/automation';
 import type { AutoTarget } from '../api/types';
 import { commit, Gesture, wheelEdit } from '../state/edit';
 import { findFx, insName, plain, S } from '../state/store';
 import { onFxFrame, tele } from '../state/telemetry';
 import { openMenu, say, U, type PlugWin } from '../state/ui';
+import { closeEditor, editorOpen, isNoEditor, knownWithoutEditor, openEditor } from '../state/pluginWindows';
 import { dblCheck, track } from '../ui/drag';
 import { addFrameTask, fitCanvas, fonts } from '../ui/frameLoop';
 import { FXMETA, FxTile } from '../ui/icons';
@@ -27,8 +28,7 @@ import { EqViz } from './fx/eq';
 import { EqStrips } from './fx/eqStrips';
 import { EqPanel, eqHover, eqLeave, eqPointerDown, eqWheel } from './fx/eqEdit';
 import { fetModes, FetViz } from './fx/fet';
-import { ReverbViz, verbHit, verbLayout } from './fx/reverb';
-import { decayAt } from '../lib/reverbSpace';
+import { ReverbViz, verbDrag, verbHit, verbLayout, type VerbHandle } from './fx/reverb';
 import { SatViz } from './fx/satDelay';
 import { DelayViz } from './fx/delay';
 import { TuneViz } from './fx/tune';
@@ -38,6 +38,9 @@ import { ChorusViz, PhaserViz } from './fx/modulation';
 import { warpDown, warpHover, WarpViz } from './fx/warp';
 import { onVoicePad, padParams, padToVoice, VoiceViz } from './fx/voice';
 import { followEditor } from '../lib/pluginEditor';
+import { StereoViz } from './fx/stereo';
+import { AnalyzerViz } from './fx/analyzer';
+import { dbOf, fOf, mbGeom, mbHit, MultibandViz } from './fx/multiband';
 
 
 function makeViz(f: Fx): Viz | null {
@@ -57,10 +60,13 @@ function makeViz(f: Fx): Viz | null {
     case 'warp': return new WarpViz();
     case 'chorus': return new ChorusViz();
     case 'phaser': return new PhaserViz();
+    case 'stereo': return new StereoViz();
+    case 'analyzer': return new AnalyzerViz();
+    case 'multiband': return new MultibandViz();
     default: return null;
   }
 }
-const VIZ_H: Partial<Record<Fx['type'], number>> = { eq: 300, reverb: 260, tune: 280, fet: 250, sat: 240, deess: 230, denoise: 240, voice: 250, rider: 220, half: 250, delay: 230, warp: 360, chorus: 170, phaser: 220 };
+const VIZ_H: Partial<Record<Fx['type'], number>> = { eq: 300, reverb: 300, tune: 280, fet: 250, sat: 240, deess: 230, denoise: 240, voice: 250, rider: 220, half: 250, delay: 230, warp: 360, chorus: 170, phaser: 220, stereo: 250, analyzer: 360, multiband: 270 };
 /** Default window widths per type (actions.openPlug). */
 export const WIN_W: Partial<Record<Fx['type'], number>> = { eq: 780, reverb: 640, plugin: 560, tune: 800, fet: 700, deess: 680, denoise: 640, voice: 700, half: 760, delay: 760, warp: 820, chorus: 700, phaser: 700 };
 
@@ -77,6 +83,9 @@ const HINTS: Partial<Record<Fx['type'], TranslationKey>> = {
   voice: 'c.fx.hint.voice',
   chorus: 'c.fx.hint.chorus',
   phaser: 'c.fx.hint.phaser',
+  stereo: 'c.fx.hint.stereo',
+  analyzer: 'c.fx.hint.analyzer',
+  multiband: 'c.fx.hint.multiband',
 };
 
 /** Move a fixed window by its header. */
@@ -98,7 +107,7 @@ export function FxWindow(props: { pw: PlugWin; z: number }) {
         const info = () => presetInfo(S.catalog, fx(), S.project.bpm);
         return (
           <div class="win fxwin" style={{ left: props.pw.x + 'px', top: props.pw.y + 'px', width: props.pw.w + 'px', 'z-index': props.z }} data-fxwin={props.pw.fxId}
-            onPointerDown={() => A.plugFront(props.pw.fxId)}>
+            on:pointerdown={{ capture: true, handleEvent: () => A.plugFront(props.pw.fxId) }}>
             <div class="winhd" onPointerDown={e => moveWindow(e, () => props.pw, setPos)}>
               <button class="pwr" classList={{ off: fx().bypass }} title={fx().bypass ? t('c.fx.bypassOn') : t('c.fx.bypassOff')}
                 onPointerDown={e => { e.stopPropagation(); A.toggleBypass(fx().id); }} />
@@ -112,6 +121,7 @@ export function FxWindow(props: { pw: PlugWin; z: number }) {
               <span class="sub">{insName(m())}</span>
               <Show when={fx().bypass}><span class="bypasstag">BYPASS</span></Show>
               <div style={{ flex: 1 }} />
+              <HintIcon fx={fx()} />
               {/* effects with their own wet/dry knob don't need a second one in the header */}
               <Show when={!OWN_MIX.has(fx().type) || (fx().mix ?? 1) !== 1}><MixControl fx={fx()} /></Show>
               <Show when={!isVst() && presetList(S.catalog, fx().type).length}>
@@ -127,7 +137,7 @@ export function FxWindow(props: { pw: PlugWin; z: number }) {
               </Show>
               <button class="closebtn" title={t('c.fx.close')} onClick={() => A.closePlug(fx().id)}>×</button>
             </div>
-            <Show when={!isVst()} fallback={<PluginBody fx={fx()} />}>
+            <Show when={!isVst()} fallback={<PluginBody id={fx().id} plugin={fx().plugin} />}>
               <Show when={fx().type === 'eq'} fallback={<VizCanvas fxId={props.pw.fxId} pw={props.pw} height={VIZ_H[fx().type] ?? 190} />}>
                 {/* EQ: band bank beside the graph, like FL Parametric EQ 2 */}
                 <div class="eqmain">
@@ -145,7 +155,7 @@ export function FxWindow(props: { pw: PlugWin; z: number }) {
 }
 
 /** Dry/wet of the effect (fx.mix), automatable. */
-const OWN_MIX = new Set<string>(['reverb', 'delay', 'sat', 'fet', 'half', 'warp', 'chorus', 'phaser']);
+const OWN_MIX = new Set<string>(['reverb', 'delay', 'sat', 'fet', 'half', 'warp', 'chorus', 'phaser', 'stereo', 'analyzer', 'multiband']);
 function MixControl(props: { fx: Fx }) {
   const target = () => ({ kind: 'mix' as const, fxId: props.fx.id });
   const val = () => autoDisplay(target()) ?? props.fx.mix ?? 1;
@@ -237,7 +247,10 @@ function Ctl(props: { fx: Fx; id: string; ends?: [string, string]; danger?: numb
   );
 }
 
-function Hint(props: { fx: Fx }) { return <span class="hint">{HINTS[props.fx.type] ? t(HINTS[props.fx.type]!) : ''}</span>; }
+/** How to use the window, behind a "?" in the header (hover or focus): there when wanted, never taking room. */
+function HintIcon(props: { fx: Fx }) {
+  return <Show when={HINTS[props.fx.type]}>{k => <span class="fxhint" tabIndex={0} role="note" aria-label={t(k())} data-tip={t(k())}>?</span>}</Show>;
+}
 /** Layout entries starting with `c.` are translation keys, anything else ("C3", "2×") is shown as is. */
 const L = (s: string) => (s.startsWith('c.') ? t(s as TranslationKey) : s);
 
@@ -285,7 +298,8 @@ const LAYOUT: Partial<Record<FxKind, Section[]>> = {
     ] },
     { title: 'c.fx.sec.model', items: [{ stack: [{ id: 'model', small: true }] }] },
     { title: 'c.fx.sec.tone', items: [{ id: 'cutoff', when: fx => (fx.params.ftype ?? 1) >= 0.5 }] },
-    { title: 'c.fx.sec.output', items: [{ id: 'mix' }, { id: 'dry' }] },
+    // Ducking sits with the levels: it is a level move on the wet (same knob as the reverb's)
+    { title: 'c.fx.sec.output', items: [{ id: 'mix' }, { id: 'dry' }, { id: 'duck', size: 'sm' }] },
     { title: 'c.fx.sec.time', adv: true, items: [
       { stack: [{ id: 'keep', labels: ['c.fx.lab.repitch', 'c.fx.lab.keepPitch'], small: true }] },
       { id: 'smooth', size: 'sm', when: fx => (fx.params.keep ?? 0) < 0.5 },
@@ -360,6 +374,26 @@ const LAYOUT: Partial<Record<FxKind, Section[]>> = {
     { title: 'c.fx.sec.feedback', items: [{ id: 'fb', ends: ['c.fx.end.hollow', 'c.fx.end.resonant'] }] },
     { title: 'c.fx.sec.output', items: [{ id: 'mix' }] },
   ],
+  // first view: how wide, is the bass mono, level and balance; polarity and swap are repair tools
+  stereo: [
+    { title: 'c.fx.sec.stereo', items: [{ id: 'width', size: 'lg', ends: ['c.fx.end.mono', 'c.fx.end.wide'] }, { id: 'spread' }] },
+    { title: 'c.fx.sec.bass', items: [{ stack: [{ id: 'bass', labels: ['c.fx.lab.bassStereo', 'Mono'], small: true }] }, { id: 'bassf', when: fx => (fx.params.bass ?? 0) >= 0.5 }] },
+    { title: 'c.fx.sec.output', items: [{ id: 'gain' }, { id: 'pan', ends: ['L', 'R'] }] },
+    { title: 'c.fx.sec.channels', adv: true, items: [{ stack: [{ id: 'invl', labels: ['L', 'Ø L'], small: true }, { id: 'invr', labels: ['R', 'Ø R'], small: true }] }, { stack: [{ id: 'swap', labels: ['L | R', 'R | L'], small: true }] }] },
+  ],
+  analyzer: [
+    { title: 'c.fx.sec.target', items: [{ stack: [{ id: 'target', labels: ['Off', 'Streaming −14', 'c.fx.lab.loud9', 'Broadcast −23'], small: true }] }] },
+    { title: 'c.fx.sec.spectrum', adv: true, items: [{ stack: [{ id: 'slope', small: true }] }] },
+  ],
+  // the four OTT controls first; the band levels and crossovers are under "Advanced", the
+  // thresholds are dragged in the display
+  multiband: [
+    { title: 'c.fx.sec.amount', items: [{ id: 'depth', size: 'lg' }, { id: 'time' }] },
+    { title: 'c.fx.sec.compression', items: [{ id: 'up', ends: ['0', '200%'] }, { id: 'down', ends: ['0', '200%'] }] },
+    { title: 'c.fx.sec.gain', items: [{ id: 'in' }, { id: 'out' }] },
+    { title: 'c.fx.sec.bands', adv: true, items: [{ id: 'gl', size: 'sm' }, { id: 'gm', size: 'sm' }, { id: 'gh', size: 'sm' }] },
+    { title: 'c.fx.sec.crossovers', adv: true, items: [{ id: 'xlo', size: 'sm' }, { id: 'xhi', size: 'sm' }] },
+  ],
   half: [
     { title: 'c.fx.sec.slowdown', items: [{ stack: [{ id: 'speed', labels: ['c.fx.lab.halfFifth', 'c.fx.lab.halfOctave', 'c.fx.lab.halfTwoOct'], small: true }, { id: 'loop', small: true }] }] },
     { title: 'c.fx.sec.transitions', items: [{ id: 'smooth', size: 'lg', ends: ['c.fx.end.percussive', 'c.fx.end.swell'] }] },
@@ -368,6 +402,8 @@ const LAYOUT: Partial<Record<FxKind, Section[]>> = {
   ],
 };
 
+/** The Multiband's thresholds: dragged in its display, not knobs. */
+const MB_THRESHOLDS = ['dl', 'dm', 'dh', 'ul', 'um', 'uh'];
 /** Chorus / Phaser: the LFO follows the tempo. */
 function synced(fx: Fx) { return (fx.params.sync ?? 0) >= 0.5; }
 /** The delay's model index (0 mono, 1 stereo, 2 ping-pong, 3 off). */
@@ -395,7 +431,8 @@ function Sections(props: { fx: Fx }) {
     lay.forEach(s => walk(s.items));
     const known = new Set(defs.map(p => p.id));
     // the tuner's key/scale/voice have their own row; Warp's slots are picked on its slot strip
-    const rest = defs.filter(p => !placed.has(p.id) && !(props.fx.type === 'tune' && ['key', 'scale', 'voice'].includes(p.id)) && !(props.fx.type === 'warp' && ['tslot', 'vslot'].includes(p.id)));
+    const rest = defs.filter(p => !placed.has(p.id) && !(props.fx.type === 'tune' && ['key', 'scale', 'voice'].includes(p.id)) && !(props.fx.type === 'warp' && ['tslot', 'vslot'].includes(p.id))
+      && !(props.fx.type === 'multiband' && MB_THRESHOLDS.includes(p.id)));
     // drop layout items the engine does not define (older catalog), then sections left empty
     const keep = (xs: Item[]): Item[] => xs.flatMap((x): Item[] => {
       if ('stack' in x) { const k = keep(x.stack); return k.length ? [{ stack: k }] : []; }
@@ -412,8 +449,7 @@ function Sections(props: { fx: Fx }) {
       <For each={shown()}>
         {(sec, i) => (
           <>
-            <Show when={i() > 0}><div class="vline" /></Show>
-            <div class="fxsec">
+            <div class="fxsec" classList={{ adv: !!sec.adv }}>
               <div class="fxsec-h">{L(sec.title)}</div>
               <div class="fxsec-b"><For each={sec.items}>{it => <LayoutItem fx={props.fx} it={it} />}</For></div>
             </div>
@@ -425,7 +461,6 @@ function Sections(props: { fx: Fx }) {
         <button class="smallbtn advbtn" classList={{ on: adv() }} title={t('c.fx.advTip')}
           onClick={() => setAdvOpen(m => ({ ...m, [props.fx.id]: !adv() }))}>{adv() ? t('c.fx.less') : t('c.fx.advanced')}</button>
       </Show>
-      <Hint fx={props.fx} />
     </div>
   );
 }
@@ -509,6 +544,7 @@ function VizCanvas(props: { fxId: Id; pw: PlugWin; height: number }) {
     else if (got.f.type === 'deess') deessDown(e, got.f);
     else if (got.f.type === 'voice') voiceDown(e);
     else if (got.f.type === 'half') halfDown(e, got.f);
+    else if (got.f.type === 'multiband') mbDown(e, got.f);
     else if (got.f.type === 'warp') warpDown(e, cv, props.fxId, viz as WarpViz, () => version++);
     else if (got.f.type === 'fet' && e.button === 0) {
       const m = fetModes.get(props.fxId) === 'out' ? 'gr' : 'out';
@@ -527,13 +563,20 @@ function VizCanvas(props: { fxId: Id; pw: PlugWin; height: number }) {
     } else if (got.f.type === 'reverb') {
       const v = viz as ReverbViz, { x, y, W, H } = rel(e), on = verbHit(got.f, x, y, W, H);
       if (on !== v.hover) { v.hover = on; version++; }
-      cv.style.cursor = on ? 'ew-resize' : 'default';
+      cv.style.cursor = on ? VERB_CURSOR[on] : 'default';
     } else if (got.f.type === 'warp') {
       if (warpHover(e, cv, props.fxId, viz as WarpViz)) version++;
     } else if (got.f.type === 'half') {
       const v = viz as HalfViz, { x, y, W, H } = rel(e), on = halfHit(got.f, x, y, W, H);
       if (on !== v.hover) { v.hover = on; version++; }
       cv.style.cursor = on ? 'ew-resize' : 'default';
+    } else if (got.f.type === 'analyzer') {
+      const { x, y } = rel(e);
+      (viz as AnalyzerViz).hover = { x, y }; version++;
+    } else if (got.f.type === 'multiband') {
+      const v = viz as MultibandViz, { x, y, W, H } = rel(e), on = mbHit(got.f, x, y, W, H);
+      if (on !== v.hover) { v.hover = on; version++; }
+      cv.style.cursor = on ? (on[0] === 'x' ? 'ew-resize' : 'ns-resize') : 'default';
     } else if (got.f.type === 'voice') {
       const v = viz as VoiceViz, { x, y, W, H } = rel(e), on = onVoicePad(x, y, W, H);
       if (on !== v.hover) { v.hover = on; version++; }
@@ -547,6 +590,8 @@ function VizCanvas(props: { fxId: Id; pw: PlugWin; height: number }) {
     if (got.f.type === 'voice') { (viz as VoiceViz).hover = false; version++; }
     if (got.f.type === 'half') { (viz as HalfViz).hover = null; version++; }
     if (got.f.type === 'reverb') { (viz as ReverbViz).hover = null; version++; }
+    if (got.f.type === 'analyzer') { (viz as AnalyzerViz).hover = null; version++; }
+    if (got.f.type === 'multiband') { (viz as MultibandViz).hover = null; version++; }
     if (got.f.type === 'warp') { const w = viz as WarpViz; w.hover = null; w.hoverX = null; version++; }
   };
   /** Pad: click / drag sets Pitch and Formant together (one undo step), double click resets both. */
@@ -560,7 +605,7 @@ function VizCanvas(props: { fxId: Id; pw: PlugWin; height: number }) {
       return A.fxOp({ ...plain(f), params: { ...plain(f.params), pitch, formant } });
     };
     const tell = () => { const p = findFx(props.fxId)?.f.params; if (p) say('Voice · Pitch ' + (p.pitch ?? 0).toFixed(1) + ' st · Formant ' + (p.formant ?? 0).toFixed(1) + ' st'); };
-    if (dblCheck('voice' + props.fxId)) { const op = put(0, 0); if (op) commit([op], 'Pitch / Formant'); tell(); return; }
+    if (e.altKey || dblCheck('voice' + props.fxId)) { const op = put(0, 0); if (op) commit([op], 'Pitch / Formant'); tell(); return; }
     const g = new Gesture('Pitch / Formant');
     const r = cv.getBoundingClientRect();
     const at = (cx: number, cy: number) => {
@@ -579,7 +624,7 @@ function VizCanvas(props: { fxId: Id; pw: PlugWin; height: number }) {
     const pd = defOf(f, which); if (!pd) return;
     e.preventDefault();
     const name = t(which === 'lo' ? 'c.fx.half.edgeLo' : 'c.fx.half.edgeHi');
-    if (dblCheck('half' + which + props.fxId)) { const op = setParam(props.fxId, which, pd.def); if (op) commit([op], name); return; }
+    if (e.altKey || dblCheck('half' + which + props.fxId)) { const op = setParam(props.fxId, which, pd.def); if (op) commit([op], name); return; }
     const g = new Gesture(name);
     const r = cv.getBoundingClientRect();
     const at = (cx: number) => {
@@ -594,6 +639,29 @@ function VizCanvas(props: { fxId: Id; pw: PlugWin; height: number }) {
     at(e.clientX);
     track(ev => at(ev.clientX), () => g.end(), 'ew-resize');
   };
+  /** Multiband: drag a crossover sideways or a threshold up and down (one undo step); double-click = default. */
+  const mbDown = (e: PointerEvent, f: Fx) => {
+    if (e.button !== 0) return;
+    const { x, y, W, H } = rel(e), id = mbHit(f, x, y, W, H); if (!id) return;
+    const pd = defOf(f, id); if (!pd) return;
+    e.preventDefault();
+    const name = tName(pd.label);
+    if (e.altKey || dblCheck('mb' + id + props.fxId)) { const op = setParam(props.fxId, id, pd.def); if (op) commit([op], name); return; }
+    const g = new Gesture(name), v = viz as MultibandViz, r = cv.getBoundingClientRect(), G = mbGeom(r.width, r.height);
+    v.drag = id; version++;
+    track(ev => {
+      const cur = findFx(props.fxId)?.f; if (!cur) return;
+      let val: number;
+      if (id[0] === 'x') {
+        val = fOf(ev.clientX - r.left, G);
+        // the crossovers stay an octave apart
+        if (id === 'xlo') val = Math.min(val, (cur.params.xhi ?? 2500) / 2); else val = Math.max(val, (cur.params.xlo ?? 88.3) * 2);
+        val = Math.round(clamp(val, pd.min, pd.max) * 10) / 10;
+      } else val = Math.round(clamp(dbOf(ev.clientY - r.top, G), pd.min, pd.max) * 10) / 10;
+      const op = setParam(props.fxId, id, val); if (op) g.update([op]);
+      say(name + ': ' + fmtLong(pd, findFx(props.fxId)?.f.params[id] ?? val));
+    }, () => { g.end(); v.drag = null; version++; }, id[0] === 'x' ? 'ew-resize' : 'ns-resize');
+  };
   const deessDown = (e: PointerEvent, f: Fx) => {
     if (e.button !== 0) return;
     const { x, y, W, H } = rel(e), G = deessGeom(W, H);
@@ -602,7 +670,7 @@ function VizCanvas(props: { fxId: Id; pw: PlugWin; height: number }) {
     const onF = x >= G.sx - 4;
     if (!onThr && !onF) return;
     e.preventDefault();
-    if (onThr && dblCheck('thr' + props.fxId)) { const op = setParam(props.fxId, 'thr', thrP.def); if (op) commit([op], t('c.fx.thr')); return; }
+    if (onThr && (e.altKey || dblCheck('thr' + props.fxId))) { const op = setParam(props.fxId, 'thr', thrP.def); if (op) commit([op], t('c.fx.thr')); return; }
     const g = new Gesture(onThr ? t('c.fx.thr') : t('c.fx.freq'));
     const r = cv.getBoundingClientRect();
     track(ev => {
@@ -615,27 +683,24 @@ function VizCanvas(props: { fxId: Id; pw: PlugWin; height: number }) {
     }, () => g.end(), onThr ? 'ns-resize' : 'ew-resize');
     if (onF && !onThr) { const op = setParam(props.fxId, 'freq', Math.round(clamp(deessXf(x, W, H), frP.min, frP.max))); if (op) g.update([op]); }
   };
-  /** Reverb envelope: drag PRE (pre-delay) or the tail's end (decay), one undo step; double-click = default. */
+  /** Reverb display: drag a decay dot (bass, decay, treble) up and down, a cut line or PRE sideways; one undo step, double-click = default. */
   const verbDown = (e: PointerEvent, f: Fx) => {
     if (e.button !== 0) return;
     const { x, y, W, H } = rel(e), which = verbHit(f, x, y, W, H); if (!which) return;
     e.preventDefault();
-    const id = which === 'pre' ? 'pre' : 'size', pd = defOf(f, id); if (!pd) return;
-    const name = t(which === 'pre' ? 'c.verb.preName' : 'c.verb.decayName');
-    if (dblCheck('verb' + which + props.fxId)) { const op = setParam(props.fxId, id, pd.def); if (op) commit([op], name); return; }
+    const L0 = verbLayout(W, H, f);
+    const id = verbDrag(which, L0, x, y, f.params).id, pd = defOf(f, id); if (!pd) return;
+    const name = tName(pd.label);
+    if (e.altKey || dblCheck('verb' + which + props.fxId)) { const op = setParam(props.fxId, id, pd.def); if (op) commit([op], name); return; }
     const g = new Gesture(name), v = viz as ReverbViz, r = cv.getBoundingClientRect();
     v.drag = which; version++;
-    const at = (cx: number) => {
+    // map through the layout the user saw at the start of the drag: the axes would rescale under the pointer
+    track(ev => {
       const cur = findFx(props.fxId)?.f; if (!cur) return;
-      // map through the layout the user sees at the start of the drag: the axis would rescale under the pointer
-      const tm = L0.xt(cx - r.left);
-      const val = which === 'pre' ? Math.round(clamp(tm * 1000, pd.min, pd.max)) : Math.round(decayAt(cur.params, tm) * 100) / 100;
-      const op = setParam(props.fxId, id, clamp(val, pd.min, pd.max)); if (op) g.update([op]);
-      const nv = findFx(props.fxId)?.f.params[id] ?? val;
-      say(name + ': ' + (which === 'pre' ? Math.round(nv) + ' ms' : nv.toFixed(2) + ' s'));
-    };
-    const L0 = verbLayout(W, H, f);
-    track(ev => at(ev.clientX), () => { g.end(); v.drag = null; version++; }, 'ew-resize');
+      const nv = verbDrag(which, L0, ev.clientX - r.left, ev.clientY - r.top, cur.params);
+      const op = setParam(props.fxId, nv.id, clamp(nv.value, pd.min, pd.max)); if (op) g.update([op]);
+      say(name + ': ' + pFmt(pd, findFx(props.fxId)?.f.params[nv.id] ?? nv.value));
+    }, () => { g.end(); v.drag = null; version++; }, VERB_CURSOR[which]);
   };
   const wheel = (e: WheelEvent) => {
     const got = ff(); if (!got || !viz) return;
@@ -645,6 +710,8 @@ function VizCanvas(props: { fxId: Id; pw: PlugWin; height: number }) {
     onPointerDown={down} onPointerMove={move} onPointerLeave={leave} onWheel={wheel} onContextMenu={e => e.preventDefault()} />;
 }
 
+const VERB_CURSOR: Record<VerbHandle, string> = { pre: 'ew-resize', lo: 'ew-resize', hi: 'ew-resize', size: 'ns-resize', bass: 'ns-resize', tone: 'ns-resize' };
+
 /** The option of an enumeration parameter its normalized value selects. */
 const nearestOption = (p: PluginParam) =>
   (p.options ?? []).reduce((best, o, i, all) => (Math.abs(o.value - p.value) < Math.abs(all[best].value - p.value) ? i : best), 0);
@@ -652,63 +719,100 @@ const nearestOption = (p: PluginParam) =>
 const paramTitle = (p: PluginParam) =>
   p.min != null && p.max != null && !p.toggle && !p.options?.length ? `${p.name} (${+p.min.toPrecision(6)} … ${+p.max.toPrecision(6)}${p.unit ? ' ' + p.unit : ''})` : p.name;
 
-/** A hosted plugin's window: its editor button (VST3 on Windows and macOS) and the generic parameter list (every format). */
-function PluginBody(props: { fx: Fx }) {
+/**
+ * A hosted plugin's controls in Synkopa's window: the button for its own window and the generic parameter list
+ * (every format). `id` is the effect's id, or with `instrument` a plugin-instrument channel's (its parameters cannot
+ * be automated yet, and a plugin that did not load leaves the channel silent rather than passing audio through).
+ */
+export function PluginBody(props: { id: Id; plugin?: PluginRef; instrument?: boolean }) {
   const [params, setParams] = createSignal<PluginParam[]>([]);
   const [err, setErr] = createSignal<string | null>(null);
-  const [guiOpen, setGuiOpen] = createSignal(false);
-  // VST3 editor windows exist on Windows and macOS; LV2 editors are not hosted: there the list is the plugin's UI
+  const [guiErr, setGuiErr] = createSignal<string | null>(null);
+  const [noEd, setNoEd] = createSignal(knownWithoutEditor(props.plugin));
+  const toggleGui = () => {
+    setGuiErr(null);
+    if (editorOpen(props.id)) return void closeEditor(props.id);
+    openEditor(props.id).catch(e => {
+      if (isNoEditor(e)) return setNoEd(true);
+      setGuiErr(t('c.fx.guiFail', { e: String(e).replace(/^Error:\s*/, '') }));
+    });
+  };
+  // whether this session can show plugin windows at all (no X11 display on Linux: the list is the plugin's UI)
   const [editors, setEditors] = createSignal(true);
-  const isLv2 = () => props.fx.plugin?.format === 'lv2';
+  const [editorsWhy, setEditorsWhy] = createSignal<string | null>(null);
   const [q, setQ] = createSignal('');
   let refresh = 0;
-  const load = () => be().pluginParams(props.fx.id).then(p => { setParams(p); setErr(null); }).catch(e => setErr(String(e)));
+  const load = () => be().pluginParams(props.id).then(p => { setParams(p); setErr(null); }).catch(e => setErr(String(e)));
   /** Why the engine could not load the plugin (not installed, refused): shown instead of a parameter error. */
-  const loadErr = () => S.fxErrors[props.fx.id];
-  onMount(() => { load(); be().appInfo().then(i => setEditors(i.pluginEditors)).catch(() => {}); });
-  // the plugin's own window: its close button and its knobs show here as they happen
-  const editor = followEditor(props.fx.id, () => setGuiOpen(false), load);
+  const loadErr = () => S.fxErrors[props.id];
+  const [trusting, setTrusting] = createSignal(false);
+  onMount(() => { load(); be().appInfo().then(i => { setEditors(i.pluginEditors); setEditorsWhy(i.pluginEditorsWhy ?? null); }).catch(() => {}); });
+  // a VST3 plugin's own window reports its knobs as they move (`plugin-editor`): the list follows at once.
+  // Its close button is followed by the plugin-window store, which owns the editor button.
+  const editor = followEditor(props.id, () => {}, load);
   let offEditor: (() => void) | null = null, gone = false;
   void be().on('plugin-editor', editor.handle).then(off => { if (gone) off(); else offEditor = off; });
   onCleanup(() => { gone = true; offEditor?.(); editor.dispose(); });
   // a window opened with the slot is asked before the engine has the instance: ask again once it does
   createEffect(() => { void S.revision; if (err() && !loadErr()) load(); });
-  onCleanup(() => { clearTimeout(refresh); if (guiOpen()) void be().pluginEditor(props.fx.id, false).catch(() => {}); });
-  const label = () => PLUGIN_FORMAT_LABEL[props.fx.plugin?.format ?? 'vst3'];
+  // an LV2 UI reports nothing: while both are open the list asks again every second
+  createEffect(() => {
+    if (!editorOpen(props.id) || props.plugin?.format === 'vst3') return;
+    const iv = window.setInterval(load, 1000);
+    onCleanup(() => clearInterval(iv));
+  });
+  // closing Synkopa's window leaves the plugin's own window open (FL): its header's gear brings this back
+  onCleanup(() => clearTimeout(refresh));
+  const label = () => PLUGIN_FORMAT_LABEL[props.plugin?.format ?? 'vst3'];
   const set = (id: number, v: number) => {
     setParams(ps => ps.map(p => p.id === id ? { ...p, value: v } : p));
     editor.localEdit();
-    void be().pluginSetParam(props.fx.id, id, v).catch(e => say(label() + ': ' + String(e)));
+    void be().pluginSetParam(props.id, id, v).catch(e => say(label() + ': ' + String(e)));
     clearTimeout(refresh); refresh = window.setTimeout(load, 200);
   };
   const shown = () => { const s = q().toLowerCase(); return params().filter(p => !s || p.name.toLowerCase().includes(s) || (p.symbol ?? '').toLowerCase().includes(s)); };
   return (
     <div style={{ padding: '12px 14px', display: 'flex', 'flex-direction': 'column', gap: '10px' }}>
       <div class="row" style={{ gap: '8px' }}>
-        <Show when={editors() && !isLv2()} fallback={<span class="note" style={{ flex: 'none' }} title={isLv2() ? t('c.fx.guiNoneLv2') : t('c.fx.guiNone')}>{t('c.fx.guiNoneShort')}</span>}>
-          <button class="smallbtn primary" style={{ height: '26px', padding: '0 12px' }} onClick={() => {
-            const open = !guiOpen();
-            be().pluginEditor(props.fx.id, open).then(() => setGuiOpen(open)).catch(e => say(t('c.fx.guiFail', { e: String(e) })));
-          }}>{guiOpen() ? t('c.fx.guiClose') : t('c.fx.guiOpen')}</button>
+        {/* a plugin that is not loaded has no window to show: the reason is below */}
+        <Show when={editors() && !loadErr()} fallback={<Show when={!loadErr()}><span class="note" style={{ flex: 'none' }} title={editorsWhy() ?? t('c.fx.guiNone')}>{t('c.fx.guiNoneShort')}</span></Show>}>
+          <Show when={!noEd()} fallback={<span class="note" style={{ flex: 'none' }} title={t('c.fx.guiNoWindowTip')}>{t('c.fx.guiNoWindow')}</span>}>
+            <button class="smallbtn primary" style={{ height: '26px', padding: '0 12px' }} onClick={toggleGui}>{editorOpen(props.id) ? t('c.fx.guiClose') : t('c.fx.guiOpen')}</button>
+          </Show>
         </Show>
         <span class="fxp-badge" style={{ flex: 'none' }}>{label()}</span>
-        <span class="note ell" style={{ flex: 1 }} title={props.fx.plugin?.cid}>{[props.fx.plugin?.vendor, props.fx.plugin?.path || props.fx.plugin?.cid].filter(Boolean).join(' · ')}</span>
+        <span class="note ell" style={{ flex: 1 }} title={props.plugin?.cid}>{[props.plugin?.vendor, props.plugin?.path || props.plugin?.cid].filter(Boolean).join(' · ')}</span>
       </div>
       <input class="textin" placeholder={t('c.fx.searchParam')} value={q()} onInput={e => setQ(e.currentTarget.value)} onKeyDown={e => e.stopPropagation()} />
-      <Show when={loadErr() ?? err()}>{e => <span class="note err">{loadErr() ? t('c.fx.pluginNotLoaded', { e: e() }) : e()}</span>}</Show>
+      <Show when={guiErr()}>{e => <span class="note err">{e()}</span>}</Show>
+      <Show when={unsafeReason(loadErr())} fallback={
+        <Show when={loadErr() ?? err()}>{e => <span class="note err">{loadErr() ? t(props.instrument ? 'c.fx.instNotLoaded' : 'c.fx.pluginNotLoaded', { e: e() }) : e()}</span>}</Show>
+      }>
+        {why => (
+          <div class="unsafe">
+            <span class="note err">{t(props.instrument ? 'c.fx.unsafeInst' : 'c.fx.unsafeFx', { e: why() })}</span>
+            <button class="smallbtn" disabled={trusting()} title={t('c.fx.loadAnywayTip')}
+              onClick={() => { setTrusting(true); be().pluginLoadAnyway(props.id).then(() => load(), e => say(String(e))).finally(() => setTrusting(false)); }}>
+              {t('c.fx.loadAnyway')}
+            </button>
+          </div>
+        )}
+      </Show>
       <div style={{ 'max-height': '320px', overflow: 'auto', 'padding-right': '4px' }}>
         <For each={shown()} fallback={<span class="note">{t('c.fx.noParams')}</span>}>
           {p => {
-            const target: AutoTarget = { kind: 'plugin', fxId: props.fx.id, paramId: p.id };
+            const target: AutoTarget = { kind: 'plugin', fxId: props.id, paramId: p.id };
             return (
               <div class="vparam" onContextMenu={e => { e.preventDefault(); e.stopPropagation();
-                paramMenu(e.clientX, e.clientY, target, () => set(p.id, p.def), undefined, { current: p.value, paramLabel: p.name });
+                if (!props.instrument) paramMenu(e.clientX, e.clientY, target, () => set(p.id, p.def), undefined, { current: p.value, paramLabel: p.name });
+                else controlMenu(e.clientX, e.clientY, p.name, () => set(p.id, p.def), t('c.fx.instNoAuto'));
               }}>
                 <span class="ell" style={{ font: '12px var(--sans)', color: 'var(--fg)' }} title={paramTitle(p)}>{p.name}</span>
                 <Show when={p.options?.length} fallback={
                   <Show when={p.toggle} fallback={
                     <input type="range" min="0" max="1" step={sliderStep(p)} value={p.value} onInput={e => set(p.id, +e.currentTarget.value)}
-                      onDblClick={() => set(p.id, p.def)} aria-label={p.name} />
+                      onDblClick={() => set(p.id, p.def)} aria-label={p.name}
+                      onPointerDown={e => { if (e.altKey && e.button === 0) { e.preventDefault(); set(p.id, p.def); } }} />
                   }>
                     <input type="checkbox" style={{ 'justify-self': 'start' }} checked={p.value >= 0.5} onChange={e => set(p.id, e.currentTarget.checked ? 1 : 0)} aria-label={p.name} />
                   </Show>
@@ -718,8 +822,8 @@ function PluginBody(props: { fx: Fx }) {
                     <For each={p.options}>{(o, oi) => <option value={String(oi())}>{o.label}</option>}</For>
                   </select>
                 </Show>
-                <span class="mono ell" style={{ 'font-size': '10px', color: 'var(--fg2)', 'text-align': 'right' }} title={isAutomated(target) ? t('d.ui.knob.auto') : p.display}>
-                  <Show when={isAutomated(target)}>● </Show>{p.display}
+                <span class="mono ell" style={{ 'font-size': '10px', color: 'var(--fg2)', 'text-align': 'right' }} title={!props.instrument && isAutomated(target) ? t('d.ui.knob.auto') : p.display}>
+                  <Show when={!props.instrument && isAutomated(target)}>● </Show>{p.display}
                 </span>
               </div>
             );

@@ -6,6 +6,7 @@ let answer: 'save' | 'discard' | 'cancel' | 'busy' = 'discard';
 let recAnswer: 'restore' | 'discard' | 'later' = 'restore';
 let recAsked = 0;
 let recPath: string | null = null;
+let recProject: string | null = null;
 let editDuringConfirm: (() => Promise<void>) | undefined;
 vi.mock('../ui/Confirm', () => ({
   confirmUnsaved: async () => {
@@ -13,7 +14,7 @@ vi.mock('../ui/Confirm', () => ({
     await editDuringConfirm?.();
     return choice;
   },
-  confirmRecover: async (_ms: number, openPath: string | null = null) => { recAsked++; recPath = openPath; return recAnswer; },
+  confirmRecover: async (_ms: number, openPath: string | null = null, project: string | null = null) => { recAsked++; recPath = openPath; recProject = project; return recAnswer; },
 }));
 beforeAll(() => {
   const noop = () => {};
@@ -35,13 +36,14 @@ beforeEach(async () => {
   recAnswer = 'restore';
   recAsked = 0;
   recPath = null;
+  recProject = null;
   editDuringConfirm = undefined;
 });
 
 describe('opening a project', () => {
   it('loads the state the open command replies with', async () => {
     await A.projectOpen();
-    expect(store.S.path).toContain('Demo.wave');
+    expect(store.S.path).toContain('Demo.synkopa');
     expect(store.S.project.clips.length).toBeGreaterThan(0);
     expect(store.S.dirty).toBe(false);
   });
@@ -120,6 +122,38 @@ describe('opening a project', () => {
     expect(store.S.path).toBe(current);
     expect((await import('./ui')).U.readout).toContain('recording: stop it first');
     await mock.transportStop();
+  });
+  it('refuses to start a new project while a take is recording, like the engine', async () => {
+    await A.projectOpen('C:\\Muzyka\\First.wave');
+    await mock.applyOps([{ op: 'setBpm', bpm: 97 }]);
+    store.replaceState(await mock.getState());
+    const track = store.S.project.tracks[0];
+    await mock.applyOps([{ op: 'putTrack', track: { ...track, arm: true } }]);
+    await mock.transportSet({ rec: true });
+    await mock.transportPlay(0);
+    store.replaceState(await mock.getState());
+    // the user-facing action reports the refusal, like Ctrl+N in the app
+    expect(await A.projectNew()).toBe(false);
+    expect((await import('./ui')).U.readout).toContain('recording: stop it first');
+    // the refused reset left the backend project alone
+    expect((await mock.getState()).project.bpm).toBe(97);
+    await mock.transportStop();
+    await A.projectNew();
+    expect((await mock.getState()).project.bpm).not.toBe(97); // with the take over, the reset goes through
+  });
+  it('accepts a new project while the audio device is down, like the engine', async () => {
+    // the output refuses to open (the Focusrite is unplugged, the ASIO host is selected):
+    // like the native engine, no running device means no audio take, so the reset is allowed
+    await A.projectOpen('C:\\Muzyka\\First.wave');
+    await mock.setFocusritePresent(false);
+    await mock.audioSetConfig({ ...(await mock.audioGetConfig()), host: 'asio' });
+    expect((await mock.audioGetConfig()).running).toBe(false);
+    const track = store.S.project.tracks[0];
+    await mock.applyOps([{ op: 'putTrack', track: { ...track, arm: true } }]);
+    await mock.transportSet({ rec: true });
+    await mock.transportPlay(0);
+    expect(await A.projectNew()).toBe(true); // no take without a device: the reset goes through
+    expect((await mock.getState()).path).toBeNull();
   });
   it('explains how to retry an Explorer open while another confirmation is active', async () => {
     await A.projectOpen('C:\\Muzyka\\First.wave');
@@ -210,11 +244,11 @@ describe('saving a project', () => {
   });
   it('saves and returns true when a path is chosen', async () => {
     expect(await A.projectSave(false)).toBe(true);
-    expect(store.S.path).toMatch(/\.wave$/);
+    expect(store.S.path).toMatch(/\.synkopa$/);
   });
 });
 
-describe('crash recovery of a project that was never saved', () => {
+describe('crash recovery (the autosave)', () => {
   /** An unsaved edit, the autosave tick, then the app dies and starts again. */
   async function crashWithUnsavedWork() {
     await mock.applyOps([{ op: 'setBpm', bpm: 137 }]);
@@ -251,7 +285,7 @@ describe('crash recovery of a project that was never saved', () => {
   it('offers the copy after a launch that opened a file, naming that project', async () => {
     await crashWithUnsavedWork();
     const opened = 'C:\\Muzyka\\Opened.wave';
-    await A.projectOpen(opened); // the Explorer double-click that started WAVE
+    await A.projectOpen(opened); // the Explorer double-click that started Synkopa
     recAnswer = 'later';
     await A.offerRecovery();
     expect(recAsked).toBe(1);
@@ -273,12 +307,51 @@ describe('crash recovery of a project that was never saved', () => {
     await A.offerRecovery();
     expect(recAsked).toBe(0);
   });
-  it('writes no copy for a saved project, and drops the copy once the project is saved', async () => {
+  it('drops the copy once the project is saved', async () => {
     await mock.applyOps([{ op: 'setBpm', bpm: 137 }]);
     store.replaceState(await mock.getState());
     expect(await mock.recoveryWrite()).toBe(true);
     await A.projectSave(false);
+    expect(await mock.recoveryWrite()).toBe(false); // nothing unsaved
     mock.simulateCrash();
     expect(await mock.recoveryList()).toEqual([]);
+  });
+  it('never saves a named project by itself: its autosave is a snapshot offered back as that project (#125)', async () => {
+    expect(await A.projectSave(false)).toBe(true);
+    const file = store.S.path!;
+    for (const bpm of [141, 147]) {
+      await mock.applyOps([{ op: 'setBpm', bpm }]);
+      store.replaceState(await mock.getState());
+      await A.recoveryTick();
+      expect(store.S.dirty).toBe(true); // the project file was not written
+    }
+    mock.simulateCrash();
+    store.replaceState(await mock.getState());
+    await A.offerRecovery();
+    expect(recProject).toBe(file);
+    expect(store.S.project.bpm).toBe(147);
+    expect(store.S.path).toBe(file);
+    expect(store.S.dirty).toBe(true);
+    // Save writes the recovered changes to the project without asking where
+    expect(await A.projectSave(false)).toBe(true);
+    expect(store.S.path).toBe(file);
+    expect(store.S.dirty).toBe(false);
+  });
+  it('opens the demo project in SONG mode and guards unsaved edits first', async () => {
+    const pat = await import('./pattern');
+    pat.setPatMode(true);
+    await mock.applyOps([{ op: 'setBpm', bpm: 111 }]);
+    store.replaceState(await mock.getState());
+    answer = 'cancel';
+    expect(await A.projectNew(true)).toBe(false);
+    expect(store.S.project.bpm).toBe(111);
+    expect(pat.patMode()).toBe(true);
+
+    answer = 'discard';
+    expect(await A.projectNew(true)).toBe(true);
+    expect(store.S.project.bpm).toBe(136);
+    expect(store.S.path).toBeNull();
+    expect(store.S.dirty).toBe(false);
+    expect(pat.patMode()).toBe(false);
   });
 });

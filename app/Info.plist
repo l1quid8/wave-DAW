@@ -4,6 +4,6 @@
 <dict>
 	<!-- Merged into the bundle's Info.plist by Tauri. Without it macOS hands CoreAudio input silence. -->
 	<key>NSMicrophoneUsageDescription</key>
-	<string>WAVE records audio from your microphone or audio interface into your project.</string>
+	<string>Synkopa records audio from your microphone or audio interface into your project.</string>
 </dict>
 </plist>

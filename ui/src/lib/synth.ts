@@ -2,6 +2,7 @@
 // the catalog (`Catalog.synth`, served by the engine; the mock serves the generated copy in
 // api/synthCatalog.ts). Mirrors crates/engine/src/poly/params.rs.
 import { VOL_UNITY, type Channel, type Id, type ParamDef, type SynthCatalog, type SynthPreset, type SynthState } from '../api/types';
+import { tName } from './i18n';
 
 /** Every parameter definition, in panel order. */
 export const synthParams = (cat: SynthCatalog): ParamDef[] => cat.sections.flatMap(s => s.params);
@@ -43,7 +44,8 @@ export const synthRoot = (category: string | undefined) => (category === '808' |
 export function newSynthChannel(cat: SynthCatalog, id: Id, name: string | null, color = '#9b7cf8'): Channel {
   const synth = presetState(cat, name);
   return {
-    id, name: synth.preset ?? 'Synth', color, kind: 'synth', synth,
+    // named in the interface's language (a factory name is English in the engine)
+    id, name: synth.preset ? tName(synth.preset) : 'Synth', color, kind: 'synth', synth,
     vol: VOL_UNITY, pan: 0, mute: false, solo: false, insert: null, root: synthRoot(name ? synthPreset(cat, name)?.category : undefined),
   };
 }

@@ -11,7 +11,7 @@ use serde::Serialize;
 
 /// The most notes one import takes (a whole orchestral score is a few tens of thousands).
 pub const MAX_NOTES: usize = 200_000;
-/// Ticks per beat of the files WAVE writes: a 1/16 step is 240 ticks, a 1/64 triplet is exact.
+/// Ticks per beat of the files Synkopa writes: a 1/16 step is 240 ticks, a 1/64 triplet is exact.
 pub const PPQ: u16 = 960;
 /// The General MIDI drum channel (channel 10, counted from 0).
 pub const DRUM_CHANNEL: u8 = 9;
@@ -50,7 +50,7 @@ pub struct MidiFile {
     pub ppq: u16,
     /// The first tempo the file sets (none = the MIDI default of 120 is implied).
     pub bpm: Option<f64>,
-    /// Tempo changes after the first (WAVE keeps one tempo: notes stay on their beats).
+    /// Tempo changes after the first (Synkopa keeps one tempo: notes stay on their beats).
     pub tempo_changes: usize,
     pub parts: Vec<Part>,
     /// What the import cannot keep (time signatures other than 4/4, tempo changes …).
@@ -161,12 +161,12 @@ pub fn parse(bytes: &[u8]) -> Result<MidiFile, String> {
     let tempo_changes = tempos.windows(2).filter(|w| w[0].1 != w[1].1).count();
     if tempo_changes > 0 {
         warnings.push(format!(
-            "the file changes tempo {tempo_changes}×: WAVE keeps one tempo ({:.2} BPM), the notes stay on their beats",
+            "the file changes tempo {tempo_changes}×: Synkopa keeps one tempo ({:.2} BPM), the notes stay on their beats",
             bpm.unwrap_or(120.0)
         ));
     }
     if let Some(m) = odd_meter {
-        warnings.push(format!("the file is in {m}: WAVE's grid is 4/4, the notes keep their beats"));
+        warnings.push(format!("the file is in {m}: Synkopa's grid is 4/4, the notes keep their beats"));
     }
     let end = parts.iter().flat_map(|p| &p.notes).map(|n| n.start + n.len).fold(0.0, f64::max);
     Ok(MidiFile { format, ppq, bpm, tempo_changes, parts, warnings, end })
@@ -377,49 +377,49 @@ pub fn gm_name(program: u8) -> &'static str {
     GM[usize::from(program.min(127))]
 }
 
-/// What an imported part plays in WAVE.
+/// What an imported part plays in Synkopa.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum Instrument {
-    /// WAVE Keys, the sampled grand piano.
+    /// Synkopa Keys, the sampled grand piano.
     Keys,
     /// A factory synth preset.
     Synth { preset: &'static str },
 }
 
-/// The WAVE instrument closest to a General MIDI program (none = a piano part).
-/// `keys`: WAVE Keys is on this computer (otherwise pianos get a synth piano).
+/// The Synkopa instrument closest to a General MIDI program (none = a piano part).
+/// `keys`: Synkopa Keys is on this computer (otherwise pianos get a synth piano).
 pub fn instrument_for(program: Option<u8>, keys: bool) -> Instrument {
     let p = program.unwrap_or(0);
     let synth = |preset| Instrument::Synth { preset };
     match p {
         0..=3 if keys => Instrument::Keys,
-        0..=3 => synth("Klawisz Miękki"),
-        4 | 5 => synth("EP Klasyczny"),
-        6 | 7 => synth("Klawisz Miękki"),
-        11 => synth("Vibrafon"),
+        0..=3 => synth("Keys Soft"),
+        4 | 5 => synth("EP FM"),
+        6 | 7 => synth("Keys Soft"),
+        11 => synth("Vibraphone"),
         12 | 13 => synth("Marimba"),
-        8..=15 => synth("Dzwonek Ciepły"),
-        16..=23 => synth("Organy"),
-        24..=31 => synth("Pluck Ciepły"),
-        38 | 39 => synth("Bas Pluck"),
-        32..=37 => synth("Bas Analog"),
-        46 => synth("Pluck Szklany"),
-        40..=51 => synth("Smyczki"),
-        52..=54 => synth("Pad Powietrzny"),
+        8..=15 => synth("FM Bell"),
+        16..=23 => synth("Organ"),
+        24..=31 => synth("Pluck Nylon"),
+        38 | 39 => synth("Click Bass"),
+        32..=37 => synth("Warm Bass"),
+        46 => synth("Pluck Glass"),
+        40..=51 => synth("Strings"),
+        52..=54 => synth("Pad Choir"),
         55..=71 => synth("Brass"),
-        72..=79 => synth("Lead Gwizdek"),
-        81 => synth("Supersaw Lead"),
-        80..=87 => synth("Lead Ostry"),
-        88..=95 => synth("Pad Ciepły"),
-        96..=103 => synth("Pad Ruch"),
-        104..=111 => synth("Pluck Ciepły"),
-        112..=119 => synth("Dzwonek Ciepły"),
-        _ => synth("Szum Wiatru"),
+        72..=79 => synth("Flute"),
+        81 => synth("Supersaw Hymn"),
+        80..=87 => synth("Lead Creamy"),
+        88..=95 => synth("Pad Warm"),
+        96..=103 => synth("Pad Motion"),
+        104..=111 => synth("Pluck Nylon"),
+        112..=119 => synth("FM Bell"),
+        _ => synth("Wind Noise"),
     }
 }
 
-/// The program a WAVE synth preset category stands for on export (the inverse of
+/// The program a Synkopa synth preset category stands for on export (the inverse of
 /// [`instrument_for`], one program per category).
 pub fn program_for_category(category: &str) -> u8 {
     match category {
@@ -628,8 +628,8 @@ mod tests {
     #[test]
     fn instruments_and_drums_map_both_ways() {
         assert_eq!(instrument_for(None, true), Instrument::Keys);
-        assert_eq!(instrument_for(Some(0), false), Instrument::Synth { preset: "Klawisz Miękki" });
-        assert_eq!(instrument_for(Some(33), true), Instrument::Synth { preset: "Bas Analog" });
+        assert_eq!(instrument_for(Some(0), false), Instrument::Synth { preset: "Keys Soft" });
+        assert_eq!(instrument_for(Some(33), true), Instrument::Synth { preset: "Warm Bass" });
         let presets: Vec<&str> = crate::poly::presets::all().iter().map(|p| p.name).collect();
         for p in 0..=127u8 {
             if let Instrument::Synth { preset } = instrument_for(Some(p), false) {

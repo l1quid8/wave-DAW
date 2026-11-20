@@ -98,6 +98,9 @@ pub struct RecNote {
     pub vel: u8,
     pub start: f64,
     pub end: f64,
+    /// The channel it was played on when that is not the take's (the computer keyboard
+    /// plays the selected channel); `None` = the take's channel.
+    pub ch: Option<Id>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -105,6 +108,7 @@ struct Open {
     key: u8,
     vel: u8,
     start: f64,
+    ch: Option<Id>,
     /// Key released while the pedal was down: ends when the pedal comes up.
     sustained: bool,
 }
@@ -130,39 +134,48 @@ impl MidiRecorder {
     }
 
     pub fn note_on(&mut self, beat: f64, key: u8, vel: u8) {
+        self.note_on_ch(beat, key, vel, None);
+    }
+
+    /// A note played on channel `ch` (`None` = the take's channel).
+    pub fn note_on_ch(&mut self, beat: f64, key: u8, vel: u8, ch: Option<Id>) {
         if beat < self.from {
             return;
         }
         // the same key struck again ends its previous note first
-        self.close(beat, key);
-        self.open.push(Open { key, vel, start: beat, sustained: false });
+        self.close(beat, key, ch);
+        self.open.push(Open { key, vel, start: beat, ch, sustained: false });
     }
 
     pub fn note_off(&mut self, beat: f64, key: u8) {
+        self.note_off_ch(beat, key, None);
+    }
+
+    pub fn note_off_ch(&mut self, beat: f64, key: u8, ch: Option<Id>) {
         if self.pedal {
-            if let Some(o) = self.open.iter_mut().find(|o| o.key == key && !o.sustained) {
+            if let Some(o) = self.open.iter_mut().find(|o| o.key == key && o.ch == ch && !o.sustained) {
                 o.sustained = true;
             }
         } else {
-            self.close(beat, key);
+            self.close(beat, key, ch);
         }
     }
 
     pub fn sustain(&mut self, beat: f64, down: bool) {
         self.pedal = down;
         if !down {
-            let ending: Vec<u8> = self.open.iter().filter(|o| o.sustained).map(|o| o.key).collect();
-            for k in ending {
-                self.close(beat, k);
+            let ending: Vec<(u8, Option<Id>)> = self.open.iter().filter(|o| o.sustained).map(|o| (o.key, o.ch)).collect();
+            for (k, ch) in ending {
+                self.close(beat, k, ch);
             }
         }
     }
 
-    /// Closes the open note of `key`.
-    fn close(&mut self, beat: f64, key: u8) {
-        if let Some(i) = self.open.iter().position(|o| o.key == key) {
+    /// Closes the open note of `key` on `ch`.
+    fn close(&mut self, beat: f64, key: u8, ch: Option<Id>) {
+        if let Some(i) = self.open.iter().position(|o| o.key == key && o.ch == ch) {
             let o = self.open.remove(i);
-            self.done.push(RecNote { key: o.key, vel: o.vel, start: o.start, end: beat.max(o.start) });
+            self.done.push(RecNote { key: o.key, vel: o.vel, start: o.start, end: beat.max(o.start), ch: o.ch });
         }
     }
 
@@ -170,10 +183,23 @@ impl MidiRecorder {
     /// start order.
     pub fn finish(mut self, beat: f64) -> Vec<RecNote> {
         for o in std::mem::take(&mut self.open) {
-            self.done.push(RecNote { key: o.key, vel: o.vel, start: o.start, end: beat.max(o.start) });
+            self.done.push(RecNote { key: o.key, vel: o.vel, start: o.start, end: beat.max(o.start), ch: o.ch });
         }
         self.done.sort_by(|a, b| a.start.total_cmp(&b.start).then(a.key.cmp(&b.key)));
         self.done
+    }
+}
+
+/// Input quantize (FL: notes recorded with the snap on Step / Beat): each note's start moves
+/// to the nearest multiple of `grid` beats, its length kept. `grid` ≤ 0 leaves them as played.
+pub fn quantize(notes: &mut [RecNote], grid: f64) {
+    if grid <= 0.0 || !grid.is_finite() {
+        return;
+    }
+    for n in notes {
+        let s = (n.start / grid).round() * grid;
+        n.end += s - n.start;
+        n.start = s;
     }
 }
 
@@ -201,20 +227,80 @@ pub fn layout(notes: &[RecNote], ch: Id, beats_per_bar: f64) -> Option<RecordedC
     let notes = notes
         .iter()
         .map(|n| Note {
-            ch,
+            pan: 0.0,
+            ch: n.ch.unwrap_or(ch),
             step: ((n.start - start) * STEPS_PER_BEAT) as f32,
             len: (((n.end - n.start) * STEPS_PER_BEAT) as f32).max(MIN_NOTE_STEPS),
             p: Some(n.key),
             v: MidiMsg::vel_gain(n.vel),
             trig: Some(false),
+            slide: false,
         })
         .collect();
     Some(RecordedClip { start, len, notes })
 }
 
+/// Notes played over a looping pattern, their beats counted on from the loop's first pass
+/// (`la` + passes × `span`), folded back into the loop `[la, la + span)`: each lands where it
+/// was heard in the pattern; one held longer than the loop is cut to its length. For overdub
+/// recording into a pattern (FL's pattern-mode recording).
+pub fn fold_loop(notes: &[RecNote], ch: Id, la: f64, span: f64) -> Vec<Note> {
+    if span <= 0.0 {
+        return vec![];
+    }
+    notes
+        .iter()
+        .map(|n| {
+            let at = la + (n.start - la).rem_euclid(span);
+            let len = (n.end - n.start).clamp(0.0, span);
+            Note {
+                pan: 0.0,
+                ch: n.ch.unwrap_or(ch),
+                step: (at * STEPS_PER_BEAT) as f32,
+                len: ((len * STEPS_PER_BEAT) as f32).max(MIN_NOTE_STEPS),
+                p: Some(n.key),
+                v: MidiMsg::vel_gain(n.vel),
+                trig: Some(false),
+                slide: false,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn input_quantize_moves_starts_to_the_grid_and_keeps_lengths() {
+        let mut n = vec![
+            RecNote { key: 60, vel: 100, start: 1.1, end: 1.6, ch: None },
+            RecNote { key: 62, vel: 100, start: 2.13, end: 2.2, ch: Some(9) },
+        ];
+        quantize(&mut n, 0.25);
+        assert!((n[0].start - 1.0).abs() < 1e-9 && (n[0].end - 1.5).abs() < 1e-9);
+        assert!((n[1].start - 2.25).abs() < 1e-9 && (n[1].end - 2.32).abs() < 1e-9);
+        // off: as played
+        let mut m = vec![RecNote { key: 60, vel: 100, start: 1.1, end: 1.6, ch: None }];
+        quantize(&mut m, 0.0);
+        assert_eq!(m[0].start, 1.1);
+        // a note on another channel keeps it in the pattern
+        let laid = layout(&n, 5, 4.0).unwrap();
+        assert_eq!((laid.notes[0].ch, laid.notes[1].ch), (5, 9));
+    }
+
+    #[test]
+    fn notes_played_over_a_looping_pattern_fold_back_into_it() {
+        let rn = |start: f64, end: f64| RecNote { key: 60, vel: 127, start, end, ch: None };
+        // a 4-beat loop from beat 0: beat 5.5 (second pass) is beat 1.5 of the pattern; a note
+        // held over the wrap keeps its length; one longer than the loop is cut to it
+        let n = fold_loop(&[rn(1.0, 2.0), rn(5.5, 6.0), rn(3.5, 4.5), rn(0.0, 9.0)], 7, 0.0, 4.0);
+        let at: Vec<(f32, f32)> = n.iter().map(|x| (x.step, x.len)).collect();
+        assert_eq!(at, vec![(4.0, 4.0), (6.0, 2.0), (14.0, 4.0), (0.0, 16.0)]);
+        assert!(n.iter().all(|x| x.ch == 7 && x.p == Some(60) && x.trig == Some(false)));
+        // a loop range inside the pattern: beats [2, 4), the third pass's beat 6.5 is beat 2.5
+        let n = fold_loop(&[rn(6.5, 7.0)], 7, 2.0, 2.0);
+        assert_eq!(n[0].step, 10.0);
+    }
 
     #[test]
     fn parses_note_on_off() {
@@ -276,7 +362,7 @@ mod tests {
         let mut r = MidiRecorder::new(0.0);
         r.note_on(1.0, 60, 100);
         r.note_off(1.5, 60);
-        assert_eq!(r.finish(4.0), vec![RecNote { key: 60, vel: 100, start: 1.0, end: 1.5 }]);
+        assert_eq!(r.finish(4.0), vec![RecNote { key: 60, vel: 100, start: 1.0, end: 1.5, ch: None }]);
     }
 
     #[test]
@@ -284,7 +370,7 @@ mod tests {
         let mut r = MidiRecorder::new(0.0);
         r.note_on(2.0, 64, 90);
         let n = r.finish(3.25);
-        assert_eq!(n, vec![RecNote { key: 64, vel: 90, start: 2.0, end: 3.25 }]);
+        assert_eq!(n, vec![RecNote { key: 64, vel: 90, start: 2.0, end: 3.25, ch: None }]);
     }
 
     #[test]
@@ -306,8 +392,8 @@ mod tests {
         r.note_off(1.75, 62);
         r.sustain(3.0, false);
         let n = r.finish(8.0);
-        assert_eq!(n[0], RecNote { key: 60, vel: 100, start: 0.5, end: 3.0 });
-        assert_eq!(n[1], RecNote { key: 62, vel: 100, start: 1.5, end: 3.0 });
+        assert_eq!(n[0], RecNote { key: 60, vel: 100, start: 0.5, end: 3.0, ch: None });
+        assert_eq!(n[1], RecNote { key: 62, vel: 100, start: 1.5, end: 3.0, ch: None });
     }
 
     #[test]
@@ -319,7 +405,7 @@ mod tests {
         let n = r.finish(4.0);
         assert_eq!(n.len(), 2);
         assert_eq!(n[0].end, 1.0);
-        assert_eq!(n[1], RecNote { key: 60, vel: 80, start: 1.0, end: 1.5 });
+        assert_eq!(n[1], RecNote { key: 60, vel: 80, start: 1.0, end: 1.5, ch: None });
     }
 
     #[test]
@@ -333,12 +419,13 @@ mod tests {
 
     #[test]
     fn layout_snaps_to_bars_and_converts_to_steps() {
-        let notes = [RecNote { key: 60, vel: 127, start: 4.5, end: 5.0 }, RecNote { key: 64, vel: 64, start: 5.0, end: 6.25 }];
+        let notes =
+            [RecNote { key: 60, vel: 127, start: 4.5, end: 5.0, ch: None }, RecNote { key: 64, vel: 64, start: 5.0, end: 6.25, ch: None }];
         let c = layout(&notes, 7, 4.0).unwrap();
         assert_eq!(c.start, 4.0);
         assert_eq!(c.len, 4.0); // up to 6.25 → 2.25 beats in → one bar
         assert_eq!(c.notes.len(), 2);
-        assert_eq!(c.notes[0], Note { ch: 7, step: 2.0, len: 2.0, p: Some(60), v: 1.0, trig: Some(false) });
+        assert_eq!(c.notes[0], Note { ch: 7, step: 2.0, len: 2.0, p: Some(60), v: 1.0, trig: Some(false), pan: 0.0, slide: false });
         assert_eq!(c.notes[1].step, 4.0);
         assert_eq!(c.notes[1].len, 5.0);
         assert!((c.notes[1].v - 64.0 / 127.0).abs() < 1e-6);
@@ -346,7 +433,8 @@ mod tests {
 
     #[test]
     fn layout_spans_extra_bars_and_enforces_min_length() {
-        let notes = [RecNote { key: 60, vel: 100, start: 3.9, end: 3.9 }, RecNote { key: 62, vel: 100, start: 8.0, end: 9.5 }];
+        let notes =
+            [RecNote { key: 60, vel: 100, start: 3.9, end: 3.9, ch: None }, RecNote { key: 62, vel: 100, start: 8.0, end: 9.5, ch: None }];
         let c = layout(&notes, 1, 4.0).unwrap();
         assert_eq!(c.start, 0.0);
         assert_eq!(c.len, 12.0);

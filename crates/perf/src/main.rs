@@ -149,7 +149,8 @@ fn bench_all(cache: &Path, sizes: &[String], quick: bool, full_export: bool) -> 
         let _ = reparse;
         let (e2, new_ms) = time_ms(|| {
             let e2 = Engine::new(Project::routed(), Arc::new(NoPlugins));
-            e2.new_project(p.clone());
+            // a fresh engine has no recording take: this cannot fail
+            let _ = e2.new_project(p.clone());
             e2
         });
         drop(e2);
@@ -317,7 +318,7 @@ fn rt_run(e: &Arc<Engine>, block: usize, from: f64, secs: f64, tails: bool) -> V
         rt.process(&mut l, &mut r, None);
     }
     if tails {
-        e.stop();
+        let _ = e.stop();
     }
     let blocks = (secs * SR as f64 / block as f64) as usize;
     let mut times = Vec::with_capacity(blocks);
@@ -334,7 +335,7 @@ fn rt_run(e: &Arc<Engine>, block: usize, from: f64, secs: f64, tails: bool) -> V
     let period = block as f64 / SR as f64 * 1e6;
     let st = stats(times.clone());
     let silent = l.iter().chain(r.iter()).all(|x| *x == 0.0);
-    e.stop();
+    let _ = e.stop();
     drop(rt);
     json!({
         "block": block, "blocks": blocks, "block_us": st.json(), "deadline_us": r2(period),
@@ -507,7 +508,7 @@ fn bench_ops(wave: &Path, _sp: &Spec, quick: bool) -> Value {
         }),
         false,
     );
-    e.begin_gesture();
+    e.begin_gesture(None);
     let mut c = clip.clone();
     res["drag_clip_transient_ms"] = time_op(
         Box::new(move |k| {
@@ -520,7 +521,7 @@ fn bench_ops(wave: &Path, _sp: &Spec, quick: bool) -> Value {
     // a note drag in the piano roll: the whole pattern per frame (as the UI sends it), from JSON
     if let Some(big) = p.patterns.iter().max_by_key(|x| x.notes.len()).cloned() {
         res["note_drag_pattern_notes"] = json!(big.notes.len());
-        e.begin_gesture();
+        e.begin_gesture(None);
         let mut pt = big.clone();
         res["note_drag_transient_ms"] = time_op(
             Box::new(move |k| {
@@ -533,7 +534,7 @@ fn bench_ops(wave: &Path, _sp: &Spec, quick: bool) -> Value {
         );
         e.end_gesture();
     }
-    e.begin_gesture();
+    e.begin_gesture(None);
     let mut t = track.clone();
     res["fader_drag_transient_ms"] = time_op(
         Box::new(move |k| {
@@ -543,7 +544,7 @@ fn bench_ops(wave: &Path, _sp: &Spec, quick: bool) -> Value {
         true,
     );
     e.end_gesture();
-    e.begin_gesture();
+    e.begin_gesture(None);
     let mut f = comp_fx.clone();
     res["fx_param_drag_transient_ms"] = time_op(
         Box::new(move |k| {
@@ -640,7 +641,7 @@ fn bench_ops(wave: &Path, _sp: &Spec, quick: bool) -> Value {
     e.on_change(move |dto| {
         b2.fetch_add(serde_json::to_vec(dto).unwrap().len(), Ordering::Relaxed);
     });
-    e.begin_gesture();
+    e.begin_gesture(None);
     let mut t = t_vec();
     let mut tr = track.clone();
     for k in 0..n {
@@ -802,7 +803,7 @@ fn bench_rt_under_edit(wave: &Path, quick: bool) -> Value {
     let r = sim.finish();
     out["audio_thread"] = r.json();
     out["audio_thread_control_no_edits"] = ctl_res.json();
-    e.stop();
+    let _ = e.stop();
     out
 }
 
@@ -901,7 +902,7 @@ fn bench_telemetry(wave: &Path, quick: bool) -> Value {
                              "apply_fader_ms_while_housekeeping": stats(t).json() });
     }
     e.set_frame_sink(None);
-    e.stop();
+    let _ = e.stop();
     let r = sim.finish();
     res["audio_thread"] = r.json();
     res

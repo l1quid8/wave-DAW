@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { samplerDefault, TOTAL_BEATS, type Channel, type Note, type Project } from '../api/types';
+import { samplerDefault, TOTAL_BEATS, type Channel, type Note, type Project, type SamplerState } from '../api/types';
 import { applyAll } from './applyOps';
 import {
+  migrateSamplerEnvelope,
   BEAT_GAP, cellsBetween, fitCw, gridW, stepAt, stepX, contentLen, duplicateRight, fillEvery, isRollRow, isStepOn, migrateProject, moveNotes, noteAt, resizeNotes,
-  rotate, samplerError, setKeyAt, setStep, setVelAt, snapStep, swingOffset, transpose,
+  rotate, samplerError, setKeyAt, setPanAt, setShiftAt, shiftOf, MAX_SHIFT, setStep, setVelAt, snapStep, stepSpans, swingOffset, transpose,
 } from './pattern';
 
 const KICK = 1000, BASS = 1003;
@@ -65,6 +66,36 @@ describe('step sequencer', () => {
     expect(isRollRow([{ ch: BASS, step: 0, len: 1, p: 40 }], bass)).toBe(false);
     expect(isRollRow([{ ch: BASS, step: 0, len: 1, p: 40 }, { ch: BASS, step: 0, len: 1, p: 43 }], bass)).toBe(true);
     expect(isRollRow([{ ch: BASS, step: 0.5, len: 1 }], bass)).toBe(true);
+  });
+  it('the graph editor pans and shifts a step; a shifted step stays a step', () => {
+    const row: Note[] = [{ ch: KICK, step: 2, len: 1, trig: true }, { ch: KICK, step: 3, len: 1 }, { ch: BASS, step: 2, len: 1, trig: true }];
+    const panned = setPanAt(row, KICK, 2, -0.5);
+    expect(panned.map(x => x.pan)).toEqual([-0.5, undefined, undefined]);
+    expect('pan' in setPanAt(panned, KICK, 2, 0.01)[0]).toBe(false); // centre clears it
+    const shifted = setShiftAt(setShiftAt(row, KICK, 2, 0.25), KICK, 3, 5);
+    expect(shifted.map(x => x.step)).toEqual([2.25, 3 + MAX_SHIFT, 2]);
+    expect(shiftOf(shifted[0])).toBeCloseTo(0.25);
+    expect(shifted[1].trig).toBe(true); // an old unflagged step becomes a trigger
+    expect(isRollRow(shifted, { ...bass, id: KICK })).toBe(false);
+    // shifting again or back works from the cell, not from where the note sits now
+    expect(setShiftAt(shifted, KICK, 2, 0)[0].step).toBe(2);
+    expect(setShiftAt(shifted, KICK, 3, 0.5)[1].step).toBe(3.5);
+  });
+  it('keeps a step row with triplet triggers written in the Piano roll as steps', () => {
+    const trip = [12, 12 + 2 / 3, 12 + 4 / 3].map(step => ({ ch: BASS, step, len: 2 / 3, trig: true }));
+    const row = [{ ch: BASS, step: 0, len: 1, trig: true }, ...trip];
+    expect(isRollRow(row, bass)).toBe(false);
+    // two triggers at the same time are a chord: the roll
+    expect(isRollRow([...row, { ch: BASS, step: 12, len: 1, trig: true }], bass)).toBe(true);
+    // a held note among them still makes it a melody
+    expect(isRollRow([...row, { ch: BASS, step: 4, len: 1, trig: false }], bass)).toBe(true);
+    // drawn widths: a full cell, or the gap to the next trigger
+    expect(stepSpans(row).map(x => +x.toFixed(3))).toEqual([1, 0.667, 0.667, 1]);
+    // a click on a cell with off-grid triggers clears them; another click sets the step again
+    expect(isStepOn(row, BASS, 13)).toBe(true);
+    const cleared = setStep(row, BASS, 13, false);
+    expect(cleared.map(n => +n.step.toFixed(3))).toEqual([0, 12, 12.667]);
+    expect(setStep(cleared, BASS, 13, true).at(-1)).toEqual({ ch: BASS, step: 13, len: 1, trig: true });
   });
   it('sets a step key from the graph editor (the root clears it)', () => {
     const n: Note[] = [{ ch: BASS, step: 2, len: 1 }, { ch: BASS, step: 3, len: 1, p: 40 }];
@@ -181,13 +212,25 @@ describe('mock engine ops (mirror of ops.rs)', () => {
     expect(again).toEqual(p);
     expect(() => applyAll(p, [{ op: 'putPattern', pattern: { id: 5, name: 'x', color: '#fff', len: 4, notes: [{ ch: 77, step: 0, len: 1 }] } }])).toThrow();
   });
+  it('opens samplers from before the envelope switch like the engine', () => {
+    const old = (patch: object) => { const s = { ...samplerDefault(), ...patch } as SamplerState & { gate?: boolean }; delete (s as Partial<SamplerState>).env; migrateSamplerEnvelope(s); return s; };
+    // gated, or one-shot with a shape it always played: on; an untouched one-shot: off
+    expect(old({ gate: true }).env).toBe(true);
+    expect(old({ gate: false, attack: 30 }).env).toBe(true);
+    expect(old({ decay: 100, sustain: 0.2 }).env).toBe(true);
+    expect(old({ gate: false, decay: 100 })).toEqual({ ...samplerDefault(), decay: 100 });
+    // a sampler that has the switch keeps it, and the new stages get their defaults
+    const now = { ...samplerDefault(), attack: 30 } as Partial<SamplerState>;
+    delete now.hold; migrateSamplerEnvelope(now as SamplerState);
+    expect(now).toEqual({ ...samplerDefault(), attack: 30 });
+  });
   it('checks sampler settings like the engine', () => {
     const p = base(), kick = p.channels![0];
     const put = (patch: Partial<ReturnType<typeof samplerDefault>>) => applyAll(p, [{ op: 'putChannel', channel: { ...kick, sampler: { ...samplerDefault(), ...patch } } as Channel }]);
     expect(samplerError(samplerDefault())).toBeNull();
-    const ok = put({ start: 0.25, end: 0.75, reverse: true, semi: -12, fine: 50, gate: true, attack: 5, decay: 200, sustain: 0.5, release: 300, cut: 8 });
+    const ok = put({ start: 0.25, end: 0.75, reverse: true, semi: -12, fine: 50, env: true, delay: 10, attack: 5, hold: 30, decay: 200, sustain: 0.5, release: 300, attackTension: 0.5, decayTension: -1, releaseTension: 1, cut: 8 });
     expect(ok.channels![0]).toMatchObject({ kind: 'sample', sampler: { start: 0.25, cut: 8 } });
-    for (const bad of [{ start: 0.5, end: 0.5 }, { end: 1.2 }, { start: NaN }, { semi: 25 }, { semi: 1.5 }, { fine: -101 }, { attack: -1 }, { decay: 5001 }, { sustain: 1.1 }, { release: 0 }, { cut: 9 }, { cut: -1 }])
+    for (const bad of [{ start: 0.5, end: 0.5 }, { end: 1.2 }, { start: NaN }, { semi: 25 }, { semi: 1.5 }, { fine: -101 }, { attack: -1 }, { decay: 5001 }, { sustain: 1.1 }, { release: 0 }, { delay: 5001 }, { hold: -1 }, { attackTension: 1.01 }, { releaseTension: NaN }, { cut: 9 }, { cut: -1 }])
       expect(() => put(bad), JSON.stringify(bad)).toThrow();
     // a sampler needs its source
     expect(() => applyAll(p, [{ op: 'putChannel', channel: { ...kick, source: 4242 } as Channel }])).toThrow();
@@ -217,5 +260,29 @@ describe('mock engine ops (mirror of ops.rs)', () => {
     p = applyAll(p, [{ op: 'removeChannel', id: K }]);
     expect(p.patterns[0].notes).toEqual([{ ch: C, step: 4, len: 1 }]);
     expect(p.channels!.some(c => c.id === K)).toBe(false);
+  });
+});
+
+describe('triplet snap grids', () => {
+  it('snaps to thirds of a beat without float noise', async () => {
+    const { snapStep, rollSnapName, ROLL_SNAPS_TRIPLET } = await import('./pattern');
+    const u = ROLL_SNAPS_TRIPLET.find(x => x[0] === '1/24')![1]; // 16th triplet = 2/3 step
+    expect(snapStep(1.9, u)).toBe(2);
+    expect(snapStep(2.6, u)).toBe(2.666667);
+    expect(snapStep(1.3, u, true)).toBe(0.666667);
+    expect(rollSnapName(4 / 3)).toBe('1/12');
+    expect(rollSnapName(Math.fround(8 / 3))).toBe('1/6'); // as the engine (f32) returns it
+    expect(rollSnapName(3)).toBeUndefined();
+  });
+});
+
+describe('autoRollSnap', () => {
+  it('picks the finest grid whose cell is at least 24 px wide', async () => {
+    const { autoRollSnap } = await import('./pattern');
+    expect(autoRollSnap(46)).toBe(1);
+    expect(autoRollSnap(48)).toBe(0.5);
+    expect(autoRollSnap(100)).toBe(0.25);
+    expect(autoRollSnap(6)).toBe(4);
+    expect(autoRollSnap(0.5)).toBe(16);
   });
 });

@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { MockBackend } from './mock';
-import { emptyProject, FACTORY_FILES, FACTORY_KIT, libPath } from '../lib/factory';
+import { demoProject, emptyProject, FACTORY_KIT, FACTORY_LISTED_FILES, factoryFile, libPath } from '../lib/factory';
 import { migrateProject } from '../lib/pattern';
 import type { ExportProgress, ExportStemsResult } from './types';
 
@@ -11,10 +11,15 @@ describe('standard library in the mock', () => {
   it('lists the standard library first, with groups and root keys', async () => {
     const be = new MockBackend();
     const { kits } = await be.libraryList();
-    expect(kits[0]).toMatchObject({ id: FACTORY_KIT, installed: true, count: FACTORY_FILES.length });
-    const files = await be.libraryFiles({ kit: FACTORY_KIT });
-    expect(files).toHaveLength(FACTORY_FILES.length);
+    expect(kits[0]).toMatchObject({ id: FACTORY_KIT, installed: true, count: FACTORY_LISTED_FILES.length });
+    const files = (await be.libraryFiles({ kit: FACTORY_KIT })).files;
+    expect(files).toHaveLength(FACTORY_LISTED_FILES.length);
     expect(files.find(f => f.name === 'Marimba Low')).toMatchObject({ group: 'Tonal', root: 36, path: libPath('marimba-low.flac') });
+    expect(files.find(f => f.name === 'Trap Kick Rack')).toMatchObject({ group: 'Kicks', path: libPath('kick-trap-rack.flac') });
+    expect(files.find(f => f.name === '808 Zay Warm')).toMatchObject({ group: '808', root: 24, pitched: true, path: libPath('bass-808-zay.flac') });
+    const unlisted = libPath('bass-808-drive.flac');
+    expect(files.some(f => f.path === unlisted)).toBe(false);
+    expect(factoryFile(unlisted)).toMatchObject({ group: '808', name: '808 Bass Drive' });
   });
   it('keeps a library file as one source however often it is imported', async () => {
     const be = new MockBackend();
@@ -36,13 +41,48 @@ describe('standard library in the mock', () => {
     await be.importAudio({ paths: ['C:\\\\loops\\\\beat.wav'] });
     expect((await be.getState()).project.sources).toHaveLength(before + 3);
   });
-  it('starts a new project like the engine: empty, with the starter kit', async () => {
+  it('starts new projects like the engine: empty with the starter kit, or the demo project', async () => {
     const be = new MockBackend();
-    const p = (await be.projectNew()).project;
-    expect(p).toEqual(emptyProject());
-    expect(p.channels!.map(c => c.name)).toEqual(['Kick', 'Clap', 'Hat', 'Snare']);
-    // it is already what the engine would make of it
-    const q = structuredClone(p); migrateProject(q); expect(q).toEqual(p);
+    const empty = (await be.projectNew()).project;
+    expect(empty).toEqual(emptyProject());
+    expect(empty.channels!.map(c => c.name)).toEqual(['Kick', 'Clap', 'Hat', 'Snare']);
+    const demo = (await be.projectNew(true)).project;
+    expect(demo).toEqual(demoProject());
+    expect(demo.bpm).toBe(136);
+    expect(demo.sources.every(s => s.path.startsWith('lib:Standard/'))).toBe(true);
+    for (const p of [empty, demo]) { const q = structuredClone(p); migrateProject(q); expect(q).toEqual(p); }
+  });
+});
+
+describe('pattern export in the mock (#125)', () => {
+  const opts = { useLoop: false, tail: 2, sampleRate: 48000 };
+  it('renders the current pattern with an empty Playlist, over the pattern, and leaves the project as it was', async () => {
+    const be = new MockBackend();
+    await be.projectNew();
+    const st = await be.getState();
+    const [kick] = st.project.channels!;
+    const pt = st.project.patterns[0];
+    await be.applyOps([{ op: 'putPattern', pattern: { ...pt, notes: [{ ch: kick.id, step: 0, len: 1, trig: true }] } }]);
+    const before = (await be.getState()).project;
+    expect(before.clips).toEqual([]);
+    const song = await be.exportAudio({ ...opts, format: 'wav', wavBits: 32 });
+    if (song.cancelled) throw new Error('cancelled');
+    expect(song.stats.silent).toBe(true); // what the issue saw: Song of an empty Playlist
+    const r = await be.exportAudio({ ...opts, pattern: pt.id, format: 'wav', wavBits: 32 });
+    if (r.cancelled) throw new Error('cancelled');
+    expect(r.stats.silent).toBe(false);
+    expect([r.fromBeat, r.toBeat]).toEqual([0, 4]);
+    expect((await be.getState()).project).toEqual(before);
+    // the starter kit plays into its own inserts: the kick's is a stem of the pattern
+    const stems = await be.exportStems({ ...opts, pattern: pt.id, includeMaster: false });
+    if (stems.cancelled) throw new Error('cancelled');
+    expect(stems.files.map(f => f.name)).toContain('Kick');
+  });
+  it('refuses a wrapped tail or a pattern that is gone', async () => {
+    const be = new MockBackend();
+    await expect(be.exportAudio({ ...opts, pattern: 999_999, format: 'wav' })).rejects.toThrow(/no longer exists/);
+    const pt = (await be.getState()).project.patterns[0];
+    await expect(be.exportAudio({ ...opts, pattern: pt.id, format: 'wav', wrapTail: true })).rejects.toThrow(/wrap/);
   });
 });
 
@@ -168,6 +208,78 @@ describe('make unique (audio) in the mock', () => {
   });
 });
 
+// the same journey as app/src/stems_actions.rs + crates/engine/tests/stems.rs
+describe('extract stems in the mock', () => {
+  async function setup() {
+    const be = new MockBackend();
+    await be.projectNew();
+    const r = await be.importAudio({ paths: ['C:\\loops\\song (3 min).wav'], track: 1, beat: 8 });
+    const c = (await be.getState()).project.clips.find(x => x.id === r.clipIds[0])!;
+    // the clip plays 30 s..60 s of the song, stretched and transposed
+    const spb = 60 / (await be.getState()).project.bpm;
+    await be.applyOps([{ op: 'putClips', clips: [{ ...c, offset: 30 / spb * 1.5, len: 30 / spb * 1.5, stretch: 1.5, pitch: 2, gain: -3 }] }]);
+    return { be, clipId: c.id, src: r.sourceIds[0], spb };
+  }
+  it('needs the model, downloads it with progress, then places one track per stem below the clip in one undo step', async () => {
+    const { be, clipId, spb } = await setup();
+    await expect(be.extractStems(clipId, ['drums'])).rejects.toThrow(/^STEM_MODEL_MISSING:/);
+    const seen: number[] = [];
+    await be.on('model-progress', p => seen.push(p.done));
+    const m = await be.stemsModelInstall();
+    expect(m).toMatchObject({ installed: true, stems: ['drums', 'bass', 'other', 'vocals'] });
+    expect(seen.at(-1)).toBe((m as { bytes: number }).bytes);
+    const before = structuredClone((await be.getState()).project);
+    const stages: string[] = [];
+    await be.on('stems-progress', p => stages.push(p.stage));
+    const r = await be.extractStems(clipId, ['vocals', 'drums']);
+    if ('cancelled' in r) throw new Error('cancelled');
+    expect(stages[0]).toBe('prepare');
+    expect(stages).toContain('separate');
+    expect(stages.at(-1)).toBe('place');
+    const p = (await be.getState()).project;
+    expect(r.track).toBe(2);
+    expect(p.tracks.slice(2, 4).map(t => t.name)).toEqual(['song (3 min) – Drums', 'song (3 min) – Vocals']);
+    expect(p.tracks).toHaveLength(before.tracks.length + 2);
+    const src = p.clips.find(x => x.id === clipId)!;
+    expect(src.muted).toBe(true);
+    for (const [k, id] of r.clipIds.entries()) {
+      const c = p.clips.find(x => x.id === id)!;
+      // the stem file starts 3 s before the region: the clip's offset moves by that much
+      expect(c).toMatchObject({ track: 2 + k, start: src.start, len: src.len, stretch: 1.5, pitch: 2, gain: -3, muted: false });
+      expect(c.offset).toBeCloseTo(3 * 1.5 / spb, 6);
+      expect(p.sources.find(s => s.id === c.ref)!.dur).toBeCloseTo(36, 6);
+    }
+    await be.undo();
+    expect((await be.getState()).project).toEqual(before);
+  });
+  it('cancels without leaving anything, and refuses bad requests', async () => {
+    const { be, clipId } = await setup();
+    await be.stemsModelInstall();
+    const before = structuredClone((await be.getState()).project);
+    const job = be.extractStems(clipId, ['bass']);
+    await expect(be.extractStems(clipId, ['bass'])).rejects.toThrow(/already/);
+    await be.stemsCancel();
+    expect(await job).toEqual({ cancelled: true });
+    expect((await be.getState()).project).toEqual(before);
+    await expect(be.extractStems(clipId, [])).rejects.toThrow(/at least one/);
+    await expect(be.extractStems(clipId, ['piano' as never])).rejects.toThrow(/no stem called/);
+    await expect(be.extractStems(999999, ['bass'])).rejects.toThrow(/no such clip/);
+  });
+  it('places nothing when the clip is deleted while it separates', async () => {
+    const { be, clipId } = await setup();
+    await be.stemsModelInstall();
+    const job = be.extractStems(clipId, ['drums']);
+    await be.applyOps([{ op: 'removeClips', ids: [clipId] }]);
+    await expect(job).rejects.toThrow(/deleted/);
+  });
+  it('reports a failed download and stays uninstalled', async () => {
+    const be = new MockBackend();
+    be.stemsOffline = true;
+    await expect(be.stemsModelInstall()).rejects.toThrow(/download failed/);
+    expect((await be.stemsModelStatus()).installed).toBe(false);
+  });
+});
+
 describe('routing channels to inserts in the mock (like the engine)', () => {
   it('creates inserts and routes channels to them in one undo step', async () => {
     const be = new MockBackend();
@@ -218,5 +330,116 @@ describe('pattern loop in the mock (like the engine)', () => {
       await expect(be.patternLoop({ a: 0, b: Infinity })).rejects.toThrow();
       await expect(be.patternPlay(424242)).rejects.toThrow();
     } finally { clock.mockRestore(); }
+  });
+});
+
+describe('recording in the mock (like the engine)', () => {
+  const recordOneSecond = async (be: MockBackend) => {
+    await be.transportSet({ rec: true, countIn: false });
+    await be.transportPlay(0);
+    await new Promise(r => setTimeout(r, 300));
+    await be.transportStop();
+  };
+  it('records to the first free track without arming, onto a new track when none has room, and undo removes both', async () => {
+    {
+      const be = new MockBackend();
+      await be.subscribeTelemetry(() => {});
+      const p0 = (await be.getState()).project;
+      // fill every track where the take goes
+      const busy = p0.tracks.map((_, i) => ({ id: 90000 + i, track: i, start: 0, len: 64, offset: 0, kind: 'pat' as const, ref: p0.patterns[0].id, muted: false, gain: 0, fadeIn: 0, fadeOut: 0, pan: 0, norm: false, rev: false }));
+      for (const t of p0.tracks) if (t.arm) await be.applyOps([{ op: 'putTrack', track: { ...t, arm: false } }], { label: 'disarm' });
+      await be.applyOps([{ op: 'putClips', clips: busy }], { label: 'fill' });
+      const n = (await be.getState()).project.tracks.length;
+      await recordOneSecond(be);
+      const p = (await be.getState()).project;
+      expect(p.tracks).toHaveLength(n + 1);
+      expect(p.clips.find(c => c.kind === 'audio')?.track).toBe(n);
+      await be.undo();
+      const u = (await be.getState()).project;
+      expect(u.tracks).toHaveLength(n);
+      expect(u.clips.some(c => c.kind === 'audio')).toBe(false);
+    }
+  });
+  it('records nothing with Audio unticked and keeps one kind ticked', async () => {
+    const be = new MockBackend();
+    expect(await be.transportSet({ recAudio: false })).toMatchObject({ recAudio: false, recNotes: true });
+    expect(await be.transportSet({ recNotes: false })).toMatchObject({ recAudio: false, recNotes: true });
+  });
+});
+
+describe('lane heights are view state (engine.rs only_track_heights)', () => {
+  it('a vertical zoom or a lane resize adds no undo step and survives undoing an older edit', async () => {
+    const be = new MockBackend();
+    await be.projectNew(true);
+    const p0 = (await be.getState()).project, t1 = p0.tracks[1];
+    await be.applyOps([{ op: 'putTrack', track: { ...t1, muted: !t1.muted } }]);
+    await be.applyOps(p0.tracks.map(t => ({ op: 'putTrack' as const, track: { ...(t.id === t1.id ? { ...t, muted: !t1.muted } : t), h: t.h + 12 } })));
+    await be.beginGesture();
+    const t0 = (await be.getState()).project.tracks[0];
+    await be.applyOps([{ op: 'putTrack', track: { ...t0, h: 140 } }], { transient: true });
+    await be.endGesture();
+    let s = await be.getState();
+    expect(s.project.tracks[0].h).toBe(140);
+    expect(s.project.tracks[2].h).toBe(p0.tracks[2].h + 12);
+    // one undo: the mute goes back, the lanes stay
+    await be.undo();
+    s = await be.getState();
+    expect(s.project.tracks[1].muted).toBe(t1.muted);
+    expect(s.project.tracks[0].h).toBe(140);
+    expect(s.project.tracks[2].h).toBe(p0.tracks[2].h + 12);
+    expect(s.canUndo).toBe(false);
+    await be.redo();
+    s = await be.getState();
+    expect(s.project.tracks[1].muted).toBe(!t1.muted);
+    expect(s.project.tracks[0].h).toBe(140);
+  });
+  it('a height change together with another change is an ordinary edit', async () => {
+    const be = new MockBackend();
+    await be.projectNew(true);
+    const t0 = (await be.getState()).project.tracks[0];
+    await be.applyOps([{ op: 'putTrack', track: { ...t0, h: t0.h + 20, name: 'Renamed' } }]);
+    expect((await be.getState()).canUndo).toBe(true);
+    await be.undo();
+    expect((await be.getState()).project.tracks[0]).toMatchObject({ h: t0.h, name: t0.name });
+  });
+});
+
+describe('import as an undo step (engine import_audio_with)', () => {
+  it('into the audio list it is one step; loaded for an edit that follows it is none, and redo is dropped', async () => {
+    const be = new MockBackend();
+    await be.projectNew();
+    const n = (await be.getState()).project.sources.length;
+    await be.importAudio({ paths: ['C:\\loops\\a.wav'] });
+    expect((await be.getState()).canUndo).toBe(true);
+    await be.undo();
+    expect((await be.getState()).project.sources).toHaveLength(n);
+    expect((await be.getState()).canRedo).toBe(true);
+    // for a sampler channel: no step of its own, and the stale redo (a project without the source) goes
+    await be.importAudio({ paths: ['C:\\loops\\b.wav'], step: false });
+    const s = await be.getState();
+    expect(s.project.sources).toHaveLength(n + 1);
+    expect(s.canUndo).toBe(false);
+    expect(s.canRedo).toBe(false);    // the channel made from it is the step, and undoing it takes the file out too
+    const src = s.project.sources.at(-1)!.id;
+    const ch = { ...s.project.channels![0], id: s.project.nextId + 5, name: 'Drop', source: src, insert: null };
+    await be.applyOps([{ op: 'putChannel', channel: ch }]);
+    await be.undo();
+    const u = await be.getState();
+    expect(u.project.sources).toHaveLength(n);
+    expect(u.project.channels!.some(c => c.name === 'Drop')).toBe(false);
+    expect(u.canUndo).toBe(false);
+  });
+  it('a lane-height gesture reports its state when it ends, though it adds no undo step', async () => {
+    const be = new MockBackend();
+    await be.projectNew(true);
+    const states: number[] = [];
+    await be.on('state', s => states.push(s.revision));
+    const t0 = (await be.getState()).project.tracks[0];
+    await be.beginGesture();
+    await be.applyOps([{ op: 'putTrack', track: { ...t0, h: t0.h + 30 } }], { transient: true });
+    await be.endGesture();
+    await new Promise(r => setTimeout(r, 5));
+    expect(states.length).toBeGreaterThan(0);
+    expect((await be.getState()).canUndo).toBe(false);
   });
 });

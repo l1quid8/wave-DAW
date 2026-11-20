@@ -1,14 +1,17 @@
-import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from 'solid-js';
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } from 'solid-js';
+import { ICONS } from '../ui/icons';
 import { be } from '../api/backend';
 import { PLUGIN_FORMAT_LABEL, type AudioConfig, type AudioDevices, type AudioHost, type AudioStatus, type CliStatus, type MidiDevice, type PluginInfo, type PluginScan } from '../api/types';
 import * as A from '../state/actions';
-import { applyAudioConfig, audioApplyError, audioBusy, audioStatus, switchToWasapi } from '../state/audioWatch';
-import { keyName, midiFlash, midiFollow, midiStatus, selectMidiDevice, setMidiFollow, setMidiTarget } from '../state/midi';
+import { resetUnderruns, underruns } from '../state/underruns';
+import { applyAudioConfig, audioApplyError, audioBusy, audioStatus, audioTabRequested, refreshAudioStatus, switchToWasapi, takeAudioTabRequest } from '../state/audioWatch';
+import { DEFAULT_FIXED_VELOCITY, keyName, midiFlash, midiFollow, midiStatus, selectMidiDevice, setMidiFollow, setMidiTarget, setMidiVelocity } from '../state/midi';
 import { S } from '../state/store';
 import { say, setU, U } from '../state/ui';
 import { Segmented } from '../ui/Knob';
 import { prefs, resetPrefs, setPref } from '../state/prefs';
-import { setTheme, THEMES, themeMode, themeName } from '../ui/theme';
+import { setTheme, THEMES, themeMode, themeName, type ThemeDef } from '../ui/theme';
+import { mix } from '../lib/color';
 import { t } from '../lib/i18n';
 import { UpdatesSettings } from './Updates';
 import { setPluginScan } from './FxPicker';
@@ -26,11 +29,16 @@ function SettingsDialog() {
   const [devs, setDevs] = createSignal<AudioDevices>({ outputs: [], inputs: [] });
   const [cli, setCli] = createSignal<CliStatus | null>(null);
   const [err, setErr] = createSignal<string | null>(null);
+  if (takeAudioTabRequest()) lastTab = 'audio';
   const [tab, setTab] = createSignal<Tab>(lastTab);
   const pickTab = (t: Tab) => { lastTab = t; setTab(t); };
+  // "Audio settings" on a notice while Settings is already open switches it to the Audio tab
+  createEffect(() => { if (audioTabRequested() && takeAudioTabRequest()) pickTab('audio'); });
+  const cur = () => TABS.find(x => x.id === tab()) ?? TABS[0];
   const st = audioStatus;
   const busy = audioBusy;
   onMount(() => {
+    void refreshAudioStatus();
     be().audioHosts().then(setHosts).catch(e => setErr(String(e)));
     be().cliStatus().then(setCli).catch(() => {});
   });
@@ -55,18 +63,39 @@ function SettingsDialog() {
   const opt = (v: string | number | null) => v == null ? '' : String(v);
   return (
     <div class="overlay" onPointerDown={() => setU('settings', false)}>
-      <div class="dialog setdlg" onPointerDown={e => e.stopPropagation()} onKeyDown={e => { if (e.key !== 'Escape') e.stopPropagation(); }}>
-        <div class="hd"><span>{t('d.set.title')}</span><button onClick={() => setU('settings', false)}>×</button></div>
-        <div class="setbody">
-          <nav class="settabs">
-            <For each={TABS}>{([id, label]) => <button classList={{ on: tab() === id }} onClick={() => pickTab(id)}>{t(label)}</button>}</For>
-          </nav>
-          <div class="setpane">
+      <div class="dialog setdlg" role="dialog" aria-modal="true" aria-label={t('d.set.title')} onPointerDown={e => e.stopPropagation()} onKeyDown={e => { if (e.key !== 'Escape') e.stopPropagation(); }}>
+        <nav class="settabs" role="tablist" aria-orientation="vertical" onKeyDown={e => {
+          if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+          e.preventDefault();
+          const i = TABS.findIndex(x => x.id === tab()), next = TABS[(i + (e.key === 'ArrowDown' ? 1 : TABS.length - 1)) % TABS.length];
+          pickTab(next.id);
+          (e.currentTarget.querySelector(`[data-tab="${next.id}"]`) as HTMLElement | null)?.focus();
+        }}>
+          <div class="settitle"><TabIcon d={ICONS.gear} color="var(--fg3)" plain />{t('d.set.title')}</div>
+          <For each={TABS}>{x => (
+            <button role="tab" data-tab={x.id} aria-selected={tab() === x.id} tabIndex={tab() === x.id ? 0 : -1} classList={{ on: tab() === x.id }} onClick={() => pickTab(x.id)}>
+              <TabIcon d={x.icon} color={x.color} />
+              <span>{t(x.label)}</span>
+            </button>
+          )}</For>
+        </nav>
+        <div class="setmain">
+          <header class="setph">
+            <TabIcon d={cur().icon} color={cur().color} big />
+            <div class="setphtx"><h2>{t(cur().label)}</h2><p>{t(cur().desc)}</p></div>
+            <button class="setx" aria-label={t('d.upd.btn.close')} title={t('d.upd.btn.close')} onClick={() => setU('settings', false)}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18" /></svg>
+            </button>
+          </header>
+          <div class="setpane" role="tabpanel">
             <Show when={tab() === 'general'}><GeneralSection /></Show>
             <Show when={tab() === 'look'}><LookSection /></Show>
+            <Show when={tab() === 'updates'}><UpdatesSettings OnOff={OnOff} /></Show>
             <Show when={tab() === 'audio'}>
         <Show when={st()} fallback={<span class="note">{err() ?? t('d.set.loading')}</span>}>
           {s => (
+            <>
+            <div class="sechd">{t('d.set.sec.device')}</div>
             <div class="form">
               <label>{t('d.set.driver')}</label>
               <div class="row" style={{ gap: '8px' }}>
@@ -97,6 +126,9 @@ function SettingsDialog() {
                 onChange={e => apply({ inputChannel: +e.currentTarget.value })}>
                 <For each={Array.from({ length: Math.max(s().inputChannels, (s().inputChannel ?? 0) + 1) }, (_, i) => i)}>{i => <option value={String(i)}>{t('d.set.inmono', { n: i + 1 })}</option>}</For>
               </select>
+            </div>
+            <div class="sechd">{t('d.set.sec.perf')}</div>
+            <div class="form">
               <label>{t('d.set.rate')}</label>
               <select class="sel" value={opt(s().sampleRate)} disabled={busy() || serverFixed(s().host)} title={serverFixed(s().host) ? t('d.set.serverfixed') : ''} onChange={e => apply({ sampleRate: e.currentTarget.value ? +e.currentTarget.value : null })}>
                 <option value="">{t('d.set.auto')}</option>
@@ -107,6 +139,16 @@ function SettingsDialog() {
                 <option value="">{t('d.set.auto')}</option>
                 <For each={BUFFERS}>{b => <option value={String(b)}>{t('d.set.samples', { n: b })}</option>}</For>
               </select>
+              {/* FL's "Underruns" sits by the buffer length: a larger buffer is the cure */}
+              <label title={t('d.set.underruns.tip')}>{t('d.set.underruns')}</label>
+              <span class="note underruns" title={t('d.set.underruns.tip')}>
+                <span classList={{ warn: underruns() > 0 }}>{underruns() ? t('d.set.underruns.note', { n: underruns() }) : t('d.set.underruns.none')}</span>
+                <Show when={underruns() > 0}>
+                  <button class="smallbtn" onClick={resetUnderruns}>{t('d.set.underruns.reset')}</button>
+                </Show>
+              </span>
+              <label title={t('d.set.cpumeter.tip')}>{t('d.set.cpumeter')}</label>
+              <span class="note" title={t('d.set.cpumeter.tip')}><OnOff on={() => prefs().cpuMeter} set={v => setPref('cpuMeter', v)} /></span>
               <label>{t('d.set.state')}</label>
               <span class="note mono" style={{ color: s().running ? 'var(--green)' : 'var(--danger)' }}>
                 {t('d.set.statline', { state: s().running ? t('d.set.running') : t('d.set.stopped'), rate: s().actualRate, buf: s().actualBuffer, ms: s().latencyMs.toFixed(1), ch: s().inputChannels })}
@@ -122,19 +164,26 @@ function SettingsDialog() {
                 ? t('d.audio.wasapi.nooutput') : s().error}</span></Show>
               <Show when={s().note}><span /><span class="note">{s().note}</span></Show>
               <Show when={audioApplyError() ?? err()}>{error => <><span /><span class="note err">{error()}</span></>}</Show>
+            </div>
+            <div class="sechd">{t('d.set.sec.rec')}</div>
+            <div class="form">
               <label>{t('d.set.recoffset')}</label>
               <RecCalib st={s()} apply={apply} busy={busy()} />
               <Show when={s().inputUnderruns || s().inputOverruns}>
                 <label>{t('d.set.dropouts')}</label>
                 <span class="note warn">{t('d.set.dropouts.note', { n: (s().inputUnderruns ?? 0) + (s().inputOverruns ?? 0) })}</span>
               </Show>
-              <label>CLI</label>
+            </div>
+            <div class="sechd">{t('d.set.sec.cli')}</div>
+            <div class="form">
+              <label>{t('d.set.cli')}</label>
               <span class="note">
                 <Show when={cli()} fallback="—">
                   {c => <><span class="mono" style={{ color: 'var(--fg-hi)' }}>{c().command}</span> · {c().installed ? t('d.set.inpath', { path: c().path ? ' (' + c().path + ')' : '' }) : t('d.set.notinpath')}{c().note ? ' · ' + c().note : ''}</>}
                 </Show>
               </span>
             </div>
+            </>
           )}
         </Show>
             </Show>
@@ -146,9 +195,36 @@ function SettingsDialog() {
   );
 }
 
-type Tab = 'general' | 'look' | 'audio' | 'midi';
-const TABS: [Tab, TranslationKey][] = [['general', 'd.set.tab.general'], ['look', 'd.set.tab.look'], ['audio', 'd.set.tab.audio'], ['midi', 'd.set.tab.midi']];
+type Tab = 'general' | 'look' | 'audio' | 'midi' | 'updates';
+interface TabDef { id: Tab; label: TranslationKey; desc: TranslationKey; icon: string; color: string }
+const TABS: TabDef[] = [
+  { id: 'general', label: 'd.set.tab.general', desc: 'd.set.tab.general.desc', icon: 'M4 6h9 M17 6h3 M4 12h3 M11 12h9 M4 18h11 M19 18h1 M15 4v4 M9 10v4 M17 16v4', color: '#4f8ef7' },
+  { id: 'look', label: 'd.set.tab.look', desc: 'd.set.tab.look.desc', icon: 'M12 3a9 9 0 1 0 0 18c1.1 0 1.8-.8 1.8-1.8 0-.5-.2-.9-.5-1.2-.3-.3-.5-.8-.5-1.3 0-1 .8-1.8 1.8-1.8H17a4 4 0 0 0 4-4C21 6.6 17 3 12 3z M7.5 11.5h.01 M10 7.5h.01 M14.5 7.5h.01 M17 11h.01', color: '#c77ddb' },
+  { id: 'audio', label: 'd.set.tab.audio', desc: 'd.set.tab.audio.desc', icon: 'M4 9h4l5-4v14l-5-4H4z M16.5 8.5a5 5 0 0 1 0 7 M19.5 5.5a9 9 0 0 1 0 13', color: '#5fbf8a' },
+  { id: 'midi', label: 'd.set.tab.midi', desc: 'd.set.tab.midi.desc', icon: 'M3 5h18v14H3z M8 5v8 M12 5v8 M16 5v8 M3 13h18', color: '#e0a44a' },
+  { id: 'updates', label: 'd.upd.sec', desc: 'd.set.tab.updates.desc', icon: 'M20 12a8 8 0 1 1-2.35-5.65 M20 4v5h-5 M12 8v4l2.5 2.5', color: '#47b8a8' },
+];
 let lastTab: Tab = 'general';
+
+/** A tab's icon on a tile tinted with the tab's colour (`plain`: no tile). */
+function TabIcon(p: { d: string; color: string; big?: boolean; plain?: boolean }) {
+  const size = p.big ? 18 : 14;
+  return (
+    <span class="settile" classList={{ big: !!p.big, plain: !!p.plain }} style={{ color: p.color, background: p.plain ? 'transparent' : `color-mix(in srgb, ${p.color} 18%, transparent)` }}>
+      <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d={p.d} /></svg>
+    </span>
+  );
+}
+
+/** One settings row: the label with an always-visible explanation, and its control. */
+function Row(p: { label: string; desc?: string; children: JSX.Element }) {
+  return (
+    <>
+      <div class="lab"><span>{p.label}</span><Show when={p.desc}><small>{p.desc}</small></Show></div>
+      <div class="ctl">{p.children}</div>
+    </>
+  );
+}
 
 const OnOff = (p: { on: () => boolean; set: (v: boolean) => void; title?: string }) =>
   <Segmented options={[t('d.set.off'), t('d.set.on')]} value={() => (p.on() ? 1 : 0)} pick={i => p.set(i === 1)} title={p.title ?? ''} />;
@@ -162,63 +238,92 @@ function GeneralSection() {
   return (
     <>
       <div class="form">
-        <label>{t('settings.language')}</label>
-        <Segmented options={[t('settings.english'), t('settings.polish')]} value={() => prefs().lang === 'pl' ? 1 : 0}
-          pick={i => setPref('lang', i === 1 ? 'pl' : 'en')} />
+        <Row label={t('settings.language')}>
+          <Segmented options={[t('settings.english'), t('settings.polish')]} value={() => prefs().lang === 'pl' ? 1 : 0}
+            pick={i => setPref('lang', i === 1 ? 'pl' : 'en')} />
+        </Row>
       </div>
       <div class="sechd">{t('d.set.sec.project')}</div>
       <div class="form">
-        <label>{t('d.set.autosave')}</label>
-        <Segmented options={AUTOSAVE.map(m => (m ? t('d.set.min', { n: m }) : t('d.set.off')))} value={() => AUTOSAVE.indexOf(prefs().autosaveMin)}
-          pick={i => setPref('autosaveMin', AUTOSAVE[i])} title={t('d.set.autosave.tip')} />
+        <Row label={t('d.set.autosave')} desc={t('d.set.autosave.tip')}>
+          <Segmented options={AUTOSAVE.map(m => (m ? t('d.set.min', { n: m }) : t('d.set.off')))} value={() => AUTOSAVE.indexOf(prefs().autosaveMin)}
+            pick={i => setPref('autosaveMin', AUTOSAVE[i])} />
+        </Row>
+        <Row label={t('d.set.demo')} desc={t('d.set.demo.tip')}>
+          <button class="smallbtn" style={{ 'justify-self': 'start' }} disabled={U.openingProject}
+            onClick={() => void A.projectNew(true).then(ok => { if (ok) setU('settings', false); })}>{t('d.set.demo.open')}</button>
+        </Row>
       </div>
       <div class="sechd">{t('d.set.sec.edit')}</div>
       <div class="form">
-        <label>{t('d.set.audition')}</label>
-        <OnOff on={() => prefs().noteAudition} set={v => setPref('noteAudition', v)} title={t('d.set.audition.tip')} />
-        <label>{t('d.set.hints')}</label>
-        <OnOff on={() => prefs().hints} set={v => setPref('hints', v)} title={t('d.set.hints.tip')} />
+        <Row label={t('d.set.audition')} desc={t('d.set.audition.tip')}><OnOff on={() => prefs().noteAudition} set={v => setPref('noteAudition', v)} /></Row>
+        <Row label={t('d.set.hints')} desc={t('d.set.hints.tip')}><OnOff on={() => prefs().hints} set={v => setPref('hints', v)} /></Row>
       </div>
       <div class="sechd">{t('d.set.sec.rec')}</div>
       <div class="form">
-        <label>{t('d.set.metro')}</label>
-        <OnOff on={() => S.transport.metro} set={v => void A.setTransportFlag('metro', v)} />
-        <label>Count-in</label>
-        <OnOff on={() => S.transport.countIn} set={v => void A.setTransportFlag('countIn', v)} title={t('d.set.countin.tip')} />
+        <Row label={t('d.set.metro')}><OnOff on={() => S.transport.metro} set={v => void A.setTransportFlag('metro', v)} /></Row>
+        <Row label="Count-in" desc={t('d.set.countin.tip')}><OnOff on={() => S.transport.countIn} set={v => void A.setTransportFlag('countIn', v)} /></Row>
       </div>
-      <UpdatesSettings OnOff={OnOff} />
       <div class="setfoot">
+        <span class="note">{t('d.set.reset.note')}</span>
         <button class="smallbtn" onClick={() => { resetPrefs(); setTheme('dark'); say(t('d.set.reset.say')); }}>{t('d.set.reset')}</button>
       </div>
     </>
   );
 }
 
+const pickTheme = (id: string, name: string) => { setTheme(id); say(t('d.set.say.theme', { name })); };
+
+/** A theme as a miniature of the app in its own colours: toolbar, browser, playlist lanes with clips. */
+function ThemeCard(p: { th: ThemeDef }) {
+  const k = () => p.th.t;
+  return (
+    <button class="themecard" role="radio" aria-checked={themeMode() === p.th.id} classList={{ on: themeMode() === p.th.id }}
+      onClick={() => pickTheme(p.th.id, themeName(p.th))} title={themeName(p.th)}>
+      <span class="tprev" style={{ background: k().bg1, 'border-color': k().line }}>
+        <span class="tbar" style={{ background: k().bg5 }}><i style={{ background: k().blue }} /><i style={{ background: k().fg5 }} /><i style={{ background: k().fg5 }} /></span>
+        <span class="tbody">
+          <span class="tside" style={{ background: k().bg3 }}><i style={{ background: k().fg4 }} /><i style={{ background: k().fg5 }} /><i style={{ background: k().fg5 }} /></span>
+          <span class="tlanes" style={{ background: k().grid }}>
+            <i style={{ background: mix(k().blue, 55, k().clipBase), left: '6%', width: '40%' }} />
+            <i style={{ background: mix(k().green, 55, k().clipBase), left: '30%', width: '34%' }} />
+            <i style={{ background: mix(k().amber, 55, k().clipBase), left: '14%', width: '56%' }} />
+            <b style={{ background: k().playhead }} />
+          </span>
+        </span>
+      </span>
+      <span class="nm">
+        <span class="ell">{themeName(p.th)}</span>
+        <Show when={themeMode() === p.th.id}><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7" /></svg></Show>
+      </span>
+    </button>
+  );
+}
+
 function LookSection() {
+  const dark = THEMES.filter(x => !x.light), light = THEMES.filter(x => x.light);
   return (
     <>
       <div class="sechd">{t('d.set.sec.theme')}</div>
-      <div class="themegrid">
-        <For each={THEMES}>{th => (
-          <button class="themecard" classList={{ on: themeMode() === th.id }} onClick={() => { setTheme(th.id); say(t('d.set.say.theme', { name: themeName(th) })); }} title={themeName(th)}>
-            <span class="sw" style={{ background: th.swatch[0] }}>
-              <span style={{ background: th.swatch[1] }} /><span style={{ background: th.swatch[2] }} />
-            </span>
-            <span class="nm">{themeName(th)}</span>
-          </button>
-        )}</For>
-        <button class="themecard" classList={{ on: themeMode() === 'system' }} onClick={() => { setTheme('system'); say(t('d.set.say.theme.sys')); }} title={t('d.set.theme.sys.tip')}>
-          <span class="sw sys"><span /><span /></span>
-          <span class="nm">{t('d.set.theme.sys')}</span>
+      <div class="themegroup" role="radiogroup" aria-label={t('d.set.sec.theme')}>
+        <div class="tglab">{t('d.set.theme.darkgrp')}</div>
+        <div class="themegrid"><For each={dark}>{th => <ThemeCard th={th} />}</For></div>
+        <div class="tglab">{t('d.set.theme.lightgrp')}</div>
+        <div class="themegrid"><For each={light}>{th => <ThemeCard th={th} />}</For></div>
+        <button class="themesys" role="radio" aria-checked={themeMode() === 'system'} classList={{ on: themeMode() === 'system' }}
+          onClick={() => { setTheme('system'); say(t('d.set.say.theme.sys')); }}>
+          <span class="sw" />
+          <span class="systx"><b>{t('d.set.theme.sys')}</b><small>{t('d.set.theme.sys.tip')}</small></span>
         </button>
       </div>
-      <div class="sechd" style={{ 'margin-top': '14px' }}>{t('d.set.sec.ui')}</div>
+      <div class="sechd">{t('d.set.sec.ui')}</div>
       <div class="form">
-        <label>{t('d.set.scale')}</label>
-        <Segmented options={SCALES.map(z => Math.round(z * 100) + '%')} value={() => SCALES.indexOf(prefs().uiScale)}
-          pick={i => setPref('uiScale', SCALES[i])} title={t('d.set.scale.tip')} />
-        <label>{t('d.set.clipicons')}</label>
-        <OnOff on={() => prefs().clipIcons} set={v => setPref('clipIcons', v)} title={t('d.set.clipicons.tip')} />
+        <Row label={t('d.set.scale')} desc={t('d.set.scale.tip')}>
+          <Segmented options={SCALES.map(z => Math.round(z * 100) + '%')} value={() => SCALES.indexOf(prefs().uiScale)}
+            pick={i => setPref('uiScale', SCALES[i])} />
+        </Row>
+        <Row label={t('d.set.clipicons')} desc={t('d.set.clipicons.tip')}><OnOff on={() => prefs().clipIcons} set={v => setPref('clipIcons', v)} /></Row>
+        <Row label={t('d.set.fullscreen')} desc={t('d.set.fullscreen.tip')}><OnOff on={() => prefs().startFullscreen} set={v => setPref('startFullscreen', v)} /></Row>
       </div>
     </>
   );
@@ -231,6 +336,8 @@ function MidiSection() {
   onMount(refresh);
   const run = (p: Promise<void>) => { setErr(null); p.catch(e => setErr(String(e))); };
   const st = midiStatus;
+  /** The value "Fixed" comes back with after "From keyboard" (this visit). */
+  let lastFixed = st()?.fixedVelocity ?? DEFAULT_FIXED_VELOCITY;
   const pitched = () => (S.project.channels ?? []);
   const targetVal = () => (midiFollow() ? 'follow' : String(st()?.target ?? ''));
   const pickTarget = (v: string) => {
@@ -259,6 +366,24 @@ function MidiSection() {
           <option value="">{t('d.set.firstinst')}</option>
           <For each={pitched()}>{c => <option value={String(c.id)}>{c.name}</option>}</For>
         </select>
+        <label>{t('d.set.vel')}</label>
+        <div class="row" style={{ gap: '8px' }} title={t('d.set.vel.tip')}>
+          <select class="sel" style={{ flex: 1 }} value={st()?.fixedVelocity == null ? 'kbd' : 'fixed'}
+            onChange={e => run(setMidiVelocity(e.currentTarget.value === 'fixed' ? lastFixed : null))}>
+            <option value="kbd">{t('d.set.vel.kbd')}</option>
+            <option value="fixed">{t('d.set.vel.fixed')}</option>
+          </select>
+          <Show when={st()?.fixedVelocity != null}>
+            <input class="textin" type="number" min="1" max="127" step="1" style={{ width: '64px' }} value={st()!.fixedVelocity!}
+              aria-label={t('d.set.vel.fixed')}
+              onChange={e => {
+                const v = Math.round(+e.currentTarget.value);
+                if (!Number.isFinite(v)) { e.currentTarget.value = String(st()!.fixedVelocity); return; }
+                lastFixed = Math.min(127, Math.max(1, v)); e.currentTarget.value = String(lastFixed);
+                run(setMidiVelocity(lastFixed));
+              }} />
+          </Show>
+        </div>
         <label>{t('d.set.state')}</label>
         <span class="note mono row" style={{ gap: '6px' }}>
           <span class="midiled" classList={{ on: !!st()?.connected, hit: midiFlash() }} />

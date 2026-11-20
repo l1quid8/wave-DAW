@@ -8,6 +8,8 @@ import { gridW } from './pattern';
 export const RACK_FIT_STEPS = 256;
 /** Steps of the greyed bar after the pattern (a click there makes the pattern a bar longer). */
 export const RACK_EXTRA_STEPS = 16;
+/** Docked at its automatic width, the rack shows at most one bar (FL); a longer pattern scrolls (it shares the row with the Playlist). */
+export const RACK_DOCK_FIT_STEPS = 16;
 
 /**
  * The Channel Rack's width (px) for a pattern of `steps` steps: the pattern and the greyed extra
@@ -24,10 +26,11 @@ export function rackFitWidth(steps: number, o: { left: number; cw: number; pad: 
 /**
  * The docked Channel Rack's width (px) when the user has not set one: the pattern's own steps
  * (no greyed extra bar) at the compact step width `cw`, no less than `min`. Docked, the rack shares
- * the row with the Playlist, so it takes what the beat needs and the grid scrolls for longer ones.
+ * the row with the Playlist, so it takes what the beat needs, up to `RACK_DOCK_FIT_STEPS` (a 4-bar
+ * pattern took over 1000 px and left the Playlist at its minimum); the grid scrolls for longer ones.
  */
 export function rackDockFitWidth(steps: number, o: { left: number; cw: number; pad: number; min: number }): number {
-  return Math.round(Math.max(o.min, o.left + gridW(Math.min(Math.max(steps, 1), RACK_FIT_STEPS), o.cw) + o.pad));
+  return Math.round(Math.max(o.min, o.left + gridW(Math.min(Math.max(steps, 1), RACK_DOCK_FIT_STEPS), o.cw) + o.pad));
 }
 
 /**

@@ -4,12 +4,14 @@
 mod ab;
 mod agent;
 mod agent_vocalset;
+mod basic_pitch;
 mod cases;
 mod eval;
 mod gtsinger;
 mod listen;
 mod medley;
 mod synth;
+mod transcribe;
 mod vocalset;
 
 use std::path::{Path, PathBuf};
@@ -36,7 +38,8 @@ const HELP: &str = "tune-bench — Tune to Reference benchmarks
                                                          blind 3-way kit: original / tune-ref / agent
   tune-bench listen-score --kit DIR --ratings ratings.csv
   agent options: --max-cents 60 --min-cents 15 (planner limits), --no-tune-ref (skip the comparison),
-                 --dump DIR (each case's take/reference/output WAV and the planner's decisions)
+                 --dump DIR (each case's take/reference/output WAV and the planner's decisions),
+                 --only TEXT (only the cases whose name contains it)
 
 common: --rmvpe model.onnx | --yin   (default: the installed RMVPE model, else YIN)
         --correction --vibrato --influence 0..100   --json report.json
@@ -246,7 +249,7 @@ fn run(cmd: &str, a: &Args) -> Result<bool, String> {
                 methods.push(agent::Method::TuneRef(p.clone()));
             }
             let mut os: Vec<agent::Outcome> = vec![];
-            for c in &cases {
+            for c in cases.iter().filter(|c| a.get("only").is_none_or(|o| c.name.contains(o))) {
                 let mut ms = methods.clone();
                 // the large controlled errors also with the limit raised, as an agent that knows the take is far off would
                 if c.group.contains("large") {
@@ -318,6 +321,160 @@ fn run(cmd: &str, a: &Args) -> Result<bool, String> {
                 std::fs::write(p, &text).map_err(|e| format!("{p}: {e}"))?;
             }
             println!("{text}");
+            Ok(true)
+        }
+        "transcribe-grid" => {
+            use wave_engine::note_track::{track, TrackParams};
+            use wave_engine::pitch::PitchAnalysis;
+            let model = estimator(a)?;
+            let est = model.as_ref().map(|m| m as &dyn F0Estimator);
+            let bpm = a.num("bpm", 120.0)?;
+            let mut cache =
+                transcribe::cache_vocalset(Path::new(a.get("root").ok_or("--root is required")?), a.num("limit", 400.0)? as usize, est)?;
+            if let Some(g) = a.get("gtsinger") {
+                cache.extend(transcribe::cache_gtsinger(Path::new(g), a.num("glimit", 200.0)? as usize, est)?);
+            }
+            let list = |k: &str, d: &[f32]| -> Vec<f32> {
+                a.get(k).map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_else(|| d.to_vec())
+            };
+            let blobs = |v: Vec<wave_engine::pitch::NoteBlob>| -> Vec<transcribe::N> {
+                v.into_iter().map(|n| transcribe::N { on: n.start, off: n.end, p: n.pitch }).collect()
+            };
+            let previous = |an: &PitchAnalysis| blobs(wave_engine::pitch::segment(&an.curve, &an.levels));
+            let with = |p: TrackParams| move |an: &PitchAnalysis| blobs(track(&an.curve, &an.levels, &an.onsets, an.rate, &p));
+            // equal weight to the exercises (VocalSet, legato onsets at the transition's middle)
+            // and the songs (GTSinger plain singing): mean of their COnP F1 on the tuning singers
+            let vs_train = |c: &transcribe::Cached| c.set == "vocalset" && !c.held_out;
+            let gt_train = |c: &transcribe::Cached| c.set == "gtsinger" && !c.held_out;
+            let d = TrackParams::default();
+            // stage 1: the note sequence; stage 2: glides and repeated notes on top of the best
+            let mut sets = vec![];
+            for sigma in list("sigmas", &[d.sigma]) {
+                for switch in list("switches", &[d.switch]) {
+                    for smooth in list("smooths", &[d.smooth]) {
+                        for glide in list("glides", &[d.glide]) {
+                            for min_note in list("mins", &[d.min_note]) {
+                                sets.push(TrackParams { sigma, switch, smooth, glide, min_note, ..d });
+                            }
+                        }
+                    }
+                }
+            }
+            let maximin = a.has("maximin");
+            let rank = |sets: Vec<TrackParams>| -> Vec<(f64, TrackParams, f64, f64)> {
+                let mut r: Vec<(f64, TrackParams, f64, f64)> = sets
+                    .into_iter()
+                    .map(|p| {
+                        let a = transcribe::score(&cache, vs_train, &with(p), bpm, true).0;
+                        let b = transcribe::score(&cache, gt_train, &with(p), bpm, false).0;
+                        let (x, y) = (a.f1_of(a.on_p), b.f1_of(b.on_p));
+                        // maximin: neither the exercises nor the songs are traded away
+                        (if maximin { x.min(y) } else { (x + y) / 2.0 }, p, x, y)
+                    })
+                    .collect();
+                r.sort_by(|x, y| y.0.total_cmp(&x.0));
+                r
+            };
+            let r1 = rank(sets);
+            for (f, p, x, y) in r1.iter().take(6) {
+                eprintln!("stage 1 train {f:.3} (vocalset {x:.3}, gtsinger {y:.3})  {p:?}");
+            }
+            let b = r1[0].1;
+            let mut sets = vec![];
+            for onset_z in list("onsets", &[d.onset_z]) {
+                for dip_db in list("dips", &[d.dip_db]) {
+                    for glide_note in list("glide-notes", &[d.glide_note]) {
+                        for steady in list("steadies", &[d.steady]) {
+                            for arrive in list("arrives", &[d.arrive]) {
+                                for snap_z in list("snaps", &[d.snap_z]) {
+                                    sets.push(TrackParams { onset_z, dip_db, glide_note, steady, arrive, snap_z, ..b });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let r2 = rank(sets);
+            for (f, p, x, y) in r2.iter().take(6) {
+                eprintln!("stage 2 train {f:.3} (vocalset {x:.3}, gtsinger {y:.3})  {p:?}");
+            }
+            let best = r2[0].1;
+            eprintln!("best {best:?}");
+            let groups: [(&str, transcribe::Pick, bool); 7] = [
+                ("vocalset train mid", &|c: &transcribe::Cached| c.set == "vocalset" && !c.held_out, true),
+                ("vocalset test mid", &|c: &transcribe::Cached| c.set == "vocalset" && c.held_out, true),
+                ("vocalset train settled", &|c: &transcribe::Cached| c.set == "vocalset" && !c.held_out, false),
+                ("vocalset test settled", &|c: &transcribe::Cached| c.set == "vocalset" && c.held_out, false),
+                ("gtsinger control train", &|c: &transcribe::Cached| c.set == "gtsinger" && !c.held_out, false),
+                ("gtsinger control test", &|c: &transcribe::Cached| c.set == "gtsinger" && c.held_out, false),
+                ("gtsinger technique", &|c: &transcribe::Cached| c.set == "gtsinger-technique", false),
+            ];
+            let tuned = with(best);
+            let default = with(d);
+            let methods: [(&str, transcribe::FromAnalysis); 3] = [("previous", &previous), ("default", &default), ("tuned", &tuned)];
+            let mut out = serde_json::Map::new();
+            for (g, pick, mid) in groups {
+                for (name, f) in methods {
+                    let (n, r) = transcribe::score(&cache, pick, f, bpm, mid);
+                    println!("{g:22} {name:8} pasted    {}", n.line());
+                    println!("{g:22} {name:8} grid1/16  {}", r.line());
+                    out.insert(format!("{g}/{name}"), json!({ "pasted": n.json(), "grid16": r.json() }));
+                }
+            }
+            out.insert("tuned".into(), json!(format!("{best:?}")));
+            out.insert("default".into(), json!(format!("{d:?}")));
+            if let Some(p) = a.get("json") {
+                std::fs::write(p, serde_json::to_string_pretty(&out).unwrap_or_default()).map_err(|e| format!("{p}: {e}"))?;
+            }
+            if let Some(dir) = a.get("dump") {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                let pts = |v: &[transcribe::N]| v.iter().map(|n| [n.on, n.off, n.p as f64]).collect::<Vec<_>>();
+                let all: Vec<Value> = cache
+                    .iter()
+                    .map(|c| {
+                        json!({ "name": c.name, "set": c.set, "gt": pts(&c.gt), "current": pts(&previous(&c.an)), "tracker": pts(&default(&c.an)),
+                                "curve": c.an.curve.iter().map(|x| if x.is_finite() { (*x * 100.0).round() / 100.0 } else { 0.0 }).collect::<Vec<_>>() })
+                    })
+                    .collect();
+                std::fs::write(Path::new(dir).join("all.json"), serde_json::to_string(&all).unwrap_or_default())
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(true)
+        }
+        "transcribe" => {
+            let model = estimator(a)?;
+            let est = model.as_ref().map(|m| m as &dyn F0Estimator);
+            let root = a.get("root").ok_or("--root is required")?;
+            let current = |an: &wave_engine::pitch::PitchAnalysis, _: &[f32], _: f32| -> Vec<transcribe::N> {
+                an.notes.iter().map(|n| transcribe::N { on: n.start, off: n.end, p: n.pitch }).collect()
+            };
+            let mut methods: Vec<transcribe::Transcriber> = vec![("current", &current)];
+            let bp = a.get("basic-pitch").map(|p| basic_pitch::Worker::spawn(Path::new(p))).transpose()?;
+            let bp_notes = |x: &[f32], sr: f32| bp.as_ref().map(|m| m.notes(x, sr).expect("Basic Pitch")).unwrap_or_default();
+            let bp_poly = |_: &wave_engine::pitch::PitchAnalysis, x: &[f32], sr: f32| basic_pitch::to_n(&bp_notes(x, sr));
+            let bp_mono =
+                |_: &wave_engine::pitch::PitchAnalysis, x: &[f32], sr: f32| basic_pitch::to_n(&basic_pitch::monophonic(&bp_notes(x, sr)));
+            if bp.is_some() {
+                methods.push(("basic-pitch", &bp_poly));
+                methods.push(("basic-pitch-mono", &bp_mono));
+            }
+            let v = transcribe::run(
+                Path::new(root),
+                a.num("limit", 60.0)? as usize,
+                est,
+                &methods,
+                a.num("bpm", 120.0)?,
+                a.get("dump").map(Path::new),
+            )?;
+            let text = serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?;
+            if let Some(p) = a.get("json") {
+                std::fs::write(p, &text).map_err(|e| format!("{p}: {e}"))?;
+            }
+            println!("{text}");
+            Ok(true)
+        }
+        "basic-pitch-worker" => {
+            basic_pitch::serve(Path::new(a.get("model").ok_or("--model is required")?))?;
             Ok(true)
         }
         "listen" => {

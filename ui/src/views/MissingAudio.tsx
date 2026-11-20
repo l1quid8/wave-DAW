@@ -88,7 +88,7 @@ export function MissingAudio() {
   return (
     <Show when={U.missingOpen}>
       <div class="overlay" onPointerDown={close}>
-        <div class="dialog missdlg" role="dialog" aria-modal="true" aria-label={t('d.miss.title', { n: rows().length })} onPointerDown={e => e.stopPropagation()} data-missing-dialog>
+        <div class="dialog missdlg" role="dialog" aria-modal="true" aria-label={t('d.miss.title', { n: rows().length })} onPointerDown={e => e.stopPropagation()} onKeyDown={e => { if (e.key !== 'Escape') e.stopPropagation(); }} data-missing-dialog>
           <div class="hd">
             <span>{rows().length ? t('d.miss.title', { n: rows().length }) : t('d.miss.titleDone')}</span>
             <button onClick={close} aria-label={t('d.miss.close')}>×</button>

@@ -1,7 +1,7 @@
 //! The agent workflow, end to end, on real recordings: analyse the take, optionally compare it
 //! with a reference, let the conservative planner (`pitch_api::suggest`) decide, apply its edit
 //! with the `editTune` op's own code (`tune_edit::apply`) and render with the pitch editor's
-//! renderer — the same functions `wave pitch inspect|compare|suggest|edit|render` run. The
+//! renderer — the same functions `synkopa pitch inspect|compare|suggest|edit|render` run. The
 //! rendered audio is analysed again and scored against independent truth where a dataset has
 //! it. Existing Tune to Reference runs on the same cases for comparison.
 
@@ -195,9 +195,11 @@ fn median(mut v: Vec<f32>) -> Option<f32> {
     Some(v[v.len() / 2])
 }
 
-/// Onsets (seconds) of the notes of an analysis.
+/// Onsets (seconds) of an analysis' pitch steps, by the plain splitter: whether the render kept
+/// the timing should not depend on how the editor decides notes (the note tracker cuts a legato
+/// change along its glide, and a corrected note changes the glide).
 fn onsets(a: &PitchAnalysis) -> Vec<f64> {
-    a.notes.iter().map(|n| n.start).collect()
+    wave_engine::pitch::segment(&a.curve, &a.levels).iter().map(|n| n.start).collect()
 }
 
 /// Writes a case's audio and the planner's decisions under `dir` (`--dump`), for listening and
@@ -477,7 +479,7 @@ pub fn outcome_json(o: &Outcome) -> Value {
     json!({
         "name": o.name, "group": o.group, "method": o.method, "failed": o.failed,
         "related": o.related, "expectRelated": o.expect_related, "interval": o.interval, "expectInterval": o.expect_interval,
-        "untouched": o.untouched,
+        "untouched": o.untouched, "octaveErrors": o.octave_errors,
         "frameMedianBefore": quantile(&o.frames_before, 0.5), "frameMedian": quantile(&o.frames_after, 0.5),
         "slipMaeBefore": mean(&o.slip_before.iter().map(|x| x.abs()).collect::<Vec<_>>()), "slipMae": mean(&o.slip_after.iter().map(|x| x.abs()).collect::<Vec<_>>()),
         "inTuneMoved": o.in_tune_change.iter().filter(|x| **x > 15.0).count(), "inTune": o.in_tune_change.len(),

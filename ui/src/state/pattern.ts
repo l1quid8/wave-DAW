@@ -2,11 +2,14 @@
 // windows, pattern and channel edits, auditions and the pattern loop preview.
 // Every edit is an op (putPattern / putChannel / removeChannel) and one undo step.
 import { createEffect, createRoot, createSignal, on } from 'solid-js';
+import { inFilter, liveFilter, type RackFilter } from '../lib/rackGroups';
+import { topFloating } from './winOrder';
 import { t, tName } from '../lib/i18n';
 import { newSynthChannel } from '../lib/synth';
+import { nextChannelColor } from '../lib/color';
 import { prefs } from './prefs';
 import { be } from '../api/backend';
-import { KEYS_DYNAMICS, KEYS_RELEASE, SAMPLE_ROOT, samplerDefault, TOTAL_BEATS, VOL_UNITY, type Channel, type Id, type LibFile, type Note, type Op, type Pattern } from '../api/types';
+import { KEYS_DYNAMICS, KEYS_RELEASE, SAMPLE_ROOT, samplerDefault, TOTAL_BEATS, VOL_UNITY, type Channel, type Id, type LibFile, type Note, type Op, type Pattern, type PluginInfo } from '../api/types';
 import { baseName, clamp, mod } from '../lib/format';
 import { BAR, barsText, cloneNotes, notesText, stepsOf } from '../lib/pattern';
 import { fitOnScreen, rackFitWidth } from '../lib/rack';
@@ -18,7 +21,9 @@ import { unwrap } from 'solid-js/store';
 import { allocId, plain, plainNotes, S } from './store';
 import { curBeat, tele } from './telemetry';
 import { loopSpan, type BeatRange } from '../lib/patLoop';
-import { say, setU, U } from './ui';
+import { docked, say, setU, tucked, U } from './ui';
+import { warnIfNoAudio } from './audioWatch';
+import { markPlayCmd } from './telemetry';
 import { leaveMixView } from './mixView';
 import { planRoute, rangeSelect, toggleSelect } from '../lib/mixer';
 
@@ -26,8 +31,9 @@ import { planRoute, rangeSelect, toggleSelect } from '../lib/mixer';
 export const RACK_LEFT = 212, RACK_HEAD = 34, RACK_ROW = 32;
 /** Frame around the step grid (px): left of the first step and right of the last; above and below the rows. */
 export const RACK_PAD_X = 10, RACK_PAD_Y = 8;
-/** Step button width in the Channel Rack (px): compact like FL's, wider only when the window has room. */
-export const STEP_MIN = 16, STEP_MAX = 24;
+/** Step button width in the Channel Rack (px). Fixed: resizing the window shows more or fewer
+ *  steps (the grid scrolls) instead of stretching or squeezing them. */
+export const STEP_W = 20;
 /** The Channel Rack window's narrowest width (px). */
 export const RACK_MIN_W = 480;
 
@@ -51,7 +57,7 @@ export function setCurPattern(id: Id, quiet = false) {
   const pt = patById(id); if (!pt) return;
   // keep the selected channel; with none yet, the first one this pattern plays
   const selCh = chanById(U.selCh) ? U.selCh : channels().find(c => pt.notes.some(n => n.ch === c.id))?.id ?? channels()[0]?.id ?? null;
-  setU({ pat: id, selCh, cur: { kind: 'pat', ref: id } });
+  setU({ pat: id, selCh, cur: { kind: 'pat', ref: id, clipId: null } });
   if (!quiet) say(t('b.st.curPat', { n: S.project.patterns.indexOf(pt) + 1, name: pt.name }));
 }
 createRoot(() => {
@@ -60,47 +66,56 @@ createRoot(() => {
   // PAT mode keeps looping the current pattern when it changes (FL)
   createEffect(on(() => curPat()?.id, id => { if (id != null && U.patPlaying && previewId !== id) void togglePreview(id); }, { defer: true }));
 });
+/**
+ * After the user switched patterns: a pattern that changed with no pattern window open would be
+ * invisible (and a closed rack is hard to find), so the Channel Rack shows it. An open Piano roll
+ * or rack already follows the current pattern; the Mix view is left alone.
+ */
+export function showPatternWindow() {
+  if (!U.rackWin && !U.rollWin && !U.mixView) openRack();
+}
 /** Numpad + / −: the next / previous pattern (wraps). */
 export function stepPattern(d: number) {
   const ps = S.project.patterns; if (!ps.length) return;
   const i = Math.max(0, ps.findIndex(p => p.id === curPat()?.id));
   setCurPattern(ps[mod(i + d, ps.length)].id);
+  showPatternWindow();
 }
 /** Numpad 1–9: the n-th pattern (1-based). */
 export function pickPatternNum(n: number) {
   const pt = S.project.patterns[n - 1];
-  if (pt) setCurPattern(pt.id); else say(t('b.st.noPatN', { n }));
+  if (!pt) { say(t('b.st.noPatN', { n })); return; }
+  setCurPattern(pt.id);
+  showPatternWindow();
 }
 /** F4: the first empty pattern after the current one, or a new one (FL "next empty pattern"). */
 export function nextEmptyPattern() {
   const ps = S.project.patterns, i = ps.findIndex(p => p.id === curPat()?.id);
   const empty = [...ps.slice(i + 1), ...ps.slice(0, Math.max(0, i))].find(p => !p.notes.length);
   if (empty) setCurPattern(empty.id); else newPattern();
+  showPatternWindow();
 }
 
 // ---------------------------------------------------------------- windows
 
 type WinKey = 'rackWin' | 'rollWin';
-const dockOf = (k: WinKey) => (k === 'rackWin' ? U.rackDock : U.rollDock);
+const dockOf = (k: WinKey) => docked(k === 'rackWin' ? 'rack' : 'roll');
 /** The Channel Rack / Piano roll is open as a floating window (not docked): it counts among the window layer's windows. */
-export const rackFloating = () => !!U.rackWin && !U.rackDock;
-export const rollFloating = () => !!U.rollWin && !U.rollDock;
+export const rackFloating = () => !!U.rackWin && !docked('rack');
+export const rollFloating = () => !!U.rollWin && !docked('roll');
 /** Bring a pattern window to the front of the window layer (showing the layer if it was tucked away). A docked panel has no front. */
 function front(k: WinKey) {
   const w = U[k]; if (!w || dockOf(k)) return;
-  if (U.plugsHidden) setU('plugsHidden', false);
-  if (w.z === U.zTop) return;
+  if (w.z === U.zTop && !tucked(w.z)) return;
   const z = U.zTop + 1;
   setU('zTop', z); setU(k, 'z', z);
 }
 export const rackFront = () => front('rackWin');
 export const rollFront = () => front('rollWin');
 /** The window is open and visible on top of every other floating window. */
+/** The floating pattern window is the one in front of every floating window (F6 / F7 then hide it). */
 function onTop(k: WinKey) {
-  const w = U[k];
-  if (!w || U.plugsHidden || dockOf(k)) return false;
-  const ok: WinKey = k === 'rackWin' ? 'rollWin' : 'rackWin', other = dockOf(ok) ? null : U[ok];
-  return U.plugs.every(p => p.z < w.z) && (!other || other.z < w.z);
+  return !!U[k] && !dockOf(k) && topFloating()?.kind === (k === 'rackWin' ? 'rack' : 'roll');
 }
 const SEL: Record<WinKey, string> = { rackWin: '.rackwin', rollWin: '.rollwin' };
 /** The pattern window (floating or docked) has the keyboard. */
@@ -112,14 +127,14 @@ const focusSoon = (k: WinKey) => requestAnimationFrame(() => (document.querySele
  * The Channel Rack's width for a pattern of `steps` steps at window position `x`: the pattern and
  * its greyed extra bar at the comfortable step width, up to ~4 bars and the screen's right edge.
  */
-export const rackWidthFor = (steps: number, x: number) => rackFitWidth(steps, { left: RACK_LEFT, cw: STEP_MAX, pad: 2 * RACK_PAD_X + 2, min: RACK_MIN_W, room: window.innerWidth - x - 10 });
+export const rackWidthFor = (steps: number, x: number) => rackFitWidth(steps, { left: RACK_LEFT, cw: STEP_W, pad: 2 * RACK_PAD_X + 2, min: RACK_MIN_W, room: window.innerWidth - x - 10 });
 /** The rack's place and width for `steps` steps: as wide as the pattern needs, sliding left before it would scroll (the screen is the only limit). */
 export const rackPlaceFor = (steps: number, x: number) => fitOnScreen(x, rackWidthFor(steps, 10), window.innerWidth);
 /** F6: open the Channel Rack (or bring it to the front). */
 export function openRack() {
   leaveMixView(); // the pattern windows live in the arrange layout
   if (!S.project.patterns.length) { say(t('b.st.noPatterns')); return; }
-  if (U.rackDock) focusSoon('rackWin');
+  if (docked('rack')) focusSoon('rackWin');
   if (U.rackWin) { rackFront(); return; }
   const pt = curPat()!, rows = Math.max(4, channels().length + 1);
   const w = rackWidthFor(stepsOf(pt), 30);
@@ -133,7 +148,7 @@ export function openRack() {
   // as wide as when it was closed if that is wider (patterns browsed before), like FL
   const fit = rackPlaceFor(stepsOf(pt), x), pl = g && g.w > fit.w ? fitOnScreen(x, g.w, window.innerWidth) : fit;
   // a docked rack keeps the floating place for when it floats again; opening it docked does not show the window layer
-  setU({ zTop: z, rackWin: { x: pl.x, y, w: pl.w, h, z }, ...(U.rackDock ? {} : { plugsHidden: false }) });
+  setU({ zTop: z, rackWin: { x: pl.x, y, w: pl.w, h, z } });
 }
 /** Close the Channel Rack; it reopens where it was (`rackFloat`: kept across restarts). */
 export function closeRack() { const w = U.rackWin; if (w) setU('rackFloat', { x: w.x, y: w.y, w: w.w, h: w.h }); setU('rackWin', null); }
@@ -144,20 +159,16 @@ function dockKey(k: WinKey, open: () => void, close: () => void) {
 }
 export function toggleRack() {
   if (leaveMixView()) return openRack(); // F6 in the Mix view: back to arrange, rack shown
-  if (U.rackDock) return dockKey('rackWin', openRack, closeRack);
+  if (docked('rack')) return dockKey('rackWin', openRack, closeRack);
   if (onTop('rackWin')) closeRack(); else openRack();
 }
 /** View menu: show / hide the Channel Rack (the check mark is whether it is open). */
-export function toggleRackShown() { if (leaveMixView()) return openRack(); if (U.rackDock) { if (U.rackWin) closeRack(); else openRack(); } else toggleRack(); }
-/** Dock the Channel Rack left of the Playlist (showing it), or float it as a window again. */
-export function setRackDock(on: boolean) {
-  leaveMixView();
-  if (U.rackDock === on) { if (on && !U.rackWin) openRack(); return; }
-  setU('rackDock', on);
-  say(t(on ? 'b.dk.rackDocked' : 'b.dk.rackFloats'));
-  // after the message: opening can say why it cannot (no pattern, no channel)
-  if (on) openRack();
-  else if (U.rackWin) { keepOnScreen(); rackFront(); focusSoon('rackWin'); }
+export function toggleRackShown() { if (leaveMixView()) return openRack(); if (docked('rack')) { if (U.rackWin) closeRack(); else openRack(); } else toggleRack(); }
+/** A pattern panel that was docked floats again: kept on screen, in front, with the keyboard. */
+export function patWinFloated(which: 'rack' | 'roll') {
+  const k: WinKey = which === 'rack' ? 'rackWin' : 'rollWin';
+  if (!U[k]) return;
+  keepOnScreen(); front(k); focusSoon(k);
 }
 
 /** F7: open the Piano roll on `ch` (default: the selected channel), or bring it to the front. */
@@ -170,16 +181,14 @@ export function openRoll(ch?: Id) {
   focusSoon('rollWin');
   if (U.rollWin) { rollFront(); return; }
   const z = U.zTop + 1, g = U.rollFloat, W = window.innerWidth, H = window.innerHeight;
-  // docked: the floating place is only kept for later, the window layer stays as it is
-  const shown = U.rollDock ? {} : { plugsHidden: false };
   // full screen by default, like FL's piano roll (a melody needs the room; the Channel Rack stays
   // one F6 away). A window the user made smaller reopens where they left it.
   if (g && !U.rollMax) {
     const w = clamp(g.w, 640, Math.max(640, W - 20)), h = clamp(g.h, 360, Math.max(360, H - 20));
-    setU({ zTop: z, ...shown, rollWin: { x: clamp(g.x, 0, Math.max(0, W - 120)), y: clamp(g.y, 0, Math.max(0, H - 80)), w, h, z } });
+    setU({ zTop: z, rollWin: { x: clamp(g.x, 0, Math.max(0, W - 120)), y: clamp(g.y, 0, Math.max(0, H - 80)), w, h, z } });
     return;
   }
-  setU({ zTop: z, ...shown, rollMax: true, rollWin: { ...fullArea(), z } });
+  setU({ zTop: z, rollMax: true, rollWin: { ...fullArea(), z } });
 }
 /** Everything under the toolbar: where the maximised Piano roll goes (it covers the browser and the mixer too). */
 function fullArea() {
@@ -190,7 +199,7 @@ function fullArea() {
 let rollRestore: { x: number; y: number; w: number; h: number } | null = null;
 /** Double-click on the floating Piano roll's title bar: go back to the size before, or fill the screen again. Docked, it has no such size. */
 export function toggleRollMax() {
-  const w = U.rollWin; if (!w || U.rollDock) return;
+  const w = U.rollWin; if (!w || docked('roll')) return;
   if (!U.rollMax) { rollRestore = { x: w.x, y: w.y, w: w.w, h: w.h }; setU('rollMax', true); setU('rollWin', v => v && { ...v, ...fullArea() }); return; }
   const W = window.innerWidth, H = window.innerHeight;
   const b = rollRestore ?? { w: clamp(Math.round(W * 0.62), 640, W - 40), h: clamp(Math.round(H * 0.58), 360, H - 100), x: Math.round(W * 0.19), y: 96 };
@@ -203,27 +212,12 @@ export function rollMoved() { if (U.rollMax) setU('rollMax', false); }
 export function closeRoll() { const w = U.rollWin; if (w) setU('rollFloat', { x: w.x, y: w.y, w: w.w, h: w.h }); setU('rollWin', null); }
 export function toggleRoll() {
   if (leaveMixView()) return openRoll();
-  if (U.rollDock) return dockKey('rollWin', () => openRoll(), closeRoll);
+  if (docked('roll')) return dockKey('rollWin', () => openRoll(), closeRoll);
   if (onTop('rollWin')) closeRoll(); else openRoll();
 }
 /** View menu: show / hide the Piano roll (the check mark is whether it is open). */
-export function toggleRollShown() { if (leaveMixView()) return openRoll(); if (U.rollDock) { if (U.rollWin) closeRoll(); else openRoll(); } else toggleRoll(); }
-/** Dock the Piano roll under the Playlist (showing it), or float it as a window again. */
-export function setRollDock(on: boolean) {
-  leaveMixView();
-  if (U.rollDock === on) { if (on && !U.rollWin) openRoll(); return; }
-  setU('rollDock', on);
-  say(t(on ? 'b.dk.rollDocked' : 'b.dk.rollFloats'));
-  // after the message: opening can say why it cannot (no pattern, no channel)
-  if (on) openRoll();
-  else if (U.rollWin) { keepOnScreen(); rollFront(); focusSoon('rollWin'); }
-}
+export function toggleRollShown() { if (leaveMixView()) return openRoll(); if (docked('roll')) { if (U.rollWin) closeRoll(); else openRoll(); } else toggleRoll(); }
 /** Escape: close the top floating pattern window when it is above every effect window (never a docked panel). True when one closed. */
-export function closeTopPatWin(): boolean {
-  if (onTop('rollWin')) { closeRoll(); return true; }
-  if (onTop('rackWin')) { closeRack(); return true; }
-  return false;
-}
 /**
  * Open a pattern from the playlist / browser: make it current and show the Channel Rack. Always
  * the rack: it used to open the Piano roll instead when one channel played the pattern, so the
@@ -395,8 +389,21 @@ export function removeBar(pt = curPat()) {
 
 // ---------------------------------------------------------------- channels
 
+/** The Channel Rack's group filter (FL's filter groups): every channel, the unsorted ones (''), or one group. */
+const [rackFilterRaw, setRackFilter] = createSignal<RackFilter>(null);
+/** The filter in force: one whose last channel left falls back to every channel. */
+export const rackFilter = () => liveFilter(channels(), rackFilterRaw());
+export { setRackFilter };
+/** The channels the rack shows. */
+export const rackChannels = () => { const f = rackFilter(); return f == null ? channels() : channels().filter(c => inFilter(c, f)); };
+
 export function chanOp(c: Channel, patch: Partial<Channel> = {}, index?: number): Op {
-  return { op: 'putChannel', channel: { ...plain(c), ...patch } as Channel, ...(index != null ? { index } : {}) };
+  const ch = { ...plain(c), ...patch } as Channel;
+  // a channel added while the rack shows one group joins it (FL)
+  const f = rackFilter();
+  if (f && ch.group === undefined && !channels().some(x => x.id === ch.id)) ch.group = f;
+  if (!ch.group) delete ch.group;
+  return { op: 'putChannel', channel: ch, ...(index != null ? { index } : {}) };
 }
 export function setChannel(c: Channel, patch: Partial<Channel>, label: string) { commit([chanOp(c, patch)], label); }
 export function toggleChanMute(c: Channel) { setChannel(c, c.mute ? { mute: false } : { mute: true, solo: false }, t('b.st.muteCh')); say(c.name + t(c.mute ? 'b.st.unmuted' : 'b.st.muted')); }
@@ -405,22 +412,37 @@ export function toggleChanSolo(c: Channel) { setChannel(c, c.solo ? { solo: fals
 /** A new channel of the built-in synth playing factory preset `name` (or the blank patch). */
 export function addSynth(name: string | null) {
   const cat = S.catalog?.synth; if (!cat) { say(t('b.st.synthNA')); return; }
-  const c = newSynthChannel(cat, allocId(), name);
+  const c = newSynthChannel(cat, allocId(), name, freshColor());
   commit([chanOp(c)], t('b.st.addSynth'));
   selectChannel(c.id);
   say(t('b.st.synthSay', { name: name ? tName(name) : t('b.st.emptySound') }));
 }
-const keysChannel = (id: Id): Channel => ({ id, name: 'WAVE Keys', color: '#e0a44a', kind: 'keys', keys: { release: KEYS_RELEASE.def, dynamics: KEYS_DYNAMICS.def }, vol: 0.7937, pan: 0, mute: false, solo: false, insert: null, root: 60 });
+/** A new channel's colour: one the rack uses least, so its steps and notes stand apart. */
+const freshColor = () => nextChannelColor(channels().map(c => c.color));
+const keysChannel = (id: Id): Channel => ({ id, name: 'Synkopa Keys', color: '#e0a44a', kind: 'keys', keys: { release: KEYS_RELEASE.def, dynamics: KEYS_DYNAMICS.def }, vol: 0.7937, pan: 0, mute: false, solo: false, insert: null, root: 60 });
 /** `root`: the key at which the file plays at its own pitch (a library file may know it). */
 const samplerChannel = (id: Id, s: { id: Id; name: string; color: string }, root: number = SAMPLE_ROOT): Channel => ({ id, name: s.name, color: s.color, kind: 'sample', source: s.id, sampler: samplerDefault(), vol: 0.7937, pan: 0, mute: false, solo: false, insert: null, root });
 
-/** What a channel can play, for "add" and "replace": a synth preset, WAVE Keys, a sampler of a source (`root`: the file's own pitch, if known). */
-export type InstrumentPick = { kind: 'synth'; preset: string | null } | { kind: 'keys' } | { kind: 'sample'; source: Id; root?: number };
+/** A channel hosting a scanned VST3 instrument, from its default sound (no saved state yet). */
+const pluginChannel = (id: Id, p: PluginInfo): Channel => ({
+  id, name: p.name, color: '#9b7cf8', kind: 'plugin',
+  plugin: { format: 'vst3', path: p.path, cid: p.cid, name: p.name, vendor: p.vendor },
+  vol: 0.7937, pan: 0, mute: false, solo: false, insert: null, root: 60,
+});
+
+/**
+ * What a channel can play, for "add" and "replace": a synth preset, Synkopa Keys, a sampler of a source (`root`: the
+ * file's own pitch, if known), or a scanned VST3 instrument.
+ */
+export type InstrumentPick =
+  | { kind: 'synth'; preset: string | null } | { kind: 'keys' } | { kind: 'sample'; source: Id; root?: number }
+  | { kind: 'plugin'; plugin: PluginInfo };
 function makeChannel(id: Id, pick: InstrumentPick): Channel | null {
   switch (pick.kind) {
-    case 'synth': { const cat = S.catalog?.synth; if (!cat) { say(t('b.st.synthNA')); return null; } return newSynthChannel(cat, id, pick.preset); }
+    case 'synth': { const cat = S.catalog?.synth; if (!cat) { say(t('b.st.synthNA')); return null; } return newSynthChannel(cat, id, pick.preset, freshColor()); }
     case 'keys': return keysChannel(id);
     case 'sample': { const src = S.project.sources.find(x => x.id === pick.source); return src ? samplerChannel(id, src, pick.root) : null; }
+    case 'plugin': return pluginChannel(id, pick.plugin);
   }
 }
 /**
@@ -429,13 +451,15 @@ function makeChannel(id: Id, pick: InstrumentPick): Channel | null {
  */
 export function replaceChannel(c: Channel, pick: InstrumentPick) {
   const fresh = makeChannel(c.id, pick); if (!fresh) return;
-  const keep = { id: c.id, color: c.color, vol: c.vol, pan: c.pan, mute: c.mute, solo: c.solo, insert: c.insert };
+  const keep = { id: c.id, color: c.color, vol: c.vol, pan: c.pan, mute: c.mute, solo: c.solo, insert: c.insert, ...(c.group ? { group: c.group } : {}) };
   commit([{ op: 'putChannel', channel: { ...fresh, ...keep } }], t('b.st.replaceCh'));
   say(t('b.st.replacedCh', { from: c.name, to: fresh.name }));
 }
+/** An audio file to make a sampler of: a library file (which may know its root key) or a path dropped from disk. */
+export type SampleFile = Pick<LibFile, 'path'> & { root?: number };
 /** Imports files and waits until their sources are in the store (the import's state event may still be in flight). */
 async function importSources(paths: string[]): Promise<Id[]> {
-  const r = await be().importAudio({ paths });
+  const r = await be().importAudio({ paths, step: false }); // the channel made from them is the undo step
   for (let k = 0; k < 50 && !r.sourceIds.every(id => S.project.sources.some(s => s.id === id)); k++) await new Promise(res => setTimeout(res, 20));
   return r.sourceIds;
 }
@@ -443,31 +467,46 @@ async function importSources(paths: string[]): Promise<Id[]> {
  * Make `c` a sampler of a file: a library file, or the first one picked in the file dialog.
  * A sampler keeps its own settings (envelope, cut group …): only the sample changes.
  */
-export async function replaceWithFile(c: Channel, file?: LibFile) {
+export async function replaceWithFile(c: Channel, file?: SampleFile) {
   try {
     const path = file?.path ?? (await be().pickAudioFiles())?.[0];
     if (!path) return;
     const [id] = await importSources([path]);
     if (id == null) return;
-    const live = chanById(c.id) ?? c, src = S.project.sources.find(s => s.id === id);
-    if (live.kind === 'sample' && src) {
-      commit([chanOp(live, { source: id, name: src.name, root: file?.root ?? live.root } as Partial<Channel>)], t('b.cw.changeSample'));
-      say(t('b.st.replacedCh', { from: live.name, to: src.name }));
-    } else replaceChannel(live, { kind: 'sample', source: id, root: file?.root });
+    replaceWithSource(c, id, file?.root);
   } catch (e) { say(t('b.st.samplerErr', { err: String(e) })); }
 }
+/** Make `c` a sampler of project source `id` (`root`: the file's own pitch, if known). A sampler keeps its settings. */
+export function replaceWithSource(c: Channel, id: Id, root?: number) {
+  const live = chanById(c.id) ?? c, src = S.project.sources.find(s => s.id === id);
+  if (!src) return;
+  if (live.kind === 'sample') {
+    if (live.source === id) return;
+    commit([chanOp(live, { source: id, name: src.name, root: root ?? live.root } as Partial<Channel>)], t('b.cw.changeSample'));
+    say(t('b.st.replacedCh', { from: live.name, to: src.name }));
+  } else replaceChannel(live, { kind: 'sample', source: id, root });
+}
 
-/** A new WAVE Keys channel: the sampled grand piano. */
+/** A new channel playing a scanned VST3 instrument (the engine loads it; a failure shows on the channel). */
+export function addPlugin(p: PluginInfo) {
+  const c = { ...pluginChannel(allocId(), p), color: freshColor() };
+  commit([chanOp(c)], t('b.st.addPlugin'));
+  selectChannel(c.id);
+  say(t('b.st.pluginSay', { name: p.name }));
+}
+/** A new Synkopa Keys channel: the sampled grand piano. */
 export function addKeys() {
-  const c = keysChannel(allocId());
+  const c = { ...keysChannel(allocId()), color: freshColor() };
   commit([chanOp(c)], t('b.st.addKeys'));
   selectChannel(c.id);
   say(t('b.st.keysSay'));
 }
-/** A new sampler channel of a project source, at `index` in the rack (default: the end). */
+/** A new sampler channel of a project source, at `index` in the rack (default: the end). Without a `root` it starts at
+ *  the root its audio clips were given in the sample editor (FL: the audio clip channel's root note). */
 export function addSampler(sourceId: Id, root?: number, index?: number) {
   const s = S.project.sources.find(x => x.id === sourceId); if (!s) return;
-  const c = samplerChannel(allocId(), s, root);
+  const clipRoot = S.project.clips.find(x => x.kind === 'audio' && x.ref === sourceId && x.root != null)?.root;
+  const c = { ...samplerChannel(allocId(), s, root ?? clipRoot), color: freshColor() };
   commit([chanOp(c, {}, index)], t('b.st.addSampler'));
   selectChannel(c.id);
   say(t('b.st.samplerSay', { name: s.name }));
@@ -477,18 +516,35 @@ export function addSampler(sourceId: Id, root?: number, index?: number) {
  * root key), or with nothing given the files picked in the dialog. Resolve the insertion index
  * after import so it follows its anchor if the rack order changes while loading the files.
  */
-export async function addSamplerFiles(files?: LibFile[] | null, index?: () => number | undefined) {
+export async function addSamplerFiles(files?: SampleFile[] | null, index?: () => number | undefined) {
   try {
-    const list: { path: string; root?: number }[] | undefined = files ?? (await be().pickAudioFiles())?.map(path => ({ path }));
+    const list: SampleFile[] | undefined = files ?? (await be().pickAudioFiles())?.map(path => ({ path }));
     if (!list?.length) return;
     const ids = await importSources(list.map(f => f.path));
     const at = index?.();
-    ids.forEach((id, k) => addSampler(id, list[k]?.root, at != null ? at + k : undefined));
+    if (ids.length === 1) { addSampler(ids[0], list[0]?.root, at); return; }
+    // several files dropped at once are one edit: one Ctrl+Z takes them all back
+    const colors = channels().map(c => c.color); // each new channel its own colour, not all the next free one
+    const made = ids.flatMap((id, k) => {
+      const s = S.project.sources.find(x => x.id === id); if (!s) return [];
+      const clipRoot = S.project.clips.find(x => x.kind === 'audio' && x.ref === id && x.root != null)?.root;
+      const color = nextChannelColor(colors); colors.push(color);
+      return [{ ...samplerChannel(allocId(), s, list[k]?.root ?? clipRoot), color }];
+    });
+    if (!made.length) return;
+    commit(made.map((c, k) => chanOp(c, {}, at != null ? at + k : undefined)), t('b.st.addSampler'));
+    selectChannel(made[made.length - 1].id);
+    say(t('b.st.samplersSay', { n: made.length }));
   } catch (e) { say(t('b.st.samplerErr', { err: String(e) })); }
 }
-export function cloneChannel(c: Channel) {
+export async function cloneChannel(c: Channel) {
+  // a plugin's sound lives in its running instance until the project is saved: the copy starts from that
+  let src = c;
+  if (c.kind === 'plugin' && !S.fxErrors[c.id]) {
+    try { src = { ...c, plugin: { ...c.plugin, state: await be().pluginState(c.id) } }; } catch (e) { console.warn(e); }
+  }
   const id = allocId(), idx = channels().findIndex(x => x.id === c.id) + 1;
-  const ops: Op[] = [chanOp({ ...c, id, name: c.name + ' 2', mute: false, solo: false }, {}, idx)];
+  const ops: Op[] = [chanOp({ ...src, id, name: c.name + ' 2', mute: false, solo: false }, {}, idx)];
   // FL clones the channel's steps too: in every pattern
   for (const pt of S.project.patterns) if (pt.notes.some(n => n.ch === c.id)) ops.push(putNotes(pt, cloneNotes(pt.notes, c.id, id)));
   commit(ops, t('b.st.cloneCh'));
@@ -502,7 +558,14 @@ export function deleteChannel(c: Channel) {
   say(t('b.st.deletedCh', { name: c.name, used: used ? t(used === 1 ? 'b.st.usedIn1' : 'b.st.usedInN', { n: used }) : '' }));
 }
 export const chanSource = (c: Channel) => (c.kind === 'sample' ? S.project.sources.find(s => s.id === c.source) : undefined);
-export const chanKindLabel = (c: Channel) => (c.kind === 'synth' ? t('b.st.kindSynth', { name: c.synth.preset ? tName(c.synth.preset) : t('b.st.kindCustom') }) : c.kind === 'keys' ? t('b.st.kindKeys') : t('b.st.kindSample', { name: chanSource(c) ? baseName(chanSource(c)!.path) : t('b.cw.noFile') }));
+export const chanKindLabel = (c: Channel) => {
+  switch (c.kind) {
+    case 'synth': return t('b.st.kindSynth', { name: c.synth.preset ? tName(c.synth.preset) : t('b.st.kindCustom') });
+    case 'keys': return t('b.st.kindKeys');
+    case 'plugin': return t('b.st.kindPlugin', { name: [c.plugin.name, c.plugin.vendor].filter(Boolean).join(' · ') });
+    case 'sample': return t('b.st.kindSample', { name: chanSource(c) ? baseName(chanSource(c)!.path) : t('b.cw.noFile') });
+  }
+};
 
 // ---------------------------------------------------------------- sound
 
@@ -528,11 +591,15 @@ export async function togglePreview(id: Id) {
   try {
     if (U.patPlaying && previewId === id) { await stopPreview(); say(t('b.st.prevStopped')); return; }
     previewId = id;
+    warnIfNoAudio();
+    markPlayCmd();
     if (U.playing) setU('playing', false);
     // queued behind pending edits: a pattern made a moment ago must reach the engine first
     const pt = patById(id);
     await enqueue(() => be().patternPlay(id, { from: pt ? patFrom(pt) : 0, range: patLoopOf(id) }));
+    markPlayCmd();
     setU('patPlaying', true);
+    if (S.transport.rec && S.transport.recNotes && patMode()) return say(t('d.act.recPatNow', { name: patById(id)?.name ?? '' }));
     say(t('b.st.prevSay', { mode: t(patMode() ? 'b.st.modePatWord' : 'b.st.modePrevWord'), name: patById(id)?.name ?? t('b.st.patternWord'), hint: patMode() ? '' : t('b.st.prevHint') }));
   } catch (e) { say(t('b.st.prevErr', { err: String(e) })); }
 }
@@ -563,7 +630,8 @@ export function setPatStart(id: Id, beat: number) {
   }
 }
 export async function stopPreview() {
-  try { await enqueue(() => be().patternPlay(null)); setU('patPlaying', false); } catch (e) { console.warn(e); }
+  markPlayCmd();
+  try { await enqueue(() => be().patternPlay(null)); markPlayCmd(); setU('patPlaying', false); } catch (e) { console.warn(e); }
 }
 
 /**
@@ -586,7 +654,7 @@ export const playStep = (pt: Pattern) => { const b = patPlayhead(pt); return b <
 // below the window's edge), and both pattern windows stay reachable when the app window shrinks.
 createRoot(() => {
   createEffect(on(() => channels().length, (n, prev) => {
-    const w = U.rackWin; if (!w || U.rackDock || prev == null || n <= prev) return;
+    const w = U.rackWin; if (!w || docked('rack') || prev == null || n <= prev) return;
     const need = RACK_HEAD + (n + 1) * RACK_ROW + 12 + 2 * RACK_PAD_Y;
     if (need > w.h) setU('rackWin', 'h', Math.min(need, Math.max(220, window.innerHeight - w.y - 20)));
   }));

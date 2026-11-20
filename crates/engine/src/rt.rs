@@ -9,7 +9,8 @@ use std::sync::atomic::{
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::model::{Id, SamplerState};
+use crate::model::{FxKind, Id, SamplerState};
+use crate::plug::{PlugBank, PlugInst};
 use crate::poly::{Patch, SynthBank, SynthInst};
 use crate::processor::{ParamBlock, ProcessCtx, Processor, METERS};
 use crate::sources::Audio;
@@ -33,9 +34,15 @@ pub struct Shared {
     pub stopped_at_end: AtomicBool,
     in_level: AtomicU32,
     cpu: AtomicU32,
+    /// Output underruns since the engine started: callbacks that took longer than the audio
+    /// they rendered lasts (the device ran dry, a click), plus xruns the driver reported.
+    underruns: AtomicU32,
     preview_pos: AtomicU32,
     /// Beats into the previewed pattern (f64 bits); negative when no pattern preview runs.
     pat_beat: AtomicU64,
+    /// Which loop the pattern playhead answers for (bumped on every PatPlay/PatRange): a
+    /// pattern recorder armed before the switch ignores beats of the loop still running.
+    pat_gen: AtomicU64,
     /// Per insert *index*: (L, R) peak since last read.
     meters: Vec<(AtomicU32, AtomicU32)>,
     gr: Vec<AtomicU32>,
@@ -50,6 +57,12 @@ pub struct Shared {
     take_lat_n: AtomicU32,
     /// Beat where input capture began (f64 bits; NaN until the audio thread has started it).
     rec_start: AtomicU64,
+}
+
+/// A callback that took longer (seconds) than the audio it rendered lasts: the device played
+/// out what it had before this block arrived.
+fn missed_deadline(spent: f32, period: f32) -> bool {
+    spent > period
 }
 
 fn fset(a: &AtomicU32, v: f32) {
@@ -75,8 +88,10 @@ impl Shared {
             stopped_at_end: AtomicBool::new(false),
             in_level: AtomicU32::new(0),
             cpu: AtomicU32::new(0),
+            underruns: AtomicU32::new(0),
             preview_pos: AtomicU32::new((-1f32).to_bits()),
             pat_beat: AtomicU64::new((-1f64).to_bits()),
+            pat_gen: AtomicU64::new(0),
             meters: (0..MAX_INSERTS).map(|_| (AtomicU32::new(0), AtomicU32::new(0))).collect(),
             gr: (0..WATCH_SLOTS).map(|_| AtomicU32::new(0)).collect(),
             fx_meters: (0..WATCH_SLOTS).map(|_| std::array::from_fn(|_| AtomicU32::new(0))).collect(),
@@ -107,12 +122,28 @@ impl Shared {
     pub fn cpu(&self) -> f32 {
         fget(&self.cpu)
     }
+    /// Output underruns counted since the engine started (late callbacks + driver xruns).
+    /// Never reset here: the UI shows the count since its own reset.
+    pub fn underruns(&self) -> u32 {
+        self.underruns.load(Relaxed)
+    }
+    /// Counts one output underrun. Lock-free; the device layer calls it for an xrun the driver
+    /// reports (possibly from the audio thread).
+    pub fn add_underrun(&self) {
+        self.underruns.fetch_add(1, Relaxed);
+    }
     pub fn preview_pos(&self) -> f32 {
         fget(&self.preview_pos)
     }
     /// Beats into the pattern the loop preview plays, or a negative number when it is stopped.
     pub fn pat_beat(&self) -> f64 {
         f64::from_bits(self.pat_beat.load(Relaxed))
+    }
+    /// Which loop the pattern playhead answers for (see [`Cmd::PatPlay`]). Read it before
+    /// [`Shared::pat_beat`]: once a generation is seen, the beat read after it belongs to
+    /// that loop (the audio thread publishes the loop's position before its generation).
+    pub fn pat_gen(&self) -> u64 {
+        self.pat_gen.load(Acquire)
     }
     pub fn fx_meters(&self, slot: usize) -> [f32; METERS] {
         std::array::from_fn(|i| fget(&self.fx_meters[slot][i]))
@@ -165,11 +196,31 @@ impl Default for Shared {
 
 // ------------------------------------------------------------------ graph
 
+/// Non-finite samples (NaN, ±inf) become silence. No allocation; one pass.
+#[inline]
+pub(crate) fn finite_or_silent(x: &mut [f32]) {
+    for v in x {
+        if !v.is_finite() {
+            *v = 0.0;
+        }
+    }
+}
+
 pub struct FxSlot {
     pub id: Id,
+    /// Which effect this slot runs: a same-id rebuild of the same kind (a bypass flip, new
+    /// params) keeps the running processor — its tail must not die at the graph swap.
+    pub kind: FxKind,
     pub bypass: bool,
     /// Dry/wet 0..1.
     pub mix: f32,
+    /// Wet scale for the bypass declick (`run_chain` ramps it over ~5 ms on a flip).
+    fade: f32,
+    /// Weight of the dry path's latency delay in a bypass release: 1.0 keeps it delayed
+    /// (aligned with the still-late wet while the wet fades out), and `run_chain` ramps it
+    /// to 0 in a second declick once the wet is gone — dropping the delay in one step would
+    /// click (a phase jump of the whole latency).
+    dly_fade: f32,
     /// `None` = "take the running processor with this id from the current graph".
     pub proc: Option<Box<dyn Processor>>,
     pub params: Option<ParamBlock>,
@@ -181,8 +232,28 @@ pub struct FxSlot {
 
 impl FxSlot {
     /// `latency` in samples (allocates; call off the audio thread).
-    pub fn new(id: Id, bypass: bool, mix: f32, proc: Option<Box<dyn Processor>>, params: Option<ParamBlock>, latency: usize) -> Self {
-        Self { id, bypass, mix, proc, params, dly_l: vec![0.0; latency], dly_r: vec![0.0; latency], dly_w: 0 }
+    pub fn new(
+        id: Id,
+        kind: FxKind,
+        bypass: bool,
+        mix: f32,
+        proc: Option<Box<dyn Processor>>,
+        params: Option<ParamBlock>,
+        latency: usize,
+    ) -> Self {
+        Self {
+            id,
+            kind,
+            bypass,
+            mix,
+            fade: if bypass { 0.0 } else { 1.0 },
+            dly_fade: if bypass { 0.0 } else { 1.0 },
+            proc,
+            params,
+            dly_l: vec![0.0; latency],
+            dly_r: vec![0.0; latency],
+            dly_w: 0,
+        }
     }
 
     fn delay_dry(&mut self, l: &mut [f32], r: &mut [f32]) {
@@ -193,6 +264,14 @@ impl FxSlot {
             *y = std::mem::replace(&mut self.dly_r[w], *y);
             self.dly_w = if w + 1 == n { 0 } else { w + 1 };
         }
+    }
+
+    /// Drops the dry-path delay line once its release is over: nothing reads it any more
+    /// (an un-bypass rebuild swaps in a fresh, zeroed one of the effect's latency).
+    fn clear_delay(&mut self) {
+        self.dly_l.clear();
+        self.dly_r.clear();
+        self.dly_w = 0;
     }
 }
 
@@ -212,6 +291,10 @@ pub struct InsertRt {
     pdc_l: Vec<f32>,
     pdc_r: Vec<f32>,
     pdc_w: usize,
+    /// The compensation delay is in the signal path: only while something plays (song or
+    /// pattern loop), where inserts must line up. Stopped, what is played live (a step click,
+    /// the typing keyboard, MIDI) is heard at once instead of waiting for the slowest insert.
+    pdc_on: bool,
     dry_l: Vec<f32>,
     dry_r: Vec<f32>,
     /// Samples the insert's input has been exact digital silence (see [`gate`]).
@@ -222,10 +305,46 @@ pub struct InsertRt {
     idle_at: usize,
     /// Set for the block just processed when the insert contributed nothing.
     idle: bool,
+    /// Something wrote into `l`/`r` this block (the chain, the fader, the PDC line, a track
+    /// or a send): they have to be zeroed before the next one. While nothing wrote, they are
+    /// known zeros and `gate` can skip its silence scan.
+    pub(crate) dirty: bool,
     /// Low-latency monitoring: this insert carries the live input of the armed track. Its
     /// effects with latency are skipped, its PDC delay runs *before* the chain (on the
     /// playback only, see `Graph::mon`) and the live input goes through undelayed.
     low_lat: bool,
+    /// Routing (see `crate::routing`): processed after every insert sending into it.
+    pub level: usize,
+    /// The output goes into the master (else only where it sends).
+    pub to_master: bool,
+    /// Post-fader sends to other inserts.
+    pub sends: Vec<SendRt>,
+    /// Something sends into this insert: `sl`/`sr` collect it during the block.
+    fed: bool,
+    sl: Vec<f32>,
+    sr: Vec<f32>,
+    /// The insert's own input, delayed to line up with the slowest insert sending into it.
+    in_dly: (Ring, Ring),
+    /// The post-fader output the sends read (only with sends).
+    post_l: Vec<f32>,
+    post_r: Vec<f32>,
+}
+
+/// One send of an insert: the target's index, its level (smoothed across a block) and the
+/// delay that lines it up with the target's other inputs.
+pub struct SendRt {
+    pub to: usize,
+    pub to_id: Id,
+    pub gain: f32,
+    g_cur: f32,
+    dly: (Ring, Ring),
+}
+
+impl SendRt {
+    /// `delay`: frames (allocates; call off the audio thread).
+    pub fn new(to: usize, to_id: Id, gain: f32, delay: usize) -> Self {
+        Self { to, to_id, gain, g_cur: gain, dly: (Ring::new(delay), Ring::new(delay)) }
+    }
 }
 
 impl InsertRt {
@@ -244,13 +363,69 @@ impl InsertRt {
             pdc_l: vec![],
             pdc_r: vec![],
             pdc_w: 0,
+            pdc_on: true,
             dry_l: vec![0.0; max_block],
             dry_r: vec![0.0; max_block],
             quiet: 0,
             parked: false,
             idle_at: usize::MAX,
             idle: false,
+            dirty: false,
             low_lat: false,
+            level: 0,
+            to_master: true,
+            sends: vec![],
+            fed: false,
+            sl: vec![],
+            sr: vec![],
+            in_dly: (Ring::default(), Ring::default()),
+            post_l: vec![],
+            post_r: vec![],
+        }
+    }
+
+    /// Wires the insert into the routing (allocates; call off the audio thread): its level,
+    /// whether it goes to the master, its sends, whether anything sends into it, and the delay
+    /// of its own input.
+    pub fn with_routing(
+        mut self,
+        level: usize,
+        to_master: bool,
+        sends: Vec<SendRt>,
+        fed: bool,
+        input_delay: usize,
+        max_block: usize,
+    ) -> Self {
+        self.level = level;
+        self.to_master = to_master;
+        if !sends.is_empty() {
+            self.post_l = vec![0.0; max_block];
+            self.post_r = vec![0.0; max_block];
+        }
+        self.sends = sends;
+        self.fed = fed;
+        if fed {
+            self.sl = vec![0.0; max_block];
+            self.sr = vec![0.0; max_block];
+        }
+        self.in_dly = (Ring::new(input_delay), Ring::new(input_delay));
+        self
+    }
+
+    /// Before the chain: the own input delayed to its slowest source, plus what was sent in.
+    fn take_sends(&mut self, n: usize) {
+        // the input-delay ring re-emits what it held even after the input went silent: while
+        // it is not empty (or a send fed us) the buffer is not a known zero
+        self.dirty |= !self.in_dly.0.is_empty() || self.fed;
+        self.in_dly.0.run(&mut self.l[..n]);
+        self.in_dly.1.run(&mut self.r[..n]);
+        if self.fed {
+            for i in 0..n {
+                self.l[i] += self.sl[i];
+                self.r[i] += self.sr[i];
+            }
+            self.sl[..n].fill(0.0);
+            self.sr[..n].fill(0.0);
         }
     }
 
@@ -275,6 +450,12 @@ pub struct Graph {
     pub inserts: Vec<InsertRt>,
     pub tracks: Vec<TrackRt>,
     track_bufs: Vec<(Vec<f32>, Vec<f32>)>,
+    /// Which track buffers were written during the current block: they are zeroed before the
+    /// next one, and while a buffer was not written it is known zeros (readers can skip it).
+    track_dirty: Vec<bool>,
+    /// Block length of the block just rendered: dirty buffers are cleared over exactly this
+    /// range (a short block after a long one must not leave stale samples past its end).
+    cleared_n: usize,
     /// Track index whose insert receives the live input when monitoring.
     pub monitor_track: Option<usize>,
     /// Pre-chain PDC line of the low-latency monitored insert (`pdc` frames, see `InsertRt::low_lat`).
@@ -283,12 +464,27 @@ pub struct Graph {
     mon_ins: Option<usize>,
     /// Delays the metronome/count-in click by the playback latency, so it is heard with the music.
     click: Ring,
+    /// The deepest routing level of a non-master insert (`crate::routing::Order::depth`).
+    pub depth: usize,
 }
 
 impl Graph {
     pub fn new(inserts: Vec<InsertRt>, tracks: Vec<TrackRt>, monitor_track: Option<usize>, max_block: usize) -> Self {
         let track_bufs = tracks.iter().map(|_| (vec![0.0; max_block], vec![0.0; max_block])).collect();
-        Self { inserts, tracks, track_bufs, monitor_track, mon: (Ring::default(), Ring::default()), mon_ins: None, click: Ring::default() }
+        let track_dirty = vec![false; tracks.len()];
+        let depth = inserts.iter().skip(1).map(|i| i.level).max().unwrap_or(0);
+        Self {
+            inserts,
+            tracks,
+            track_bufs,
+            track_dirty,
+            cleared_n: 0,
+            monitor_track,
+            mon: (Ring::default(), Ring::default()),
+            mon_ins: None,
+            click: Ring::default(),
+            depth,
+        }
     }
 
     /// Allocates the latency lines (call off the audio thread): `pdc` = the delay every
@@ -324,6 +520,9 @@ impl Ring {
     }
     fn clear(&mut self) {
         self.buf.fill(0.0);
+    }
+    fn is_empty(&self) -> bool {
+        self.buf.is_empty()
     }
     /// Takes over what `old` still has to play (see [`carry_line`]).
     fn carry(&mut self, old: &mut Ring) {
@@ -374,6 +573,8 @@ fn carry_pdc(new: &mut InsertRt, old: &mut InsertRt) -> bool {
 /// Fader/pan/mute for everything, sent when only those changed.
 pub struct MixState {
     pub inserts: Vec<(Id, f32, f32, f32, bool)>,
+    /// Send levels: (from insert, to insert, gain).
+    pub sends: Vec<(Id, Id, f32)>,
     pub tracks: Vec<(f32, bool)>,
     pub monitor_track: Option<usize>,
     /// Channel (gain, pan, on), in the timeline's channel order.
@@ -391,7 +592,7 @@ pub enum ClipSrc {
 }
 
 /// A resolved automation target (indices into the graph built from the same project).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TargetRt {
     Param {
         fx: Id,
@@ -431,7 +632,7 @@ pub enum TargetRt {
         fx: Id,
         param_id: u32,
     },
-    /// WAVE Keys channel (index into `Timeline::chans`): release time, dynamics.
+    /// Synkopa Keys channel (index into `Timeline::chans`): release time, dynamics.
     KeysRelease(usize),
     KeysDynamics(usize),
     /// An audio clip (index into `Timeline::clips`; `usize::MAX` while it does not play).
@@ -442,6 +643,13 @@ pub enum TargetRt {
 pub struct AutoRt {
     pub target: TargetRt,
     pub env: crate::model::Automation,
+}
+
+/// Every automation clip that drives one target (indices into `Timeline::clips`, by start).
+/// Between, before and after them the target still follows them (see `drive_value`).
+pub struct Drive {
+    pub target: TargetRt,
+    pub clips: Vec<usize>,
 }
 
 pub struct ClipRt {
@@ -457,6 +665,8 @@ pub struct ClipRt {
     pub pan: f32,
     pub fade_in: f32,
     pub fade_out: f32,
+    /// Audio clips routed past their track: the insert index they play into.
+    pub insert: Option<usize>,
     pub src: ClipSrc,
     /// `gain` (dB) and `pan` as the previous block played them: an automated change glides
     /// across the block instead of stepping (a zipper at every block edge).
@@ -473,6 +683,11 @@ pub struct NoteRt {
     pub chan: usize,
     pub key: u8,
     pub vel: f32,
+    /// The note's own pan (-1..=1), on top of the channel's. Sampler and Keys voices only.
+    pub pan: f32,
+    /// A slide note: it glides the channel's sounding notes to `key` over `len` (see
+    /// [`crate::model::Note::slide`]) instead of starting a sound.
+    pub slide: bool,
 }
 
 impl NoteRt {
@@ -491,8 +706,8 @@ pub struct PatRt {
     pub len: f64,
     /// Only the notes that start before `len` (later ones are kept in the project, hidden).
     pub notes: Vec<NoteRt>,
-    /// Insert index of the track of the first clip that plays this pattern (where the
-    /// loop preview and auditions of track-routed channels go).
+    /// Insert index of the track of the first clip that plays this pattern (where auditions
+    /// of track-routed channels go while no pattern loops; the loop itself skips it).
     pub home: Option<usize>,
 }
 
@@ -507,12 +722,18 @@ pub struct SmpRt {
     pub rate: f64,
     /// Level of "normalise" (1 when off).
     pub gain: f32,
-    pub gate: bool,
-    /// Seconds.
+    /// The volume envelope: on/off, stage times in seconds, the sustain level and each curved
+    /// segment's bend factor (see [`crate::synth::bend`]).
+    pub env: bool,
+    pub delay: f32,
     pub attack: f32,
+    pub hold: f32,
     pub decay: f32,
     pub sustain: f32,
     pub release: f32,
+    pub attack_bend: f32,
+    pub decay_bend: f32,
+    pub release_bend: f32,
     pub cut: u8,
     pub fade_in: f64,
     pub fade_out: f64,
@@ -537,11 +758,17 @@ impl SmpRt {
             reverse: s.reverse,
             rate: 2f64.powf((s.semi as f64 + s.fine as f64 / 100.0) / 12.0),
             gain,
-            gate: s.gate,
+            env: s.env,
+            delay: s.delay.max(0.0) / 1000.0,
             attack: s.attack.max(0.0) / 1000.0,
+            hold: s.hold.max(0.0) / 1000.0,
             decay: s.decay.max(0.0) / 1000.0,
             sustain: s.sustain.clamp(0.0, 1.0),
             release: s.release.max(1.0) / 1000.0,
+            // a rising attack bows up with a factor below 1, a falling decay or release above it
+            attack_bend: crate::synth::bend(-s.attack_tension),
+            decay_bend: crate::synth::bend(s.decay_tension),
+            release_bend: crate::synth::bend(s.release_tension),
             cut: s.cut,
             fade_in: s.fade_in_ms.clamp(0.0, SamplerState::FADE_MS.1) as f64 / 1000.0,
             fade_out: s.fade_out_ms.clamp(0.0, SamplerState::FADE_MS.1) as f64 / 1000.0,
@@ -557,7 +784,10 @@ pub struct ChanRt {
     /// and how it is played.
     pub sample: Option<Arc<Audio>>,
     pub smp: SmpRt,
-    /// WAVE Keys channels: the piano (`None` until it is loaded: the channel is silent),
+    /// Slice mode: where each slice starts (fractions of the file, increasing), see
+    /// `ChannelSrc::Sample::slices`. `None` = the sampler plays its region by pitch.
+    pub slices: Option<Arc<[f32]>>,
+    /// Synkopa Keys channels: the piano (`None` until it is loaded: the channel is silent),
     /// the release time in seconds and the velocity → level amount 0..1.
     pub keys: Option<Arc<crate::keys::KeysBank>>,
     pub keys_release: f32,
@@ -586,6 +816,8 @@ pub struct Timeline {
     pub pats: Vec<PatRt>,
     pub chans: Vec<ChanRt>,
     pub autos: Vec<AutoRt>,
+    /// The automated targets, each with its clips.
+    pub drives: Vec<Drive>,
     pub loop_range: Option<(f64, f64)>,
     pub song_end: f64,
 }
@@ -598,6 +830,8 @@ pub struct Preview {
     pub fade_in: f64,
     pub fade_out: f64,
     pub start: f64,
+    /// Read speed: 1 = the audio's own pitch; 2 = an octave up (the sample editor's keyboard).
+    pub rate: f64,
 }
 
 // ------------------------------------------------------------------ messages
@@ -640,6 +874,9 @@ pub enum Cmd {
         rec_loop: bool,
     },
     Stop,
+    /// Panic (a second Stop): everything still ringing is cut — voices, the built-in effects'
+    /// tails, latency lines, the preview — with a short ramp so the cut does not click.
+    Silence,
     Flags {
         metro: bool,
         monitor: bool,
@@ -659,15 +896,19 @@ pub enum Cmd {
         pattern: Option<Id>,
     },
     /// Loop one pattern on its own (`None` stops), from `from` beats into it, within `range`
-    /// (beats; `None` = the whole pattern). Exclusive with the song transport.
+    /// (beats; `None` = the whole pattern). Exclusive with the song transport. `gen`: the
+    /// loop's generation — the audio thread publishes it once this command runs, so a
+    /// pattern-recorder armed before the switch knows when its loop is live.
     PatPlay {
         id: Option<Id>,
         from: f64,
         range: Option<(f64, f64)>,
+        gen: u64,
     },
     /// The pattern loop's range changed while it plays (`None` = the whole pattern): the
-    /// position stays, or goes to the range's start when it falls outside it.
-    PatRange(Option<(f64, f64)>),
+    /// position stays, or goes to the range's start when it falls outside it. `gen` as in
+    /// [`Cmd::PatPlay`].
+    PatRange(Option<(f64, f64)>, u64),
     /// Live MIDI key down/up on a channel. It plays where the song plays the channel (its own
     /// insert, else the track of its pattern); `ins` (the armed track's insert) only for a
     /// channel the song does not play yet, else the master.
@@ -695,6 +936,11 @@ pub enum Cmd {
     },
     /// A synth channel is gone.
     SynthRemove(Id),
+    /// A plugin-instrument channel's instance, made off the audio thread (replaces one of the
+    /// same channel).
+    PlugAdd(Box<PlugInst>),
+    /// A plugin-instrument channel is gone (or its plugin changed).
+    PlugRemove(Id),
 }
 
 pub enum Garbage {
@@ -703,12 +949,15 @@ pub enum Garbage {
     Mix(Box<MixState>),
     Preview(Box<Preview>),
     Synth(Box<SynthInst>),
+    Plug(Box<PlugInst>),
     Patch(Box<Patch>),
     FxData(crate::processor::FxData),
 }
 
 pub struct Taps {
+    /// mono (L+R)/2 into each watched effect
     pub input: Vec<rtrb::Producer<f32>>,
+    /// interleaved L, R out of each watched effect
     pub output: Vec<rtrb::Producer<f32>>,
 }
 
@@ -725,6 +974,8 @@ pub struct Rt {
     voices: VoicePool,
     /// Synth channel instances.
     synths: SynthBank,
+    /// Plugin-instrument channel instances.
+    plugs: PlugBank,
     click: Vec<f32>,
     tmp_l: Vec<f32>,
     tmp_r: Vec<f32>,
@@ -756,8 +1007,8 @@ pub struct Rt {
     skip_silent: bool,
     /// Live MIDI events (see `Engine::midi_event`).
     midi: Option<rtrb::Consumer<Cmd>>,
-    /// Worker threads for the insert chains (offline renders only; 0/1 = this thread).
-    workers: usize,
+    /// Worker threads for the synth instances and insert chains (`None` = this thread only).
+    pool: Option<crate::pool::RtPool>,
     /// Instant start (live streams, see [`Rt::set_instant_start`]): the share of a callback
     /// period the audio thread may fill while pre-rolling, `None` = off (offline renders
     /// drop the latency themselves).
@@ -805,11 +1056,13 @@ impl Rt {
                 pats: vec![],
                 chans: vec![],
                 autos: vec![],
+                drives: vec![],
                 loop_range: None,
                 song_end: 4.0,
             }),
             voices: VoicePool::new(sr),
             synths: SynthBank::default(),
+            plugs: PlugBank::default(),
             click: vec![0.0; max_block],
             tmp_l: vec![0.0; max_block],
             tmp_r: vec![0.0; max_block],
@@ -836,7 +1089,7 @@ impl Rt {
             pat_range: None,
             skip_silent: true,
             midi: None,
-            workers: 0,
+            pool: None,
             instant: None,
             preroll: 0,
             pre_cost: 0.0,
@@ -871,6 +1124,20 @@ impl Rt {
 
     /// Starts the pre-roll at a transport jump. Not while recording: a take's alignment
     /// assumes the delayed start (`RecBuf::skip` drops the playback latency).
+    /// Moves every automated target to its value at the playhead at once (no glide from the
+    /// previous value). Allocation-free.
+    fn settle_automation(&mut self) {
+        apply_automation(&mut self.timeline, &mut self.graph, &mut self.synths, self.beat);
+        for c in self.timeline.chans.iter_mut() {
+            c.gain0 = c.gain;
+            c.pan0 = c.pan;
+        }
+        for c in self.timeline.clips.iter_mut() {
+            c.gain0 = c.gain;
+            c.pan0 = c.pan;
+        }
+    }
+
     fn jump(&mut self) {
         if self.instant.is_none() || self.rec {
             return;
@@ -884,10 +1151,17 @@ impl Rt {
         }
     }
 
-    /// Lets this Rt process insert chains on `n` worker threads. Never for a live stream:
-    /// it spawns threads and allocates. Output is identical to the single-threaded one.
+    /// Lets this Rt spread each block's synth instances and insert chains over `n` threads
+    /// (the audio thread and `n - 1` workers; 0 or 1 = the audio thread only), live and
+    /// offline alike. Spawns threads: call it before the Rt goes to the audio thread. The
+    /// output is identical to the single-threaded one.
     pub fn set_workers(&mut self, n: usize) {
-        self.workers = n;
+        self.pool = (n > 1).then(|| crate::pool::RtPool::new(n - 1));
+    }
+
+    /// Threads besides the audio thread that process this Rt's blocks.
+    pub fn workers(&self) -> usize {
+        self.pool.as_ref().map_or(0, |p| p.workers())
     }
 
     /// The ring live keyboard events arrive on, drained together with the command ring.
@@ -950,7 +1224,24 @@ impl Rt {
                             if let Some((st, old)) = found {
                                 let mut took = false;
                                 if slot.proc.is_none() {
-                                    slot.proc = old.proc.take();
+                                    // "take the running processor with this id" — but a kind
+                                    // change under the same id is a different effect: the fresh
+                                    // one must play (a carried Comp would process a Fet slot)
+                                    if old.kind == slot.kind {
+                                        slot.proc = old.proc.take();
+                                        slot.fade = old.fade;
+                                        slot.dly_fade = if slot.bypass { old.dly_fade } else { 1.0 };
+                                        took = true;
+                                    }
+                                } else if old.kind == slot.kind && old.proc.is_some() {
+                                    // a same-kind rebuild (a bypass flip, new params) keeps the
+                                    // running processor: its tail must not die at the swap. The
+                                    // fresh one now sits in `old`, freed off-thread with the old
+                                    // graph (trashed below). A different kind (comp ↔ FET) keeps
+                                    // the fresh one.
+                                    std::mem::swap(&mut slot.proc, &mut old.proc);
+                                    slot.fade = old.fade;
+                                    slot.dly_fade = if slot.bypass { old.dly_fade } else { 1.0 };
                                     took = true;
                                 }
                                 if old.dly_l.len() == slot.dly_l.len() {
@@ -958,6 +1249,19 @@ impl Rt {
                                     std::mem::swap(&mut slot.dly_r, &mut old.dly_r);
                                     slot.dly_w = old.dly_w;
                                     took = took || !slot.dly_l.is_empty();
+                                } else if slot.bypass
+                                    && (slot.fade > 0.0 || slot.dly_fade > 0.0)
+                                    && slot.dly_l.is_empty()
+                                    && !old.dly_l.is_empty()
+                                {
+                                    // a bypass ramp-out (or its release) with the wet still carried
+                                    // on: it stays late by the plugin's latency, so the dry path must
+                                    // stay delayed with it until the handoff is done — the rebuilt
+                                    // slot says 0 (a bypassed effect delays nothing once it is over)
+                                    std::mem::swap(&mut slot.dly_l, &mut old.dly_l);
+                                    std::mem::swap(&mut slot.dly_r, &mut old.dly_r);
+                                    slot.dly_w = old.dly_w;
+                                    took = true;
                                 }
                                 if took {
                                     carried = true;
@@ -973,9 +1277,21 @@ impl Rt {
                         // (an effect added or bypassed anywhere) must not drop up to the whole
                         // compensation delay (seconds with a long look-ahead Rider) on every insert
                         let mut pdc_carried = false;
+                        // stopped, a new line starts out of the path (see `InsertRt::pdc_on`)
+                        ins.pdc_on = self.playing || self.pat_play.is_some() || self.instant.is_none();
                         if let Some(old) = self.graph.inserts.iter_mut().find(|i| i.id == ins.id) {
                             ins.g_cur = old.g_cur;
                             pdc_carried = carry_pdc(ins, old);
+                            // a send that stays keeps its level ramp and what is in flight in its delay
+                            for s in ins.sends.iter_mut() {
+                                if let Some(o) = old.sends.iter_mut().find(|o| o.to_id == s.to_id) {
+                                    s.g_cur = o.g_cur;
+                                    s.dly.0.carry(&mut o.dly.0);
+                                    s.dly.1.carry(&mut o.dly.1);
+                                }
+                            }
+                            ins.in_dly.0.carry(&mut old.in_dly.0);
+                            ins.in_dly.1.carry(&mut old.in_dly.1);
                         }
                         (ins.quiet, ins.parked) = if carried { (quiet, parked) } else { (usize::MAX / 2, true) };
                         // a parked chain is idle once its PDC line has played out (at once if it is empty)
@@ -998,6 +1314,13 @@ impl Rt {
                             i.pan = pan;
                             i.width = width;
                             i.on = on;
+                        }
+                    }
+                    for &(from, to, gain) in &m.sends {
+                        if let Some(s) =
+                            self.graph.inserts.iter_mut().find(|i| i.id == from).and_then(|i| i.sends.iter_mut().find(|s| s.to_id == to))
+                        {
+                            s.gain = gain;
                         }
                     }
                     for (t, &(gain, on)) in self.graph.tracks.iter_mut().zip(m.tracks.iter()) {
@@ -1045,6 +1368,7 @@ impl Rt {
                     self.rec_drain = 0;
                     self.voices.clear();
                     self.synths.stop_all();
+                    self.plugs.stop_all();
                     // the song and the pattern preview are exclusive (FL's SONG / PAT)
                     self.set_pat_play(None);
                     self.beat = from - count_in;
@@ -1060,6 +1384,9 @@ impl Rt {
                     self.playing = true;
                     self.shared.playing.store(true, Relaxed);
                     self.shared.stopped_at_end.store(false, Relaxed);
+                    // automated targets start at their value here, without gliding from
+                    // whatever the last pass (or the static value) left them at
+                    self.settle_automation();
                     self.jump();
                 }
                 Cmd::EndTake { stop, fallback_skip, pdc } => self.end_take(stop, fallback_skip, pdc),
@@ -1074,6 +1401,7 @@ impl Rt {
                     }
                 }
                 Cmd::Stop => self.stop(false),
+                Cmd::Silence => self.silence(),
                 Cmd::Flags { metro, monitor } => {
                     self.metro = metro;
                     self.monitor = monitor;
@@ -1095,10 +1423,12 @@ impl Rt {
                     if let Some(i) = tl.chans.iter().position(|c| c.id == chan) {
                         let ch = &tl.chans[i];
                         let home = pattern.and_then(|id| tl.pats.iter().find(|p| p.id == id)).and_then(|p| p.home);
-                        let ins = ch.insert.or(home).unwrap_or(ch.home);
+                        // over a pattern loop it sounds like the loop: no playlist track's insert
+                        let ins = if self.pat_play.is_some() { ch.insert.unwrap_or(0) } else { ch.insert.or(home).unwrap_or(ch.home) };
                         play(
                             &mut self.voices,
                             &mut self.synths,
+                            &mut self.plugs,
                             ch,
                             i,
                             Dest::Insert(ins),
@@ -1107,6 +1437,7 @@ impl Rt {
                             key,
                             vel,
                             1.0,
+                            0.0,
                             self.sr,
                         );
                     }
@@ -1118,9 +1449,17 @@ impl Rt {
                             let ch = &tl.chans[i];
                             // never through an unrelated armed track: a vocal chain (compressor, pitch
                             // correction) mangles chords that sound right in the piano roll
-                            let ins = ch.insert.or(ch.heard).or(ins).unwrap_or(ch.home);
+                            let ins = if self.pat_play.is_some() {
+                                ch.insert.unwrap_or(0)
+                            } else {
+                                ch.insert.or(ch.heard).or(ins).unwrap_or(ch.home)
+                            };
                             if ch.kind == VoiceKind::Synth {
                                 if let Some(s) = self.synths.get(chan) {
+                                    s.key_down(key, vel, Dest::Insert(ins));
+                                }
+                            } else if ch.kind == VoiceKind::Plugin {
+                                if let Some(s) = self.plugs.get(chan) {
                                     s.key_down(key, vel, Dest::Insert(ins));
                                 }
                             } else {
@@ -1130,21 +1469,38 @@ impl Rt {
                     } else {
                         self.voices.note_off(chan, key);
                         self.synths.key_up(chan, key);
+                        self.plugs.key_up(chan, key);
                     }
                 }
                 Cmd::MidiSustain(down) => {
                     self.voices.sustain(down);
                     self.synths.sustain(down);
+                    self.plugs.sustain(down);
                 }
                 Cmd::MidiBend(st) => {
                     self.voices.set_bend(st);
                     self.synths.set_bend(st);
+                    self.plugs.set_bend(st);
                 }
                 Cmd::MidiOff => {
                     self.voices.all_notes_off();
                     self.synths.all_notes_off();
+                    self.plugs.all_notes_off();
                 }
-                Cmd::MidiMod(v) => self.synths.set_wheel(v),
+                Cmd::MidiMod(v) => {
+                    self.synths.set_wheel(v);
+                    self.plugs.set_wheel(v);
+                }
+                Cmd::PlugAdd(s) => {
+                    if let Some(old) = self.plugs.add(s) {
+                        self.trash(Garbage::Plug(old));
+                    }
+                }
+                Cmd::PlugRemove(id) => {
+                    if let Some(old) = self.plugs.remove(id) {
+                        self.trash(Garbage::Plug(old));
+                    }
+                }
                 Cmd::SynthAdd(s) => {
                     if let Some(old) = self.synths.add(s) {
                         self.trash(Garbage::Synth(old));
@@ -1161,7 +1517,7 @@ impl Rt {
                         self.trash(Garbage::Synth(old));
                     }
                 }
-                Cmd::PatPlay { id, from, range } => {
+                Cmd::PatPlay { id, from, range, gen } => {
                     if id.is_some() && self.playing {
                         self.stop(false);
                     }
@@ -1169,6 +1525,7 @@ impl Rt {
                         // a jump inside a playing loop: what sounds now must not ring on
                         self.voices.clear();
                         self.synths.stop_all();
+                        self.plugs.stop_all();
                     }
                     self.set_pat_play(id);
                     self.pat_range = range;
@@ -1177,8 +1534,24 @@ impl Rt {
                         self.shared.pat_beat.store(self.pat_beat.to_bits(), Relaxed);
                         self.jump();
                     }
+                    // last, and Release: a reader that sees this generation also sees the
+                    // new loop's position, never the previous loop's beat under the new name
+                    self.shared.pat_gen.store(gen, Release);
                 }
-                Cmd::PatRange(range) => self.pat_range = range,
+                Cmd::PatRange(range, gen) => {
+                    self.pat_range = range;
+                    // a position outside the new range moves to its start now (as the next
+                    // block would), so the beat published with the generation is in range
+                    let len = self.pat_play.and_then(|pid| self.timeline.pats.iter().find(|p| p.id == pid)).map(|p| p.len);
+                    if let Some(len) = len.filter(|l| *l > 0.0) {
+                        let (la, lb) = loop_span(range, len);
+                        if !(la..lb).contains(&self.pat_beat) {
+                            self.pat_beat = la;
+                            self.shared.pat_beat.store(self.pat_beat.to_bits(), Relaxed);
+                        }
+                    }
+                    self.shared.pat_gen.store(gen, Release);
+                }
             }
         }
     }
@@ -1212,34 +1585,59 @@ impl Rt {
         let b0 = self.pat_beat - la;
         let b1 = b0 + n as f64 * bps;
         let (r0, r1) = ((b0 / span).floor() as i64, (b1 / span).floor() as i64);
-        for r in r0..=r1 {
-            for nt in &pat.notes {
-                if nt.beat < la || nt.beat >= lb {
-                    continue;
+        // slide notes after the notes they bend (a slide moves what has started by then)
+        for slides in [false, true] {
+            for r in r0..=r1 {
+                for nt in pat.notes.iter().filter(|nt| nt.slide == slides) {
+                    if nt.beat < la || nt.beat >= lb {
+                        continue;
+                    }
+                    let nb = r as f64 * span + nt.beat - la;
+                    if nb < b0 || nb >= b1 {
+                        continue;
+                    }
+                    let Some(ch) = tl.chans.get(nt.chan) else { continue };
+                    if !ch.on {
+                        continue;
+                    }
+                    // PAT mode plays the pattern itself, not its place in the song: a channel without
+                    // an insert of its own goes to the master, not through the insert (and effects) of
+                    // the playlist track its clip is on
+                    let ins = ch.insert.unwrap_or(0);
+                    let delay = ((nb - b0) / bps) as u32;
+                    if slides {
+                        slide(&mut self.voices, &mut self.synths, ch, delay, nt.key, (nt.len * spb) as f32 * self.sr);
+                        continue;
+                    }
+                    play(
+                        &mut self.voices,
+                        &mut self.synths,
+                        &mut self.plugs,
+                        ch,
+                        nt.chan,
+                        Dest::Insert(ins),
+                        delay,
+                        nt.end(spb, f64::INFINITY),
+                        nt.key,
+                        nt.vel,
+                        1.0,
+                        nt.pan,
+                        self.sr,
+                    );
                 }
-                let nb = r as f64 * span + nt.beat - la;
-                if nb < b0 || nb >= b1 {
-                    continue;
+            }
+        }
+        // the metronome counts the pattern's beats (accent on each of its bars), as in the song
+        if self.metro {
+            for r in r0..=r1 {
+                let mut p = la.ceil();
+                while p < lb {
+                    let nb = r as f64 * span + p - la;
+                    if nb >= b0 && nb < b1 {
+                        self.voices.click((p as i64).rem_euclid(4) == 0, ((nb - b0) / bps) as u32);
+                    }
+                    p += 1.0;
                 }
-                let Some(ch) = tl.chans.get(nt.chan) else { continue };
-                if !ch.on {
-                    continue;
-                }
-                let ins = ch.insert.or(pat.home).unwrap_or(ch.home);
-                let delay = ((nb - b0) / bps) as u32;
-                play(
-                    &mut self.voices,
-                    &mut self.synths,
-                    ch,
-                    nt.chan,
-                    Dest::Insert(ins),
-                    delay,
-                    nt.end(spb, f64::INFINITY),
-                    nt.key,
-                    nt.vel,
-                    1.0,
-                    self.sr,
-                );
             }
         }
         self.pat_beat = la + b1.rem_euclid(span);
@@ -1255,7 +1653,35 @@ impl Rt {
         if at_end {
             self.shared.stopped_at_end.store(true, Relaxed);
         }
-        // tails of instruments keep ringing; effect tails too
+        // tails of instruments keep ringing; effect tails too (a second Stop: `silence`)
+    }
+
+    /// See [`Cmd::Silence`]. Allocation-free: buffers are zeroed in place, the preview goes to
+    /// the garbage queue. Hosted plugins get note-offs (their own effect tails are theirs).
+    fn silence(&mut self) {
+        self.voices.clear();
+        self.synths.silence();
+        self.plugs.stop_all();
+        if let Some(old) = self.preview.take() {
+            fset(&self.shared.preview_pos, -1.0);
+            self.trash(Garbage::Preview(old));
+        }
+        for ins in self.graph.inserts.iter_mut() {
+            for slot in ins.fx.iter_mut() {
+                if let Some(p) = slot.proc.as_mut() {
+                    p.reset();
+                }
+                slot.dly_l.fill(0.0);
+                slot.dly_r.fill(0.0);
+            }
+            ins.pdc_l.fill(0.0);
+            ins.pdc_r.fill(0.0);
+        }
+        // what was heard last ramps to zero instead of stopping dead
+        if self.last.0.abs() > 1e-6 || self.last.1.abs() > 1e-6 {
+            self.dc = self.last;
+            self.dc_pos = 0;
+        }
     }
 
     fn end_take(&mut self, stop: bool, fallback_skip: usize, pdc: usize) {
@@ -1303,8 +1729,14 @@ impl Rt {
             self.preroll -= mute;
             pos += m;
         }
+        let spent = t0.elapsed().as_secs_f32();
+        // later than the audio it rendered lasts: the device ran dry before this block arrived
+        // (the pre-roll counts here: the deadline is missed all the same)
+        if missed_deadline(spent, period) {
+            self.shared.add_underrun();
+        }
         // the pre-roll is not this callback's load (the meter would only show its spike)
-        let load = (t0.elapsed().as_secs_f32() - pre).max(0.0) / period.max(1e-6);
+        let load = (spent - pre).max(0.0) / period.max(1e-6);
         let prev = fget(&self.shared.cpu);
         fset(&self.shared.cpu, if load > prev { load } else { prev * 0.95 + load * 0.05 });
     }
@@ -1360,14 +1792,27 @@ impl Rt {
         ahead: bool,
     ) {
         let sr = self.sr;
-        for (l, r) in self.graph.track_bufs.iter_mut() {
-            l[..n].fill(0.0);
-            r[..n].fill(0.0);
+        // only buffers written during the last block have to be cleared; while nothing wrote
+        // into a buffer it is known zeros, and its writers are the only ones who can say when
+        // that stopped being true (write-side, see the `dirty` flags). Clear exactly what the
+        // last block could have written: the current block's length would miss stale samples
+        // when a short block follows a long one.
+        let g = &mut *self.graph;
+        for (ti, (l, r)) in g.track_bufs.iter_mut().enumerate() {
+            if g.track_dirty[ti] {
+                l[..g.cleared_n].fill(0.0);
+                r[..g.cleared_n].fill(0.0);
+                g.track_dirty[ti] = false;
+            }
         }
-        for ins in self.graph.inserts.iter_mut() {
-            ins.l[..n].fill(0.0);
-            ins.r[..n].fill(0.0);
+        for ins in g.inserts.iter_mut() {
+            if ins.dirty {
+                ins.l[..g.cleared_n].fill(0.0);
+                ins.r[..g.cleared_n].fill(0.0);
+                ins.dirty = false;
+            }
         }
+        g.cleared_n = n;
         self.click[..n].fill(0.0);
 
         let bpm = self.timeline.bpm;
@@ -1438,12 +1883,13 @@ impl Rt {
                 }
             }
         }
-        // the clips of this block are mixed: the next one glides from what they played
-        for c in self.timeline.clips.iter_mut() {
-            c.gain0 = c.gain;
-            c.pan0 = c.pan;
-        }
         if self.playing {
+            // the clips of this block are mixed: the next one glides from what they played
+            // (stopped, nothing renders from the clips, so there is nothing to glide from)
+            for c in self.timeline.clips.iter_mut() {
+                c.gain0 = c.gain;
+                c.pan0 = c.pan;
+            }
             apply_automation(&mut self.timeline, &mut self.graph, &mut self.synths, block_beat);
         }
         let shared_beat = if self.playing { self.beat } else { block_beat };
@@ -1453,8 +1899,38 @@ impl Rt {
         // tempo-locked effects follow the pattern loop preview like the song
         let pat_ctx = if !self.playing && self.pat_play.is_some() { Some(self.pat_beat) } else { None };
         self.schedule_pattern(n, bps, spb);
-        self.voices.render(n, &mut self.graph.track_bufs, &mut self.graph.inserts, &mut self.click[..n], &self.timeline.chans);
-        self.synths.render(n, &mut self.graph.track_bufs, &mut self.graph.inserts, &self.timeline.chans, bpm);
+        self.voices.render(
+            n,
+            &mut self.graph.track_bufs,
+            &mut self.graph.inserts,
+            &mut self.click[..n],
+            &self.timeline.chans,
+            &mut self.graph.track_dirty,
+        );
+        self.synths.render(
+            n,
+            &mut self.graph.track_bufs,
+            &mut self.graph.inserts,
+            &self.timeline.chans,
+            bpm,
+            self.pool.as_ref(),
+            &mut self.graph.track_dirty,
+        );
+        if !self.plugs.is_empty() {
+            let ctx = match pat_ctx {
+                Some(b) => ProcessCtx { sample_rate: sr, bpm, beat: b, playing: true },
+                None => ProcessCtx { sample_rate: sr, bpm, beat: block_beat, playing: self.playing },
+            };
+            let _no_denormals = crate::processor::NoDenormals::new();
+            self.plugs.render(
+                n,
+                &mut self.graph.track_bufs,
+                &mut self.graph.inserts,
+                &self.timeline.chans,
+                &ctx,
+                &mut self.graph.track_dirty,
+            );
+        }
         // what this block played is where the next one glides from
         for c in self.timeline.chans.iter_mut() {
             c.gain0 = c.gain;
@@ -1495,6 +1971,7 @@ impl Rt {
             if self.monitor && mon_ins.is_none() {
                 if let Some(t) = self.graph.monitor_track {
                     if let Some((l, r)) = self.graph.track_bufs.get_mut(t) {
+                        self.graph.track_dirty[t] = true;
                         for i in 0..n.min(il.len()) {
                             l[i] += il[i];
                             r[i] += ir[i];
@@ -1508,13 +1985,25 @@ impl Rt {
         let g = &mut *self.graph;
         for (ti, t) in g.tracks.iter().enumerate() {
             let Some(ins) = g.inserts.get_mut(t.insert) else { continue };
-            if !t.on {
+            if !t.on || !g.track_dirty[ti] {
+                // a track that wrote nothing this block would only add its zeros
                 continue;
             }
             let (tl, tr) = &g.track_bufs[ti];
+            ins.dirty = true;
             for i in 0..n {
                 ins.l[i] += tl[i] * t.gain;
                 ins.r[i] += tr[i] * t.gain;
+            }
+        }
+        // monitoring with no track to monitor through (nothing armed or being recorded): dry on the master
+        if self.monitor && g.monitor_track.is_none() {
+            if let (Some((il, ir)), Some(m)) = (input, g.inserts.first_mut()) {
+                m.dirty = true;
+                for i in 0..n.min(il.len()) {
+                    m.l[i] += il[i];
+                    m.r[i] += ir[i];
+                }
             }
         }
 
@@ -1522,6 +2011,7 @@ impl Rt {
             // playback on the monitored insert is compensated before the chain; the live
             // input joins after the delay, scaled and muted by its track like the playback
             let ins = &mut g.inserts[k];
+            ins.dirty = true;
             g.mon.0.run(&mut ins.l[..n]);
             g.mon.1.run(&mut ins.r[..n]);
             if let (Some(t), Some((il, ir))) = (g.monitor_track.and_then(|t| g.tracks.get(t)).filter(|t| t.on), input) {
@@ -1540,39 +2030,52 @@ impl Rt {
         let count = g.inserts.len();
         if count > 0 {
             let (enabled, watch) = (self.skip_silent, &self.watch[..self.watch_n]);
-            if self.workers > 1 && count > 4 && watch.is_empty() {
-                // offline: the effect chains of the non-master inserts are independent, so
-                // worker threads take them one by one (the sum into the master stays in order)
-                let next = std::sync::atomic::AtomicUsize::new(0);
-                let cells: Vec<std::sync::Mutex<&mut InsertRt>> = g.inserts[1..].iter_mut().map(std::sync::Mutex::new).collect();
-                let shared = &*self.shared;
-                std::thread::scope(|sc| {
-                    for _ in 0..self.workers.min(cells.len()) {
-                        sc.spawn(|| {
-                            let mut taps = Taps { input: vec![], output: vec![] };
-                            loop {
-                                let j = next.fetch_add(1, Relaxed);
-                                let Some(cell) = cells.get(j) else { break };
-                                let mut ins = cell.lock().unwrap();
-                                process_insert(&mut ins, j + 1, n, &ctx, enabled, &[], &mut taps, shared);
+            let aligned = ctx.playing || self.instant.is_none();
+            // level by level (`crate::routing`): an insert runs once everything sending into it
+            // has; the inserts of one level are independent of each other
+            for lv in 0..=g.depth {
+                for ins in g.inserts.iter_mut().skip(1).filter(|i| i.level == lv) {
+                    ins.take_sends(n);
+                }
+                if let Some(pool) = self.pool.as_ref().filter(|_| count > 2) {
+                    // the pool's threads take this level's chains one by one. A chain with a
+                    // watched effect writes the analysis taps: this thread runs it.
+                    let shared = &*self.shared;
+                    let watched = |ins: &InsertRt| !watch.is_empty() && ins.fx.iter().any(|s| watch.contains(&s.id));
+                    pool.for_each_mut(&mut g.inserts[1..], &|j, ins| {
+                        if ins.level == lv && !watched(ins) {
+                            let mut no_taps = Taps { input: Vec::new(), output: Vec::new() };
+                            process_insert(ins, j + 1, n, &ctx, aligned, enabled, &[], &mut no_taps, shared);
+                        }
+                    });
+                    if !watch.is_empty() {
+                        for (k, insert) in g.inserts.iter_mut().enumerate().skip(1) {
+                            if insert.level == lv && watched(insert) {
+                                process_insert(insert, k, n, &ctx, aligned, enabled, watch, &mut self.taps, shared);
                             }
-                        });
+                        }
                     }
-                });
-            } else {
-                for (k, insert) in g.inserts.iter_mut().enumerate().skip(1) {
-                    process_insert(insert, k, n, &ctx, enabled, watch, &mut self.taps, &self.shared);
+                } else {
+                    for (k, insert) in g.inserts.iter_mut().enumerate().skip(1) {
+                        if insert.level == lv {
+                            process_insert(insert, k, n, &ctx, aligned, enabled, watch, &mut self.taps, &self.shared);
+                        }
+                    }
+                }
+                if lv < g.depth {
+                    send_level(&mut g.inserts, lv, n, &mut self.tmp_l, &mut self.tmp_r);
                 }
             }
             let (head, tail) = g.inserts.split_at_mut(1);
             let master = &mut head[0];
-            for ins in tail.iter().filter(|i| !i.idle) {
+            for ins in tail.iter().filter(|i| !i.idle && i.to_master) {
+                master.dirty = true;
                 for i in 0..n {
                     master.l[i] += ins.l[i];
                     master.r[i] += ins.r[i];
                 }
             }
-            process_insert(master, 0, n, &ctx, enabled, watch, &mut self.taps, &self.shared);
+            process_insert(master, 0, n, &ctx, aligned, enabled, watch, &mut self.taps, &self.shared);
         }
 
         // ---- out: master + click (delayed like the music) + preview
@@ -1606,7 +2109,7 @@ impl Rt {
             self.last = (out_l[at + n - 1], out_r[at + n - 1]);
         }
         if let Some(pv) = self.preview.as_mut() {
-            let rate = pv.audio.sr as f64 / sr as f64;
+            let rate = pv.rate * pv.audio.sr as f64 / sr as f64;
             for i in 0..n {
                 if pv.pos >= pv.end {
                     break;
@@ -1672,25 +2175,47 @@ impl Rt {
                     let hi = b1.min(c.end);
                     let r0 = ((lo - base) / pat.len).floor() as i64 - 1;
                     let r1 = ((hi - base) / pat.len).floor() as i64;
-                    for r in r0..=r1 {
-                        for nt in &pat.notes {
-                            let nb = base + r as f64 * pat.len + nt.beat;
-                            if nb >= lo && nb < hi {
-                                let Some(ch) = tl.chans.get(nt.chan) else { continue };
-                                if !ch.on {
-                                    continue;
+                    // slide notes after the notes they bend (a slide moves what has started by then)
+                    for slides in [false, true] {
+                        for r in r0..=r1 {
+                            for nt in pat.notes.iter().filter(|nt| nt.slide == slides) {
+                                let nb = base + r as f64 * pat.len + nt.beat;
+                                if nb >= lo && nb < hi {
+                                    let Some(ch) = tl.chans.get(nt.chan) else { continue };
+                                    if !ch.on {
+                                        continue;
+                                    }
+                                    let delay = ((nb - b0) / bps) as u32 + at as u32;
+                                    if slides {
+                                        let len = (nt.len.min(c.end - nb) * spb) as f32 * self.sr;
+                                        slide(&mut self.voices, &mut self.synths, ch, delay, nt.key, len);
+                                        continue;
+                                    }
+                                    let end = nt.end(spb, c.end - nb);
+                                    let (dest, gain) = match ch.insert {
+                                        None => (Dest::Track(c.track), 1.0),
+                                        // routed past the track: the track still mutes and scales it
+                                        Some(k) => match self.graph.tracks.get(c.track) {
+                                            Some(t) if t.on => (Dest::Insert(k), t.gain),
+                                            _ => continue,
+                                        },
+                                    };
+                                    play(
+                                        &mut self.voices,
+                                        &mut self.synths,
+                                        &mut self.plugs,
+                                        ch,
+                                        nt.chan,
+                                        dest,
+                                        delay,
+                                        end,
+                                        nt.key,
+                                        nt.vel,
+                                        gain,
+                                        nt.pan,
+                                        self.sr,
+                                    );
                                 }
-                                let delay = ((nb - b0) / bps) as u32 + at as u32;
-                                let end = nt.end(spb, c.end - nb);
-                                let (dest, gain) = match ch.insert {
-                                    None => (Dest::Track(c.track), 1.0),
-                                    // routed past the track: the track still mutes and scales it
-                                    Some(k) => match self.graph.tracks.get(c.track) {
-                                        Some(t) if t.on => (Dest::Insert(k), t.gain),
-                                        _ => continue,
-                                    },
-                                };
-                                play(&mut self.voices, &mut self.synths, ch, nt.chan, dest, delay, end, nt.key, nt.vel, gain, self.sr);
                             }
                         }
                     }
@@ -1711,6 +2236,7 @@ impl Rt {
                     if i1 <= i0 {
                         continue;
                     }
+                    self.graph.track_dirty[c.track] = true;
                     let m = i1 - i0;
                     let (bl, br) = (&mut self.comp_l[..m], &mut self.comp_r[..m]);
                     bl.fill(0.0);
@@ -1734,10 +2260,30 @@ impl Rt {
                         tl_r[at + i0 + k] += br[k] * env * pr;
                     }
                 }
-                ClipSrc::Audio(a) => {
-                    let Some((tl_l, tl_r)) = self.graph.track_bufs.get_mut(c.track) else { continue };
-                    crate::clipmix::mix_audio_clip(c, a, b0, bps, spb, &mut tl_l[at..at + n], &mut tl_r[at..at + n]);
-                }
+                ClipSrc::Audio(a) => match c.insert {
+                    None => {
+                        let Some((tl_l, tl_r)) = self.graph.track_bufs.get_mut(c.track) else { continue };
+                        self.graph.track_dirty[c.track] = true;
+                        crate::clipmix::mix_audio_clip(c, a, b0, bps, spb, &mut tl_l[at..at + n], &mut tl_r[at..at + n]);
+                    }
+                    // its own insert: past the track's insert, still muted and scaled by the track (as a routed channel)
+                    Some(k) => {
+                        let gain = match self.graph.tracks.get(c.track) {
+                            Some(t) if t.on => t.gain,
+                            _ => continue,
+                        };
+                        let Some(ins) = self.graph.inserts.get_mut(k) else { continue };
+                        ins.dirty = true;
+                        let (bl, br) = (&mut self.comp_l[..n], &mut self.comp_r[..n]);
+                        bl.fill(0.0);
+                        br.fill(0.0);
+                        crate::clipmix::mix_audio_clip(c, a, b0, bps, spb, bl, br);
+                        for i in 0..n {
+                            ins.l[at + i] += bl[i] * gain;
+                            ins.r[at + i] += br[i] * gain;
+                        }
+                    }
+                },
             }
         }
     }
@@ -1750,6 +2296,7 @@ impl Rt {
 fn play(
     voices: &mut VoicePool,
     synths: &mut SynthBank,
+    plugs: &mut PlugBank,
     ch: &ChanRt,
     idx: usize,
     dest: Dest,
@@ -1758,21 +2305,105 @@ fn play(
     key: u8,
     vel: f32,
     gain: f32,
+    pan: f32,
     sr: f32,
 ) {
     if ch.kind == VoiceKind::Synth {
         if let Some(s) = synths.get(ch.id) {
-            s.note(delay, (end.seconds().unwrap_or_default().max(0.0) * sr) as u32, key, vel * gain, dest);
+            s.note_pan(delay, (end.seconds().unwrap_or_default().max(0.0) * sr) as u32, key, vel * gain, dest, pan);
+        }
+    } else if ch.kind == VoiceKind::Plugin {
+        // the level on top goes to the instance's output, not into the velocity (a plugin's
+        // velocity changes its timbre)
+        if let Some(s) = plugs.get(ch.id) {
+            s.note(delay, (end.seconds().unwrap_or_default().max(0.0) * sr) as u32, key, vel, dest, gain);
         }
     } else {
-        voices.note(ch, idx, dest, delay, end, key, vel, gain);
+        voices.note(ch, idx, dest, delay, end, key, vel, gain, pan);
+    }
+}
+
+/// A slide note of channel `ch`: its sounding notes glide to `key` over `len` samples. Plugin
+/// instruments have no way to be told (FL Studio's slide notes are native-only too).
+fn slide(voices: &mut VoicePool, synths: &mut SynthBank, ch: &ChanRt, delay: u32, key: u8, len: f32) {
+    match ch.kind {
+        VoiceKind::Synth => {
+            if let Some(s) = synths.get(ch.id) {
+                s.slide(delay, key, len.max(0.0) as u32);
+            }
+        }
+        VoiceKind::Sample | VoiceKind::Keys => voices.slide(ch.id, delay, key, len.max(0.0) as u32),
+        VoiceKind::Plugin | VoiceKind::Click { .. } => {}
+    }
+}
+
+/// Adds what the inserts of level `lv` send into their targets' send inputs: the post-fader
+/// output times the send level (ramped across the block), through the send's delay line.
+/// `tl`/`tr`: scratch, at least `n` long. An idle insert sends silence (its delay lines still
+/// play out what they hold).
+fn send_level(inserts: &mut [InsertRt], lv: usize, n: usize, tl: &mut [f32], tr: &mut [f32]) {
+    for a in 1..inserts.len() {
+        if inserts[a].level != lv {
+            continue;
+        }
+        for si in 0..inserts[a].sends.len() {
+            let to = inserts[a].sends[si].to;
+            let Some((src, dst)) = pair_mut(inserts, a, to) else { continue };
+            let idle = src.idle;
+            let s = &mut src.sends[si];
+            if idle && s.dly.0.is_empty() {
+                s.g_cur = s.gain;
+                continue;
+            }
+            let (g0, g1) = (s.g_cur, s.gain);
+            let step = (g1 - g0) / n as f32;
+            for i in 0..n {
+                let g = g0 + step * (i + 1) as f32;
+                (tl[i], tr[i]) = if idle { (0.0, 0.0) } else { (src.post_l[i] * g, src.post_r[i] * g) };
+            }
+            s.g_cur = g1;
+            s.dly.0.run(&mut tl[..n]);
+            s.dly.1.run(&mut tr[..n]);
+            if dst.fed {
+                for i in 0..n {
+                    dst.sl[i] += tl[i];
+                    dst.sr[i] += tr[i];
+                }
+            }
+        }
+    }
+}
+
+/// Two different inserts, mutably.
+fn pair_mut(v: &mut [InsertRt], a: usize, b: usize) -> Option<(&mut InsertRt, &mut InsertRt)> {
+    if a == b || a >= v.len() || b >= v.len() {
+        return None;
+    }
+    if a < b {
+        let (x, y) = v.split_at_mut(b);
+        Some((&mut x[a], &mut y[0]))
+    } else {
+        let (x, y) = v.split_at_mut(a);
+        Some((&mut y[0], &mut x[b]))
     }
 }
 
 /// One insert's turn in a block: silence gate, effect chain, fader/pan, PDC delay. Leaves the
 /// insert's output in `ins.l`/`ins.r` (or `ins.idle` set: it contributes nothing).
+/// `aligned`: the PDC delay is in the path (see `InsertRt::pdc_on`): while playing, and
+/// always in an offline render (its tail after the end still needs the compensation).
 #[allow(clippy::too_many_arguments)]
-fn process_insert(ins: &mut InsertRt, k: usize, n: usize, ctx: &ProcessCtx, enabled: bool, watch: &[Id], taps: &mut Taps, shared: &Shared) {
+fn process_insert(
+    ins: &mut InsertRt,
+    k: usize,
+    n: usize,
+    ctx: &ProcessCtx,
+    aligned: bool,
+    enabled: bool,
+    watch: &[Id],
+    taps: &mut Taps,
+    shared: &Shared,
+) {
     // also set here: offline renders run chains on worker threads, each with its own float mode
     let _no_denormals = crate::processor::NoDenormals::new();
     let gate = gate(ins, n, enabled, watch);
@@ -1782,6 +2413,8 @@ fn process_insert(ins: &mut InsertRt, k: usize, n: usize, ctx: &ProcessCtx, enab
         ins.g_cur = if ins.on { ins.gain } else { 0.0 };
         return;
     }
+    // the chain, the fader or the PDC line writes into the buffer this block
+    ins.dirty = true;
     if gate == Gate::Run {
         run_chain(ins, n, ctx, watch, taps, shared);
     }
@@ -1817,17 +2450,35 @@ fn process_insert(ins: &mut InsertRt, k: usize, n: usize, ctx: &ProcessCtx, enab
         }
     }
     ins.g_cur = target;
-    if !ins.pdc_l.is_empty() && !ins.low_lat {
+    if !ins.sends.is_empty() {
+        ins.post_l[..n].copy_from_slice(&ins.l[..n]);
+        ins.post_r[..n].copy_from_slice(&ins.r[..n]);
+    }
+    if !ins.pdc_l.is_empty() && !ins.low_lat && (aligned || ins.pdc_on) {
         let d = ins.pdc_l.len();
+        // a stop switches from delayed to direct output: crossfade across this block instead of
+        // jumping (tails still ringing would click). A start switches at once: the line is empty
+        // then, and what plays first is the pre-roll, not heard.
+        let (from, to) = (if ins.pdc_on && !aligned { 1.0 } else { 0.0 }, if aligned { 1.0 } else { 0.0 });
+        let from = if aligned { 1.0 } else { from };
+        let step = (to - from) / n as f32;
         for i in 0..n {
             let w = ins.pdc_w;
             let (a, b) = (ins.pdc_l[w], ins.pdc_r[w]);
             ins.pdc_l[w] = ins.l[i];
             ins.pdc_r[w] = ins.r[i];
-            ins.l[i] = a;
-            ins.r[i] = b;
+            let k = if from == to { to } else { from + step * (i + 1) as f32 };
+            ins.l[i] = a * k + ins.l[i] * (1.0 - k);
+            ins.r[i] = b * k + ins.r[i] * (1.0 - k);
             ins.pdc_w = if w + 1 == d { 0 } else { w + 1 };
         }
+        if !aligned {
+            // stopped: the line restarts empty at the next play (bounded: the line's length, once per stop)
+            ins.pdc_l.fill(0.0);
+            ins.pdc_r.fill(0.0);
+            ins.pdc_w = 0;
+        }
+        ins.pdc_on = aligned;
     }
 }
 
@@ -1850,7 +2501,10 @@ fn gate(ins: &mut InsertRt, n: usize, enabled: bool, watch: &[Id]) -> Gate {
     if !enabled {
         return Gate::Run;
     }
-    let silent = ins.l[..n].iter().all(|&x| x == 0.0) && ins.r[..n].iter().all(|&x| x == 0.0);
+    // scanning the full input of every insert every block is O(inserts × block) at any project
+    // size: while nothing wrote into the buffer it is known zeros, so only a written one (the
+    // `dirty` writers, see [`InsertRt`]) has to be scanned at all
+    let silent = if ins.dirty { ins.l[..n].iter().all(|&x| x == 0.0) && ins.r[..n].iter().all(|&x| x == 0.0) } else { true };
     if !silent {
         ins.quiet = 0;
         ins.parked = false;
@@ -1867,6 +2521,18 @@ fn gate(ins: &mut InsertRt, n: usize, enabled: bool, watch: &[Id]) -> Gate {
                 return Gate::Run;
             }
             if s.bypass {
+                // a bypass ramp-out — and the dry handoff after it — is still audible: the
+                // chain keeps running until both fades settle, whatever the tails say. The
+                // flip may land after the silence began, so the elapsed quiet does not cover
+                // the fade; parking here would freeze it mid-ramp and cut the wet (or the
+                // still-late dry) at a block boundary. run_chain only advances a slot's fades
+                // where it runs the slot at all (low-latency monitoring skips delayed slots),
+                // so a fade that cannot advance must not hold the chain awake either.
+                let delayed = !s.dly_l.is_empty();
+                let fading = (s.fade > 0.0 && s.proc.is_some()) || (s.dly_fade > 0.0 && delayed);
+                if fading && (!ins.low_lat || !delayed) {
+                    return Gate::Run;
+                }
                 continue;
             }
             tail = tail.saturating_add(s.dly_l.len());
@@ -1899,6 +2565,9 @@ fn gate(ins: &mut InsertRt, n: usize, enabled: bool, watch: &[Id]) -> Gate {
 
 fn run_chain(ins: &mut InsertRt, n: usize, ctx: &ProcessCtx, watch: &[Id], taps: &mut Taps, shared: &Shared) {
     let low_lat = ins.low_lat;
+    // bypass declick: the wet contribution ramps over ~5 ms in either direction, so flipping
+    // bypass never cuts a ringing tail (or a fed delay line) in one sample
+    let declick = 1.0 / (0.005 * ctx.sample_rate);
     for slot in ins.fx.iter_mut() {
         let delayed = !slot.dly_l.is_empty();
         if low_lat && delayed {
@@ -1908,34 +2577,79 @@ fn run_chain(ins: &mut InsertRt, n: usize, ctx: &ProcessCtx, watch: &[Id], taps:
         if let Some(w) = w {
             push_tap(&mut taps.input[w], &ins.l[..n], &ins.r[..n]);
         }
+        // the wet path runs while it is audible or still ramping out: a bypassed slot whose
+        // fade has reached 0 costs nothing again
+        let fading = (!slot.bypass && slot.mix > 0.0005) || (slot.bypass && slot.fade > 0.0);
+        // the wet is gone, but the dry path still sits on the old latency: hand it back in a
+        // second declick (dropping the delay in one step would click with a phase jump)
+        let releasing = slot.bypass && slot.fade <= 0.0 && slot.dly_fade > 0.0 && delayed;
         if !slot.bypass && slot.mix <= 0.0005 && delayed {
             // fully dry: still late by the latency PDC is compensating for
             slot.delay_dry(&mut ins.l[..n], &mut ins.r[..n]);
-        } else if !slot.bypass && slot.mix > 0.0005 {
+        } else if releasing {
+            ins.dry_l[..n].copy_from_slice(&ins.l[..n]);
+            ins.dry_r[..n].copy_from_slice(&ins.r[..n]);
+            slot.delay_dry(&mut ins.l[..n], &mut ins.r[..n]);
+            let mut w = slot.dly_fade;
+            for i in 0..n {
+                w -= declick;
+                if w < 0.0 {
+                    w = 0.0;
+                }
+                ins.l[i] += (ins.dry_l[i] - ins.l[i]) * (1.0 - w);
+                ins.r[i] += (ins.dry_r[i] - ins.r[i]) * (1.0 - w);
+            }
+            slot.dly_fade = w;
+            if w == 0.0 {
+                slot.clear_delay();
+            }
+        } else if fading {
             if let Some(p) = slot.proc.as_mut() {
                 let mix = slot.mix.min(1.0);
-                if mix < 0.9995 || delayed {
+                let mut g = slot.fade;
+                let down = slot.bypass;
+                // the ramp must run whenever the wet scale is not settled: a bypass flip at
+                // full Mix arrives with g == 1.0 and still has to ramp down to dry
+                let blending = mix < 0.9995 || g < 0.9995 || down;
+                if blending || delayed {
                     ins.dry_l[..n].copy_from_slice(&ins.l[..n]);
                     ins.dry_r[..n].copy_from_slice(&ins.r[..n]);
                 }
                 p.process(&mut ins.l[..n], &mut ins.r[..n], ctx);
+                // a misbehaving (hosted) effect must not poison the effects after it and the
+                // mix: a filter fed one NaN stays NaN for good
+                finite_or_silent(&mut ins.l[..n]);
+                finite_or_silent(&mut ins.r[..n]);
                 if delayed {
                     // the line runs at every Mix so lowering it never plays stale audio
                     slot.delay_dry(&mut ins.dry_l[..n], &mut ins.dry_r[..n]);
                 }
-                if mix < 0.9995 {
+                if blending {
                     for i in 0..n {
-                        ins.l[i] = ins.dry_l[i] + (ins.l[i] - ins.dry_l[i]) * mix;
-                        ins.r[i] = ins.dry_r[i] + (ins.r[i] - ins.dry_r[i]) * mix;
+                        if down {
+                            g -= declick;
+                            if g < 0.0 {
+                                g = 0.0;
+                            }
+                        } else {
+                            g += declick;
+                            if g > 1.0 {
+                                g = 1.0;
+                            }
+                        }
+                        let wet = mix * g;
+                        ins.l[i] = ins.dry_l[i] + (ins.l[i] - ins.dry_l[i]) * wet;
+                        ins.r[i] = ins.dry_r[i] + (ins.r[i] - ins.dry_r[i]) * wet;
                     }
                 }
+                slot.fade = g;
             }
         }
         if let Some(w) = w {
             let wet = if slot.bypass { None } else { slot.proc.as_ref().and_then(|p| p.wet_tap()) };
             match wet {
-                Some(wet) if !wet.is_empty() => push_mono(&mut taps.output[w], wet),
-                _ => push_tap(&mut taps.output[w], &ins.l[..n], &ins.r[..n]),
+                Some(wet) if !wet.is_empty() => push_stereo(&mut taps.output[w], wet, wet),
+                _ => push_stereo(&mut taps.output[w], &ins.l[..n], &ins.r[..n]),
             }
             let gr = if slot.bypass { 0.0 } else { slot.proc.as_ref().map(|p| p.gain_reduction_db()).unwrap_or(0.0) };
             fset(&shared.gr[w], gr);
@@ -1959,12 +2673,15 @@ fn push_tap(p: &mut rtrb::Producer<f32>, l: &[f32], r: &[f32]) {
     }
 }
 
-fn push_mono(p: &mut rtrb::Producer<f32>, x: &[f32]) {
-    if p.slots() < x.len() {
+/// The output tap is stereo (interleaved L, R), for the windows that draw the stereo field.
+fn push_stereo(p: &mut rtrb::Producer<f32>, l: &[f32], r: &[f32]) {
+    let n = l.len().min(r.len());
+    if p.slots() < 2 * n {
         return;
     }
-    for &v in x {
-        let _ = p.push(v);
+    for i in 0..n {
+        let _ = p.push(l[i]);
+        let _ = p.push(r[i]);
     }
 }
 
@@ -2008,17 +2725,45 @@ fn carry_automated(new: &mut Timeline, old: &Timeline) {
     }
 }
 
+/// The value a target's automation clips give it at `beat` (FL Studio / Ableton / Bitwig): the
+/// clip under the playhead (the latest-starting one where clips overlap); between clips, where
+/// the last one before ended; before the first clip, where that clip begins. So the value never
+/// depends on what played before (a jump back to the song start used to keep the last pass's
+/// value or the static one until the first clip was reached).
+fn drive_value(tl: &Timeline, d: &Drive, beat: f64) -> Option<f32> {
+    let env_at = |ci: usize, t: f64| {
+        let c = &tl.clips[ci];
+        let ClipSrc::Auto(ai) = c.src else { return None };
+        tl.autos.get(ai)?.env.value_at(t - c.start + c.offset)
+    };
+    let mut covering = None;
+    let mut ended: Option<usize> = None;
+    for &ci in &d.clips {
+        let c = &tl.clips[ci];
+        if c.start > beat {
+            break;
+        }
+        if beat < c.end {
+            covering = Some(ci);
+        } else if ended.is_none_or(|e| c.end >= tl.clips[e].end) {
+            ended = Some(ci);
+        }
+    }
+    if let Some(ci) = covering {
+        return env_at(ci, beat);
+    }
+    if let Some(ci) = ended {
+        return env_at(ci, tl.clips[ci].end);
+    }
+    let &first = d.clips.first()?;
+    env_at(first, tl.clips[first].start)
+}
+
 /// Moves automated parameters to their value at `beat`. Allocation-free.
 fn apply_automation(tl: &mut Timeline, g: &mut Graph, synths: &mut crate::poly::SynthBank, beat: f64) {
-    for ci in 0..tl.clips.len() {
-        let c = &tl.clips[ci];
-        let ClipSrc::Auto(ai) = c.src else { continue };
-        if beat < c.start || beat >= c.end {
-            continue;
-        }
-        let Some(a) = tl.autos.get(ai) else { continue };
-        let Some(v) = a.env.value_at(beat - c.start + c.offset) else { continue };
-        let target = a.target;
+    for di in 0..tl.drives.len() {
+        let Some(v) = drive_value(tl, &tl.drives[di], beat) else { continue };
+        let target = tl.drives[di].target;
         match target {
             TargetRt::Param { fx, idx, min, max, log } => {
                 if let Some(s) = slot(g, fx) {
@@ -2131,7 +2876,7 @@ pub const CLIP_GAIN_DB: (f32, f32) = (-24.0, 12.0);
 
 /// The part of a pattern `len` beats long that its loop preview plays: `range` kept inside the
 /// pattern, or the whole pattern when there is none or it is too short to loop (< 1/64 beat).
-fn loop_span(range: Option<(f64, f64)>, len: f64) -> (f64, f64) {
+pub(crate) fn loop_span(range: Option<(f64, f64)>, len: f64) -> (f64, f64) {
     match range {
         Some((a, b)) if a.is_finite() && b.is_finite() => {
             let (a, b) = (a.min(b).clamp(0.0, len), a.max(b).clamp(0.0, len));
@@ -2142,5 +2887,28 @@ fn loop_span(range: Option<(f64, f64)>, len: f64) -> (f64, f64) {
             }
         }
         _ => (0.0, len),
+    }
+}
+
+#[cfg(test)]
+mod underrun_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_callback_slower_than_its_audio_misses_the_deadline() {
+        let period = 256.0 / 48000.0; // 5.3 ms
+        assert!(!missed_deadline(0.0, period));
+        assert!(!missed_deadline(period * 0.99, period));
+        assert!(!missed_deadline(period, period));
+        assert!(missed_deadline(period * 1.01, period));
+    }
+
+    #[test]
+    fn underruns_only_count_up() {
+        let s = Shared::new();
+        assert_eq!(s.underruns(), 0);
+        s.add_underrun();
+        s.add_underrun();
+        assert_eq!(s.underruns(), 2);
     }
 }

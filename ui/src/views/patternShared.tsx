@@ -1,26 +1,25 @@
 // What the Channel Rack and the Piano roll windows share: sizing hooks, the window frame
-// (move, resize, focus, keys that must not reach the playlist), channel and pattern menus.
-import { createEffect, createSignal, onCleanup, onMount, type JSX } from 'solid-js';
+// (move, resize and focus live in PanelFrame; here: keys that must not reach the playlist), channel and pattern menus.
+import { createEffect, createSignal, onCleanup, onMount } from 'solid-js';
 import { t, tName } from '../lib/i18n';
 import type { Channel, LibFile, Note, Pattern } from '../api/types';
-import { clamp } from '../lib/format';
 import { FACTORY_KIT, LIB_SCHEME } from '../lib/factory';
 import { barsText, clearChannel, fillEvery, notesText, rotate, stepsOf } from '../lib/pattern';
+import { cleanGroup, rackGroups } from '../lib/rackGroups';
 import { libGroup, loadStdLib, stdLibGroups } from '../state/library';
+import { ensurePluginScan, pluginScan, runPluginScan } from '../state/pluginScan';
 import { isTypingKey } from '../state/typingKeys';
 import { commit } from '../state/edit';
+import { pickInsert, type InsertChoice } from '../ui/InsertPicker';
 import {
-  addBar, addKeys, addSampler, addSamplerFiles, addSynth, audition, chanKindLabel, channels, clonePattern, cloneChannel, curPat, deleteChannel,
+  addBar, addKeys, addPlugin, addSampler, addSamplerFiles, addSynth, audition, chanKindLabel, chanOp, channels, clonePattern, cloneChannel, curPat, deleteChannel,
   deletePattern, type InstrumentPick, newPattern, nextEmptyPattern, openPattern, openRack, openRoll, putNotes, recolorPattern, removeBar, renamePattern, replaceChannel, replaceWithFile, setChannel, setCurPattern, splitByChannel,
-  rollMoved, setRackDock, setRollDock,
+  rollMoved,
 } from '../state/pattern';
-import { Icon } from '../ui/icons';
 import { arrVersion, S } from '../state/store';
 import { openMenu, openRename, say, setU, U, type MenuItem, type PatWin } from '../state/ui';
-import { track } from '../ui/drag';
 import { libGlyph, PICK_GLYPH, synthCategoryGlyph } from '../ui/menuIcons';
 import { theme } from '../ui/theme';
-import { moveWindow } from './FxWindow';
 import { midiExport, midiImport } from '../state/actions';
 
 /** Size of an element, tracked. */
@@ -44,7 +43,7 @@ export function useDataVersion() {
 
 /**
  * Keys typed while a pattern window has the focus never edit the playlist behind it: selection,
- * delete, clipboard and nudge shortcuts stop here (Space, Ctrl+Z, F-keys and Esc stay global).
+ * delete, clipboard, mute (Alt+M) and nudge shortcuts stop here (Space, Ctrl+Z, Ctrl+M = metronome, F-keys and Esc stay global).
  * `own` handles the window's own keys first.
  */
 export function guardKeys(e: KeyboardEvent, own?: (e: KeyboardEvent) => void) {
@@ -52,71 +51,18 @@ export function guardKeys(e: KeyboardEvent, own?: (e: KeyboardEvent) => void) {
   own?.(e);
   if (e.cancelBubble) return;
   const m = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();
-  if (e.key === 'Delete' || e.key === 'Backspace' || e.key.startsWith('Arrow') || (m && !e.shiftKey && 'abcdxvm'.includes(k) && k.length === 1)) { e.preventDefault(); e.stopPropagation(); }
+  if (e.key === 'Delete' || e.key === 'Backspace' || e.key.startsWith('Arrow') || (m && !e.shiftKey && 'abcdxv'.includes(k) && k.length === 1) || (e.altKey && !m && e.code === 'KeyM')) { e.preventDefault(); e.stopPropagation(); }
   // the playlist's tool letters: a window that does not use one must not switch the tool behind it
   else if (!m && !e.altKey && k.length === 1 && 'pbdtce'.includes(k)) e.stopPropagation();
 }
 
-/**
- * A pattern window: frame, title bar (drag to move), bottom-right resize grip. `docked`: the same
- * frame laid out in the main window instead (no move, no grip, never "in front"); it keeps
- * `.win.patwin` so the keyboard rules of the floating window (focus, guarded keys) stay the same.
- */
-export function PatFrame(props: {
-  win: PatWin; key: 'rackWin' | 'rollWin'; z: number; class: string; minW: number; minH: number; docked?: boolean;
-  front: () => void; onKey?: (e: KeyboardEvent) => void; head: JSX.Element; children: JSX.Element;
-  /** Below this height (px) the window hides its status / hint footer (`.pstatus`) to keep room for the editor. */
-  compactH: number;
-  /** Wheel over the title bar (the Channel Rack switches pattern). */
-  onHeadWheel?: (e: WheelEvent) => void;
-  /** Double-click on the empty part of the title bar (the Piano roll maximises / restores). */
-  onHeadDbl?: () => void;
-}) {
-  let root!: HTMLDivElement;
-  const W = () => props.win;
-  // a short window (small screen, both panels docked) drops the hint footer: the rows matter more
-  const size = useSize(() => root);
-  const compact = () => size().h > 0 && size().h < props.compactH;
-  // a move or resize the user makes takes the Piano roll out of full screen (it then stays where they put it)
-  const put = (g: Partial<PatWin>) => {
-    const w = W(); if (Object.entries(g).every(([k, v]) => w[k as keyof PatWin] === v)) return;
-    if (props.key === 'rollWin') rollMoved();
-    setU(props.key, o => o && { ...o, ...g });
+/** A pattern window's place, for `PanelFrame`. A move or resize by the user takes the Piano roll
+ * out of full screen (it then stays where they put it). */
+export function patGeom(key: 'rackWin' | 'rollWin') {
+  return {
+    geom: () => U[key]!,
+    setGeom: (g: Partial<PatWin>) => { if (key === 'rollWin') rollMoved(); setU(key, o => o && { ...o, ...g }); },
   };
-  const resize = (e: PointerEvent) => {
-    if (e.button !== 0) return; e.preventDefault(); e.stopPropagation();
-    const sx = e.clientX, sy = e.clientY, o = { ...W() };
-    track(ev => put({ w: clamp(o.w + ev.clientX - sx, props.minW, window.innerWidth - 20), h: clamp(o.h + ev.clientY - sy, props.minH, window.innerHeight - 20) }), null, 'nwse-resize');
-  };
-  return (
-    <div ref={root} tabIndex={0} class={'win patwin ' + props.class} classList={{ docked: !!props.docked, compact: compact() }}
-      style={props.docked ? undefined : { left: W().x + 'px', top: W().y + 'px', width: W().w + 'px', height: W().h + 'px', 'z-index': props.z }}
-      onPointerDown={e => { if (!props.docked) props.front(); const tg = (e.target as HTMLElement).tagName; if (tg !== 'SELECT' && tg !== 'INPUT') root.focus({ preventScroll: true }); }}
-      onKeyDown={e => guardKeys(e, props.onKey)}>
-      <div class="winhd" onPointerDown={e => { if (!props.docked) moveWindow(e, () => W(), (x, y) => put({ x, y })); }} onWheel={e => props.onHeadWheel?.(e)}
-        onDblClick={e => { if (!props.docked && !(e.target as HTMLElement).closest('button, select, input, .numf, .seg')) props.onHeadDbl?.(); }}>{props.head}</div>
-      {props.children}
-      {!props.docked && <div class="resizer" onPointerDown={resize} title={t('b.pe.resize')} />}
-    </div>
-  );
-}
-
-/** Dock-left / dock-bottom glyphs (a frame with the panel's side drawn) and the float glyph (two windows). */
-const DOCK_ICON = { rack: 'M4 5h16v14H4z M10 5v14', roll: 'M4 5h16v14H4z M4 13h16' } as const;
-const FLOAT_ICON = 'M9 9h11v10H9z M5 15H4V5h11v1';
-/**
- * The title-bar button that switches a pattern window between floating and docked (the Channel
- * Rack docks left of the Playlist, the Piano roll under it). The View menu has the same switch.
- */
-export function DockBtn(props: { which: 'rack' | 'roll' }) {
-  const docked = () => (props.which === 'rack' ? U.rackDock : U.rollDock);
-  const tip = () => t(docked() ? 'b.dk.float' : props.which === 'rack' ? 'b.dk.dockLeft' : 'b.dk.dockBottom');
-  return (
-    <button class="iconbtn dockbtn" title={tip()} aria-label={tip()} aria-pressed={docked()}
-      onClick={() => (props.which === 'rack' ? setRackDock : setRollDock)(!docked())}>
-      <Icon d={docked() ? FLOAT_ICON : DOCK_ICON[props.which]} size={13} />
-    </button>
-  );
 }
 
 // ---------------------------------------------------------------- channel menus
@@ -131,10 +77,15 @@ export function insTitle(c: Channel): string {
   const m = S.project.inserts.find(x => x.id === c.insert);
   return t('b.pe.insTo', { name: m ? (m.id === 0 ? 'Master' : m.name) : '?' });
 }
+/** A channel's mixer box as an insert choice (the same one the channel window's MIXER picker makes). */
+export function chanInsertChoice(c: Channel): InsertChoice {
+  return { value: c.insert ?? null, nullLabel: t('b.cw.likeClipTrack'), ops: insert => [chanOp(c, { insert })], label: t('b.pe.mixCh'), wheelKey: 'cins' + c.id, free: { name: c.name, color: c.color } };
+}
+
 export function insertMenu(c: Channel, x: number, y: number) {
   const items: MenuItem[] = [{ t: 'title', label: t('b.pe.mixChName', { name: c.name }) },
-    { t: 'item', label: t('b.pe.clipTrack'), kbd: c.insert == null ? '✓' : '', title: t('b.pe.clipTrackTitle'), act: () => setChannel(c, { insert: null }, t('b.pe.mixCh')) }, { t: 'sep' }];
-  S.project.inserts.forEach((m, i) => items.push({ t: 'item', label: i === 0 ? 'Master' : i + ' · ' + m.name, kbd: c.insert === m.id ? '✓' : '', act: () => { setChannel(c, { insert: m.id }, t('b.pe.mixCh')); say(c.name + ' → ' + (i === 0 ? 'Master' : t('b.pe.insWord', { n: i }))); } }));
+    { t: 'item', label: t('b.pe.clipTrack'), kbd: c.insert == null ? '✓' : '', title: t('b.pe.clipTrackTitle'), act: () => pickInsert(chanInsertChoice(c), null) }, { t: 'sep' }];
+  S.project.inserts.forEach((m, i) => items.push({ t: 'item', label: i === 0 ? 'Master' : i + ' · ' + m.name, kbd: c.insert === m.id ? '✓' : '', act: () => pickInsert(chanInsertChoice(c), m.id) }));
   openMenu(x, y, items, Math.min(window.innerHeight - 20, 60 + items.length * 26));
 }
 
@@ -153,17 +104,33 @@ export function chanMenu(c: Channel, x: number, y: number, clipboardItems: MenuI
     { t: 'item', label: t('b.pe.fill2'), act: () => edit(fillEvery(pt.notes, c.id, steps, 2), t('b.pe.fill')) },
     { t: 'item', label: t('b.pe.fill4'), act: () => edit(fillEvery(pt.notes, c.id, steps, 4), t('b.pe.fill')) },
     { t: 'item', label: t('b.pe.fill8'), act: () => edit(fillEvery(pt.notes, c.id, steps, 8), t('b.pe.fill')) },
-    { t: 'item', label: t('b.pe.shiftL'), kbd: 'Shift+Alt+←', act: () => edit(rotate(pt.notes, c.id, steps, -1), t('b.pe.shiftSteps')) },
-    { t: 'item', label: t('b.pe.shiftR'), kbd: 'Shift+Alt+→', act: () => edit(rotate(pt.notes, c.id, steps, 1), t('b.pe.shiftSteps')) },
+    { t: 'item', label: t('b.pe.shiftL'), kbd: 'Shift+Ctrl+←', act: () => edit(rotate(pt.notes, c.id, steps, -1), t('b.pe.shiftSteps')) },
+    { t: 'item', label: t('b.pe.shiftR'), kbd: 'Shift+Ctrl+→', act: () => edit(rotate(pt.notes, c.id, steps, 1), t('b.pe.shiftSteps')) },
     { t: 'item', label: t('b.pe.clear'), disabled: !pt.notes.some(n => n.ch === c.id), act: () => edit(clearChannel(pt.notes, c.id), t('b.pe.clearCh')) },
     { t: 'sep' },
     { t: 'item', label: t('b.pe.preview'), kbd: t('b.pe.ctrlClick'), act: () => audition(c.id, undefined, 0.8, true) },
     { t: 'item', label: t('b.pe.rename'), act: () => openRename(x, y, c.name, v => v.trim() && setChannel(c, { name: v.trim() }, t('b.pe.chName'))) },
+    { t: 'sub', label: t('b.rk.groupMenu'), items: groupItems(c, x, y) },
     { t: 'swatches', current: c.color, pick: col => setChannel(c, { color: col }, t('b.pe.chColor')) },
     { t: 'item', label: t('b.pe.clone'), act: () => cloneChannel(c) },
     { t: 'sep' },
     { t: 'item', label: t('b.pe.delete'), danger: true, act: () => deleteChannel(c) },
   ], 520);
+}
+
+/** FL's filter groups: put the channel in an existing group, a new one, or none. */
+function groupItems(c: Channel, x: number, y: number): MenuItem[] {
+  const groups = rackGroups(channels());
+  const put = (g: string | undefined) => {
+    setChannel(c, { group: g }, t('b.rk.groupSetGest'));
+    say(g ? t('b.rk.groupJoined', { name: c.name, group: g }) : t('b.rk.groupLeft', { name: c.name }));
+  };
+  return [
+    ...groups.map((g): MenuItem => ({ t: 'item', label: g.name, checked: c.group === g.name, act: () => put(g.name) })),
+    ...(groups.length ? [{ t: 'sep' } as MenuItem] : []),
+    { t: 'item', label: t('b.rk.groupNew'), act: () => openRename(x, y, '', v => { const g = cleanGroup(v); if (g) put(g); }, t('b.rk.groupNewTitle')) },
+    { t: 'item', label: t('b.rk.groupClear'), disabled: !c.group, act: () => put(undefined) },
+  ];
 }
 
 /**
@@ -192,6 +159,34 @@ function instrumentItems(pick: (p: InstrumentPick) => void, file: (f?: LibFile) 
     items.push({ t: 'item', label: t('b.pe.menuSynthEmpty'), glyph: PICK_GLYPH.emptySynth, act: () => pick({ kind: 'synth', preset: null }) });
   }
   items.push({ t: 'sep' }, { t: 'title', label: t('b.pe.menuSampled') }, { t: 'item', label: t('b.pe.menuKeys'), glyph: PICK_GLYPH.keys, act: () => pick({ kind: 'keys' }) });
+  items.push({ t: 'sep' }, { t: 'title', label: t('b.pe.menuPlugins') }, ...pluginItems(pick));
+  return items;
+}
+
+/** Most instruments listed directly; more are grouped by vendor. */
+const FLAT_PLUGINS = 12;
+
+/** The scanned VST3 instruments (FL's generators), and a rescan for new ones. */
+function pluginItems(pick: (p: InstrumentPick) => void): MenuItem[] {
+  const r = pluginScan();
+  if (!r) { ensurePluginScan(); return [{ t: 'item', label: t('b.pe.menuPluginsScanning'), disabled: true, act: () => {} }]; }
+  const list = r.instruments ?? [];
+  const item = (p: (typeof list)[number]): MenuItem => ({
+    t: 'item', label: p.name, glyph: PICK_GLYPH.plugin, title: [p.vendor, p.category, p.path].filter(Boolean).join(' · '),
+    act: () => pick({ kind: 'plugin', plugin: p }),
+  });
+  const items: MenuItem[] = [];
+  if (!list.length) items.push({ t: 'item', label: t('b.pe.menuPluginsNone'), title: t('b.pe.menuPluginsNoneTip'), disabled: true, act: () => {} });
+  else if (list.length <= FLAT_PLUGINS) items.push(...list.map(item));
+  else {
+    const vendors = new Map<string, typeof list>();
+    for (const p of list) { const v = p.vendor || '—'; vendors.set(v, [...(vendors.get(v) ?? []), p]); }
+    for (const [v, ps] of [...vendors].sort((a, b) => a[0].localeCompare(b[0]))) items.push({ t: 'sub', label: v, glyph: PICK_GLYPH.plugin, items: ps.map(item) });
+  }
+  items.push({ t: 'item', label: t('b.pe.menuRescan'), title: t('b.pe.menuRescanTip'), act: () => {
+    say(t('b.pe.rescanning'));
+    void runPluginScan(true).then(s => say(t('b.pe.rescanDone', { n: (s.instruments ?? []).length })));
+  } });
   return items;
 }
 
@@ -199,6 +194,7 @@ export function addChannelMenu(x: number, y: number) {
   const add = (p: InstrumentPick) => {
     if (p.kind === 'synth') addSynth(p.preset);
     else if (p.kind === 'keys') addKeys();
+    else if (p.kind === 'plugin') addPlugin(p.plugin);
     else addSampler(p.source);
   };
   const items = instrumentItems(add, f => void addSamplerFiles(f ? [f] : null));
@@ -216,7 +212,7 @@ export function renameCurrent(x: number, y: number) {
 
 
 /** What can be done to one pattern: rename, clone, split by channel, length, colour, delete. */
-function patItems(p: Pattern, x: number, y: number): MenuItem[] {
+export function patItems(p: Pattern, x: number, y: number): MenuItem[] {
   const last = S.project.patterns.length < 2;
   return [
     { t: 'item', label: t('b.pm.rename'), kbd: p.id === curPat()?.id ? 'F2' : undefined, act: () => openRename(x, y, p.name, v => renamePattern(p, v)) },
@@ -258,3 +254,13 @@ export function patternMenu(x: number, y: number, showRack = false) {
 
 /** "3 notes · 2 bars" for status lines. */
 export const patSummary = () => { const pt = curPat(); return pt ? notesText(pt.notes.length) + ' · ' + barsText(pt.len / 4) : ''; };
+
+/** The pattern an editor window shows, as a chip: its colour and name; a click lists the patterns. One for the Channel rack and the Piano roll. */
+export function PatternChip(props: { pat: Pattern }) {
+  return (
+    <button class="patname" title={t('b.rk.patTitle')} onClick={e => { const r = (e.currentTarget as HTMLElement).getBoundingClientRect(); patternMenu(r.left, r.bottom + 4); }}>
+      <span class="sw" style={{ background: props.pat.color }} /><span class="ell">{props.pat.name}</span>
+      <svg width="8" height="8" viewBox="0 0 8 8"><path d="M1 2.5l3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.3" /></svg>
+    </button>
+  );
+}

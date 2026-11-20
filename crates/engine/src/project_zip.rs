@@ -69,7 +69,7 @@ pub(crate) fn write(mut project: Project, destination: &Path, origin: Option<&Pa
         names.insert(key, name);
     }
 
-    zip.start_file(format!("{}.wave", portable_name(project_name)), options).map_err(|e| output_error(&e))?;
+    zip.start_file(format!("{}.synkopa", portable_name(project_name)), options).map_err(|e| output_error(&e))?;
     let document = serde_json::to_vec_pretty(&project_document(&project)).map_err(|e| output_error(&e))?;
     zip.write_all(&document).map_err(|e| output_error(&e))?;
     zip.finish().map_err(|e| output_error(&e))?;
@@ -138,7 +138,7 @@ mod tests {
         });
         project.inserts[0].fx.push(fx);
         let engine = Engine::new(project, Arc::new(NoPlugins));
-        let (imported, _) = engine.import_audio(&[first.clone(), second, first], Some((0, 0.0))).unwrap();
+        let (imported, ..) = engine.import_audio(&[first.clone(), second, first], Some((0, 0.0))).unwrap();
         engine.import_audio(&[PathBuf::from(factory::lib_path(factory::files()[2].file))], None).unwrap();
         engine.save(&project_file).unwrap();
         assert!(engine.open(&project_file).unwrap().is_empty());
@@ -156,7 +156,7 @@ mod tests {
         archive.extract(&unpacked).unwrap();
         fs::rename(&original, root.path().join("offline")).unwrap();
         let reopened = Engine::new(Project::empty(), Arc::new(NoPlugins));
-        assert!(reopened.open(&unpacked.join("Song.wave")).unwrap().is_empty());
+        assert!(reopened.open(&unpacked.join("Song.synkopa")).unwrap().is_empty());
         let mut recovered = reopened.project();
         let path_for = |id| &recovered.sources.iter().find(|s| s.id == id).unwrap().path;
         assert_eq!(path_for(imported[0]), path_for(imported[2]));

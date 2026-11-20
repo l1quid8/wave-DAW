@@ -1,10 +1,11 @@
 // Canvas rendering of the pattern windows: the Channel Rack step grid and graph editor, the
 // velocity lane and the piano roll. Static parts (cell backgrounds, key rows, grid lines, the keyboard) are cached
 // offscreen in `Layer`s keyed by geometry and theme; notes are drawn on top on change only.
+import { shadeBands, shadeUnit } from '../lib/gridShade';
 import type { Channel, Id, Note, Pattern } from '../api/types';
 import { t } from '../lib/i18n';
 import { mix } from '../lib/color';
-import { BEAT_GAP, gridW, inScale, keyOf, noteWidth, stepAt, stepX, velOf } from '../lib/pattern';
+import { BEAT_GAP, gridW, inScale, keyOf, noteWidth, stepAt, stepSpans, stepX, panOf, velOf } from '../lib/pattern';
 import { isBlack, noteName } from '../lib/pitch';
 import type { Layer } from '../ui/frameLoop';
 import { rgba, T, theme } from '../ui/theme';
@@ -27,7 +28,7 @@ export interface RackGeo { cw: number; sx: number; sy: number; rh: number; steps
 const STEP_PAD = 2, STEP_VPAD = 5, STEP_R = 3;
 /** Unlit step colours: alternating groups of four (beats), like FL's. */
 function stepOff(s: number) {
-  return mix(T.fg5, Math.floor(s / 4) % 2 ? (theme.light ? 18 : 13) : (theme.light ? 30 : 24), T.bg2);
+  return mix(T.fg5, Math.floor(s / 4) % 2 ? (theme.light ? 14 : 9) : (theme.light ? 34 : 30), T.bg2);
 }
 /** A lit step: one neutral colour for every channel (the channel colour is the row's strip); velocity = brightness. */
 function stepOn(v: number, dim: boolean) {
@@ -84,18 +85,20 @@ export function drawRack(g: CanvasRenderingContext2D, W: number, H: number, G: R
       }
       continue;
     }
-    for (const n of notes) {
-      const s = Math.round(n.step), x = stepX(s, G.cw) - G.sx;
-      if (x > W || x + G.cw < 0) continue;
+    // a trigger off the grid (a triplet) sits at its place inside the cell, as wide as the gap to the next one
+    const spans = stepSpans(notes);
+    notes.forEach((n, k) => {
+      const x = stepX(n.step, G.cw) - G.sx, cw = G.cw * spans[k];
+      if (x > W || x + cw < 0) return;
       g.fillStyle = stepOn(velOf(n), dim);
-      g.beginPath(); rr(g, x + STEP_PAD, y + vpad, G.cw - 2 * STEP_PAD, G.rh - 2 * vpad, STEP_R); g.fill();
+      g.beginPath(); rr(g, x + STEP_PAD, y + vpad, Math.max(3, cw - 2 * STEP_PAD), G.rh - 2 * vpad, Math.min(STEP_R, cw / 4)); g.fill();
       // a step with its own key (graph editor): its note name, or a tick when the cell is narrow
       if (n.p != null && n.p !== c.root) {
         g.fillStyle = T.onFill;
-        if (G.cw >= 18) { g.font = MONO8; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(noteName(n.p), x + G.cw / 2, y + G.rh / 2 + 1); }
-        else g.fillRect(x + G.cw / 2 - 1, y + G.rh - vpad - 4, 2, 2);
+        if (cw >= 18) { g.font = MONO8; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(noteName(n.p), x + cw / 2, y + G.rh / 2 + 1); }
+        else g.fillRect(x + cw / 2 - 1, y + G.rh - vpad - 4, 2, 2);
       }
-    }
+    });
   }
 }
 
@@ -113,9 +116,12 @@ export function drawRackHead(g: CanvasRenderingContext2D, W: number, H: number, 
 /** One velocity bar per note of the selected channel. `x0`: where step 0 is (px), `cw` px per step. */
 export function drawLane(g: CanvasRenderingContext2D, W: number, H: number, o: {
   x0: number; cw: number; sx: number; steps: number; notes: { n: Note; i: number }[]; color: string; sel?: Set<number>; cells: boolean; muted: boolean; beatGap?: boolean;
+  /** What a bar shows, 0..1 (default: the velocity); `bipolar` bars grow from the centre line (pan). */
+  value?: (n: Note) => number; bipolar?: boolean;
 }) {
   g.clearRect(0, 0, W, H);
   const top = 6, bh = H - top - 3;
+  const valueOf = o.value ?? velOf, mid = top + bh / 2;
   const px = (s: number) => (o.beatGap ? stepX(s, o.cw) : s * o.cw);
   const endX = Math.min(W, o.x0 + (o.beatGap ? gridW(o.steps, o.cw) : o.steps * o.cw) - o.sx);
   g.fillStyle = T.vizPanel; g.fillRect(0, 0, W, H);
@@ -123,18 +129,70 @@ export function drawLane(g: CanvasRenderingContext2D, W: number, H: number, o: {
   g.fillStyle = T.vizGrid2;
   for (const f of [0.25, 0.5, 0.75]) g.fillRect(o.x0, Math.round(top + bh * (1 - f)) + 0.5, endX - o.x0, 1);
   g.fillStyle = T.vizAxis; g.fillRect(o.x0, top, endX - o.x0, 1);
-  for (const { n, i } of o.notes) {
-    const v = velOf(n);
-    const x = o.x0 + px(o.cells ? Math.round(n.step) : n.step) - o.sx;
-    const w = o.cells ? Math.max(2, o.cw - 6) : Math.max(3, Math.min(8, n.len * o.cw - 2));
-    const bx = o.cells ? x + (o.cw - w) / 2 : x;
-    if (bx > W || bx + w < o.x0 - 4) continue;
-    const y = top + bh * (1 - v), sel = !!o.sel?.has(i);
+  if (o.bipolar) {
+    g.fillRect(o.x0, Math.round(mid) + 0.5, endX - o.x0, 1);
+  }
+  const spans = o.cells ? stepSpans(o.notes.map(x => x.n)) : [];
+  o.notes.forEach(({ n, i }, k) => {
+    const v = valueOf(n);
+    // in cells a bar stays in its step's column, wherever in the cell the note starts (its shift)
+    const x = o.x0 + px(o.cells ? Math.floor(n.step + 1e-3) : n.step) - o.sx, cw = o.cw * (spans[k] ?? 1);
+    const w = o.cells ? Math.max(2, cw - 6) : Math.max(3, Math.min(8, n.len * o.cw - 2));
+    const bx = o.cells ? x + (cw - w) / 2 : x;
+    if (bx > W || bx + w < o.x0 - 4) return;
+    const sel = !!o.sel?.has(i);
+    const y = top + bh * (1 - v), base = o.bipolar ? mid : top + bh;
     g.fillStyle = rgba(o.color, (o.muted ? 0.35 : 0.75) * (sel ? 1.25 : 1));
-    g.fillRect(bx, y, w, top + bh - y);
+    g.fillRect(bx, Math.min(y, base), w, Math.max(1, Math.abs(base - y)));
     g.fillStyle = sel ? T.fgHi : mix(o.color, 60, T.fgHi);
     g.fillRect(bx, y - 1, w, 2);
+  });
+  // which way is which, over the bars (the first step's bar sits right under the labels)
+  if (o.bipolar) {
+    g.fillStyle = T.fgHi; g.font = MONO8; g.textAlign = 'right'; g.textBaseline = 'middle';
+    g.fillText('R', endX - 4, top + 7); g.fillText('L', endX - 4, top + bh - 6);
   }
+}
+
+/** The colour of the Piano roll lane's handles: one per target, so the lane says what it edits. */
+export const laneColor = (mode: 'vel' | 'pan') => (mode === 'pan' ? T.pan : T.blue);
+
+/**
+ * The Piano roll's lane (FL's event editor): one handle per note of the channel — a stem from the
+ * base line to the value, a head, and a flag as long as the note. Velocity grows from the floor, pan
+ * from the centre line (up = right). Notes that start together (a chord) share a stem position; their
+ * flags differ by length, and with a selection the other notes fade and the selected ones are drawn
+ * last, in white: those are the ones a stroke changes.
+ */
+export function drawRollLane(g: CanvasRenderingContext2D, W: number, H: number, o: {
+  x0: number; pps: number; sx: number; steps: number; notes: { n: Note; i: number }[]; sel: Set<number>; muted: boolean; mode: 'vel' | 'pan';
+}) {
+  g.clearRect(0, 0, W, H);
+  const top = 7, bh = H - top - 5, pan = o.mode === 'pan';
+  const endX = Math.min(W, o.x0 + o.steps * o.pps - o.sx);
+  g.fillStyle = T.vizPanel; g.fillRect(0, 0, W, H);
+  g.fillStyle = T.viz; g.fillRect(o.x0, 0, endX - o.x0, H);
+  g.fillStyle = T.vizGrid2;
+  for (const f of [0.25, 0.5, 0.75]) if (!(pan && f === 0.5)) g.fillRect(o.x0, Math.round(top + bh * (1 - f)) + 0.5, endX - o.x0, 1);
+  g.fillStyle = T.vizAxis; g.fillRect(o.x0, top, endX - o.x0, 1);
+  const base = pan ? Math.round(top + bh / 2) + 0.5 : top + bh;
+  g.fillRect(o.x0, base, endX - o.x0, 1);
+  if (pan) {
+    g.fillStyle = T.fg6; g.font = MONO8; g.textAlign = 'left'; g.textBaseline = 'middle';
+    g.fillText('R', o.x0 + 4, top + 7); g.fillText('L', o.x0 + 4, top + bh - 6);
+  }
+  const col = laneColor(o.mode), some = o.sel.size > 0;
+  const one = ({ n, i }: { n: Note; i: number }) => {
+    const x = Math.round(o.x0 + n.step * o.pps - o.sx), fw = Math.max(5, n.len * o.pps - 2);
+    if (x > W || x + fw < o.x0 - 4) return;
+    const sel = o.sel.has(i), y = pan ? base - (bh / 2) * panOf(n) : top + bh * (1 - velOf(n));
+    const a = (o.muted ? 0.45 : 1) * (some && !sel ? 0.5 : 1), c = sel ? T.fgHi : col;
+    g.fillStyle = rgba(c, 0.3 * a); g.fillRect(x, y - 1, fw, 2); // the flag: the note's length
+    g.fillStyle = rgba(c, 0.85 * a); g.fillRect(x, Math.min(y, base), 2, Math.abs(y - base)); // the stem
+    g.fillStyle = rgba(c, a); g.beginPath(); g.arc(x + 1, y, 3.2, 0, Math.PI * 2); g.fill(); // the head
+  };
+  for (const x of o.notes) if (!o.sel.has(x.i)) one(x);
+  for (const x of o.notes) if (o.sel.has(x.i)) one(x);
 }
 
 /**
@@ -159,15 +217,16 @@ export function drawKeyGraph(g: CanvasRenderingContext2D, W: number, H: number, 
     return;
   }
   g.font = MONO8; g.textAlign = 'center'; g.textBaseline = 'bottom';
-  for (const { n } of o.notes) {
-    const k = n.p ?? o.root;
-    const x = stepX(Math.round(n.step), o.cw) - o.sx, w = Math.max(2, o.cw - 6), bx = x + (o.cw - w) / 2;
+  const spans = stepSpans(o.notes.map(x => x.n));
+  for (const [j, { n }] of o.notes.entries()) {
+    const k = n.p ?? o.root, cw = o.cw * spans[j];
+    const x = stepX(n.step, o.cw) - o.sx, w = Math.max(2, cw - 6), bx = x + (cw - w) / 2;
     if (bx > W || bx + w < 0) continue;
     const y0 = yOf(o.root), y = yOf(Math.max(o.root - o.span, Math.min(o.root + o.span, k)));
     g.fillStyle = rgba(o.color, 0.75);
     g.fillRect(bx, Math.min(y, y0), w, Math.max(2, Math.abs(y - y0)));
     g.fillStyle = mix(o.color, 60, T.fgHi); g.fillRect(bx, y - 1, w, 2);
-    if (k !== o.root && o.cw >= 22) { g.fillStyle = T.fg3; g.fillText(noteName(k), x + o.cw / 2, Math.min(y, y0) - 1); }
+    if (k !== o.root && cw >= 22) { g.fillStyle = T.fg3; g.fillText(noteName(k), x + cw / 2, Math.min(y, y0) - 1); }
   }
 }
 
@@ -176,7 +235,7 @@ export interface RollGeo { pps: number; sx: number; sy: number; rowH: number; kw
 export const rollY = (G: RollGeo, key: number) => (127 - key) * G.rowH - G.sy;
 export const rollX = (G: RollGeo, step: number) => G.kw + step * G.pps - G.sx;
 
-function rollBg(g: CanvasRenderingContext2D, W: number, H: number, G: RollGeo, root: number, mask: number) {
+function rollBg(g: CanvasRenderingContext2D, W: number, H: number, G: RollGeo, root: number, mask: number, grid: number) {
   const k0 = Math.max(0, Math.floor(127 - (G.sy + H) / G.rowH)), k1 = Math.min(127, Math.ceil(127 - G.sy / G.rowH));
   g.fillStyle = T.viz; g.fillRect(0, 0, W, H);
   for (let k = k0; k <= k1; k++) {
@@ -187,12 +246,26 @@ function rollBg(g: CanvasRenderingContext2D, W: number, H: number, G: RollGeo, r
     g.fillStyle = (k % 12 === 0) ? T.vizAxis : T.vizGrid;
     g.fillRect(G.kw, Math.round(y + G.rowH) - 0.5, W - G.kw, 1);
   }
-  // vertical lines: 16ths (when there is room), beats, bars
+  // vertical lines: the snap grid's own lines (16ths, triplets, ... when there is room), then
+  // beats and bars over them. A grid of a beat or longer shows 16ths, like 1/16.
   const s0 = Math.max(0, Math.floor(G.sx / G.pps)), s1 = Math.ceil((G.sx + W - G.kw) / G.pps);
-  for (let s = s0; s <= s1; s++) {
-    const bar = s % 16 === 0, beat = s % 4 === 0;
-    if (!beat && G.pps < 7) continue;
-    g.fillStyle = bar ? T.vizAxis : beat ? T.vizGrid2 : T.vizGrid;
+  // every other beat (bar when zoomed out) a shade lighter, over the key rows and under the lines (4 steps = a beat)
+  g.fillStyle = T.gridShade;
+  for (const [b, n] of shadeBands(s0 / 4, s1 / 4, shadeUnit(G.pps * 4))) {
+    const xa = Math.max(G.kw, Math.round(rollX(G, b * 4))), xb = Math.round(rollX(G, (b + n) * 4));
+    if (xb > xa) g.fillRect(xa, 0, xb - xa, H);
+  }
+  const u = grid > 0 && grid < 4 ? grid : 1;
+  if (u * G.pps >= 7) {
+    g.fillStyle = T.vizGrid;
+    for (let i = Math.floor(s0 / u); i * u <= s1; i++) {
+      const s = i * u;
+      if (Math.abs(s / 4 - Math.round(s / 4)) < 1e-6) continue;
+      g.fillRect(Math.round(rollX(G, s)) - 0.5, 0, 1, H);
+    }
+  }
+  for (let s = Math.ceil(s0 / 4) * 4; s <= s1; s += 4) {
+    g.fillStyle = s % 16 === 0 ? T.vizAxis : T.vizGrid2;
     g.fillRect(Math.round(rollX(G, s)) - 0.5, 0, 1, H);
   }
   // past the pattern end: drawing there makes the pattern longer
@@ -207,18 +280,26 @@ function rollBg(g: CanvasRenderingContext2D, W: number, H: number, G: RollGeo, r
     if (k % 12 === 0 && G.rowH >= 9) {
       g.fillStyle = T.keyWText; g.font = MONO9; g.textBaseline = 'middle'; g.textAlign = 'right';
       g.fillText(noteName(k), G.kw - 4, y + G.rowH / 2 + 0.5);
+    } else if (G.rowH >= 11 && inScale(k, root, mask)) {
+      // the other notes of the song's key, by letter only (the octave is on the C): where the scale is on the keyboard
+      g.fillStyle = b ? rgba(T.keyBText, 0.55) : rgba(T.keyWText, 0.5); g.font = MONO8; g.textBaseline = 'middle'; g.textAlign = 'right';
+      g.fillText(noteName(k).replace(/-?\d+$/, ''), b ? G.kw * 0.62 - 4 : G.kw - 4, y + G.rowH / 2 + 0.5);
     }
   }
   g.fillStyle = T.line2; g.fillRect(G.kw - 1, 0, 1, H);
 }
 
 export function drawRoll(g: CanvasRenderingContext2D, W: number, H: number, G: RollGeo, layer: Layer, o: {
-  pt: Pattern; ch: Channel; chans: Map<Id, Channel>; sel: Set<number>; root: number; mask: number; hoverKey: number | null; lit?: number[]; marquee: { x0: number; y0: number; x1: number; y1: number } | null;
+  pt: Pattern; ch: Channel; chans: Map<Id, Channel>; sel: Set<number>; root: number; mask: number;
+  /** Snap grid in steps: its lines are drawn (triplet grids get triplet lines). */
+  grid: number; hoverKey: number | null; lit?: number[]; marquee: { x0: number; y0: number; x1: number; y1: number } | null;
   /** Ctrl+right-drag: the box the view will zoom to (dashed, no fill: it selects nothing). */
   zoomBox?: { x0: number; y0: number; x1: number; y1: number } | null;
+  /** Chord-stamp tool: what a click at this cell would write (ghosted, dashed outline). */
+  stampGhost?: { s: number; len: number; pitches: number[] } | null;
 }) {
   g.clearRect(0, 0, W, H);
-  const bg = layer.get(W, H, ['roll', G.pps, G.sx, G.sy, G.rowH, G.kw, G.steps, o.root, o.mask].join('|'), (gg, w, h) => rollBg(gg, w, h, G, o.root, o.mask));
+  const bg = layer.get(W, H, ['roll', G.pps, G.sx, G.sy, G.rowH, G.kw, G.steps, o.root, o.mask, o.grid].join('|'), (gg, w, h) => rollBg(gg, w, h, G, o.root, o.mask, o.grid));
   g.drawImage(bg, 0, 0, W, H);
   g.save();
   g.beginPath(); g.rect(G.kw, 0, W - G.kw, H); g.clip();
@@ -236,6 +317,19 @@ export function drawRoll(g: CanvasRenderingContext2D, W: number, H: number, G: R
     const k = keyOf(n, o.ch), x = rollX(G, n.step), y = rollY(G, k), w = noteWidth(n, G.pps);
     if (x > W || x + w < G.kw || y > H || y + G.rowH < 0) return;
     const sel = o.sel.has(i), v = velOf(n);
+    if (n.slide) {
+      // FL's slide note: a note like the others, darker (it has no sound of its own), with a ramp
+      // triangle at its start (the slide icon)
+      g.fillStyle = sel ? mix(o.ch.color, 40, theme.light ? '#000000' : '#ffffff') : mix(o.ch.color, 38, T.viz);
+      g.beginPath(); rr(g, x, y + 0.5, w, G.rowH - 1, 2.5); g.fill();
+      g.strokeStyle = sel ? T.fgHi : o.ch.color; g.lineWidth = 1;
+      g.beginPath(); rr(g, x + 0.5, y + 1, w - 1, G.rowH - 2, 2.5); g.stroke();
+      const th = G.rowH - 5, tw = Math.min(w - 3, Math.max(5, th * 1.3));
+      g.fillStyle = sel ? T.fgHi : mix(o.ch.color, 70, '#ffffff');
+      g.beginPath(); g.moveTo(x + 2, y + G.rowH - 2.5); g.lineTo(x + 2 + tw, y + G.rowH - 2.5); g.lineTo(x + 2 + tw, y + G.rowH - 2.5 - th); g.closePath(); g.fill();
+      if (w > tw + 26 && G.rowH >= 11) { g.fillStyle = sel ? rgba(T.onFill, 0.9) : T.fgHi; g.fillText(noteName(k), x + 5 + tw, y + G.rowH / 2 + 0.5); }
+      return;
+    }
     g.fillStyle = sel ? mix(o.ch.color, 55, theme.light ? '#000000' : '#ffffff') : mix(o.ch.color, Math.round(45 + 55 * v), T.viz);
     g.beginPath(); rr(g, x, y + 0.5, w, G.rowH - 1, 2.5); g.fill();
     g.strokeStyle = sel ? T.fgHi : rgba('#000000', theme.light ? 0.25 : 0.45); g.lineWidth = 1;
@@ -244,6 +338,17 @@ export function drawRoll(g: CanvasRenderingContext2D, W: number, H: number, G: R
     if (n.trig || w > 10) { g.fillStyle = rgba(T.onFill, 0.35); g.fillRect(x + w - 3, y + 3, 1, G.rowH - 6); }
     if (w > 26 && G.rowH >= 11) { g.fillStyle = rgba(T.onFill, 0.85); g.fillText(noteName(k), x + 4, y + G.rowH / 2 + 0.5); }
   });
+  if (o.stampGhost) {
+    const gh = o.stampGhost, w = Math.max(3, gh.len * G.pps - 1), x = rollX(G, gh.s);
+    for (const k of gh.pitches) {
+      const y = rollY(G, k);
+      g.fillStyle = rgba(o.ch.color, 0.32);
+      g.beginPath(); rr(g, x, y + 0.5, w, G.rowH - 1, 2.5); g.fill();
+      g.strokeStyle = rgba(o.ch.color, 0.95); g.lineWidth = 1; g.setLineDash([3, 2]);
+      g.beginPath(); rr(g, x + 0.5, y + 1, w - 1, G.rowH - 2, 2.5); g.stroke();
+      g.setLineDash([]);
+    }
+  }
   if (o.marquee) {
     const m = o.marquee, x = Math.min(m.x0, m.x1), y = Math.min(m.y0, m.y1);
     g.fillStyle = rgba(T.blue, 0.12); g.fillRect(x, y, Math.abs(m.x1 - m.x0), Math.abs(m.y1 - m.y0));

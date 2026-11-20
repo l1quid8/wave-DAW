@@ -1,5 +1,5 @@
 #![recursion_limit = "512"]
-//! WAVE desktop app: Tauri commands around the engine, the audio device, the
+//! Synkopa desktop app: Tauri commands around the engine, the audio device, the
 //! sample library, VST3 plugins and the live session the `wave` CLI talks to.
 
 mod actions;
@@ -13,11 +13,21 @@ mod links;
 mod midi_actions;
 mod models;
 mod pitch_actions;
+#[cfg(target_os = "linux")]
+mod plugin_loop;
+pub mod plugin_probe;
 mod plugins;
 mod project_launch;
 mod recovery;
 mod settings;
+mod stems_actions;
+#[cfg(test)]
+mod stems_actions_tests;
+#[cfg(test)]
+mod ui_prefixes_tests;
 mod updater;
+#[cfg(test)]
+mod watch_tests;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,10 +54,12 @@ pub struct App {
     pub cli: Mutex<CliStatus>,
     /// Set while an offline bounce is running; flipped by `export_cancel`.
     pub export_cancel: AtomicBool,
+    /// Set to stop a running stem extraction or model download; flipped by `stems_cancel`.
+    pub stems_cancel: AtomicBool,
     /// Why the installed RMVPE model could not be used, if it could not.
     pub model_error: Mutex<Option<String>>,
     session: Mutex<Option<wave_session::Server>>,
-    /// WAVE Keys piano: where it is and whether it is loaded.
+    /// Synkopa Keys piano: where it is and whether it is loaded.
     pub keys: keys::Keys,
     /// The update found by the last check and its downloaded installer.
     pub updater: updater::State,
@@ -86,16 +98,18 @@ impl actions::Host for App {
     fn model_error(&self) -> Option<String> {
         self.model_error.lock().clone()
     }
+    fn set_model_error(&self, e: Option<String>) {
+        *self.model_error.lock() = e;
+    }
     fn wait_keys(&self) -> R<()> {
-        keys::wait(self);
-        Ok(())
+        keys::wait(self)
     }
     fn keys_installed(&self) -> bool {
         keys::status(self).installed
     }
 }
 
-/// `WAVE --cli …`: the `wave` command. Commands go to the running app, or with
+/// `Synkopa --cli …`: the `synkopa` command. Commands go to the running app, or with
 /// `--project FILE` run here, on the file, with no window and no audio device.
 pub fn cli_main(args: Vec<String>) -> std::process::ExitCode {
     wave_cli::run_cli_with(args, Some(&headless::Files))
@@ -126,19 +140,20 @@ async fn get_state(app: St<'_>) -> R<StateDto> {
 }
 
 #[tauri::command]
-async fn apply_ops(app: St<'_>, ops: Vec<Op>, transient: Option<bool>) -> R<Value> {
-    let rev = app.engine.apply(&ops, transient.unwrap_or(false), None).map_err(es)?;
+async fn apply_ops(app: St<'_>, ops: Vec<Op>, transient: Option<bool>, label: Option<String>) -> R<Value> {
+    let rev = app.engine.apply_labeled(&ops, transient.unwrap_or(false), None, label.as_deref()).map_err(es)?;
     Ok(json!({ "revision": rev }))
 }
 
 #[tauri::command]
-async fn begin_gesture(app: St<'_>) -> R<()> {
-    app.engine.begin_gesture();
+async fn begin_gesture(app: St<'_>, label: Option<String>) -> R<()> {
+    app.engine.begin_gesture(label);
     Ok(())
 }
 
 #[tauri::command]
-async fn end_gesture(app: St<'_>) -> R<()> {
+async fn end_gesture(app: St<'_>, label: Option<String>) -> R<()> {
+    let _ = label; // already sent with begin_gesture; this one is ignored
     app.engine.end_gesture();
     Ok(())
 }
@@ -171,20 +186,23 @@ async fn transport_play(app: St<'_>, from_beat: f64) -> R<()> {
 #[tauri::command]
 async fn transport_stop(app: St<'_>) -> R<()> {
     let a = app.inner().clone();
-    let st = tauri::async_runtime::spawn_blocking(move || {
-        a.engine.stop();
+    let (written, st) = tauri::async_runtime::spawn_blocking(move || {
+        // the transport stops even when the take could not be written: the input is
+        // released either way, and only then is the write failure reported
+        let written = a.engine.stop();
         let t = a.engine.state().transport;
-        (!t.rec && !t.monitor).then(|| a.audio.set_input(false))
+        (written, (!t.rec && !t.monitor).then(|| a.audio.set_input(false)))
     })
     .await
     .map_err(es)?;
     if let Some(st) = st {
         *app.status.lock() = st;
     }
-    Ok(())
+    written.map(|_| ()).map_err(es)
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // one optional argument per transport setting
 async fn transport_set(
     app: St<'_>,
     metro: Option<bool>,
@@ -192,11 +210,20 @@ async fn transport_set(
     rec: Option<bool>,
     monitor: Option<bool>,
     start_beat: Option<f64>,
+    rec_audio: Option<bool>,
+    rec_notes: Option<bool>,
+    rec_quantize: Option<f64>,
 ) -> R<wave_engine::TransportDto> {
     let e = app.engine.clone();
     let t = tauri::async_runtime::spawn_blocking(move || {
         if let Some(b) = start_beat {
             e.set_start(b);
+        }
+        if rec_audio.is_some() || rec_notes.is_some() {
+            e.set_rec_filter(rec_audio, rec_notes);
+        }
+        if let Some(q) = rec_quantize {
+            e.set_rec_quantize(q);
         }
         e.set_transport(metro, count_in, rec, monitor)
     })
@@ -206,8 +233,9 @@ async fn transport_set(
     // drop to the low-quality headset profile whenever a mic stream is open). It opens and
     // closes without touching the output, so a punch-in keeps the song playing; closing
     // still waits for the transport to stop (a punch-out may be followed by another punch-in).
-    if rec.is_some() || monitor.is_some() {
-        let need = t.rec || t.monitor;
+    // (notes-only recording needs no mic)
+    if rec.is_some() || monitor.is_some() || rec_audio.is_some() {
+        let need = t.rec && t.rec_audio || t.monitor;
         if need || !t.playing {
             let a = app.inner().clone();
             let st = tauri::async_runtime::spawn_blocking(move || a.audio.set_input(need)).await.map_err(es)?;
@@ -234,11 +262,26 @@ async fn watch_fx(app: St<'_>, ids: Vec<u64>) -> R<()> {
 // ---------------------------------------------------------------- audio sources
 
 #[tauri::command]
-async fn import_audio(app: St<'_>, paths: Vec<String>, track: Option<u32>, beat: Option<f64>) -> R<Value> {
+async fn import_audio(app: St<'_>, paths: Vec<String>, track: Option<u32>, beat: Option<f64>, step: Option<bool>) -> R<Value> {
     let a = app.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || actions::import(&*a, &json!({ "paths": paths, "track": track, "beat": beat })))
-        .await
-        .map_err(es)?
+    tauri::async_runtime::spawn_blocking(move || {
+        actions::import(&*a, &json!({ "paths": paths, "track": track, "beat": beat, "step": step.unwrap_or(true) }))
+    })
+    .await
+    .map_err(es)?
+}
+
+/// Candidate slice points of a source: [pos, strength] f32 pairs (see `slices::onsets`).
+#[tauri::command]
+async fn source_onsets(app: St<'_>, id: u64) -> R<Response> {
+    let e = app.engine.clone();
+    let o = tauri::async_runtime::spawn_blocking(move || e.source_onsets(id)).await.map_err(es)?.ok_or("no such source")?;
+    let mut b = Vec::with_capacity(o.len() * 8);
+    for x in o {
+        b.extend_from_slice(&x.pos.to_le_bytes());
+        b.extend_from_slice(&x.strength.to_le_bytes());
+    }
+    Ok(Response::new(b))
 }
 
 #[tauri::command]
@@ -335,7 +378,8 @@ async fn auto_vocal_plan(
 #[tauri::command]
 async fn bake_rider(app: St<'_>, clip_id: u64, params: std::collections::BTreeMap<String, f64>) -> R<Value> {
     let e = app.engine.clone();
-    let (source, clip) = tauri::async_runtime::spawn_blocking(move || e.bake_rider(clip_id, &params)).await.map_err(es)?.map_err(es)?;
+    let (source, clip) =
+        tauri::async_runtime::spawn_blocking(move || e.bake_rider(clip_id, &params, None)).await.map_err(es)?.map_err(es)?;
     Ok(json!({ "sourceId": source, "clipId": clip }))
 }
 
@@ -364,7 +408,7 @@ async fn fx_chain(app: St<'_>, cmd: String, args: Value) -> R<Value> {
         return Err(format!("not an FX chain command: {cmd}"));
     }
     let a = app.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || actions::control(&*a, &cmd, &args, None)).await.map_err(es)?
+    tauri::async_runtime::spawn_blocking(move || actions::control(&*a, &cmd, &args, None, None)).await.map_err(es)?
 }
 
 /// `midi_inspect` / `midi_import` / `midi_export` (`midi_actions.rs`), off the UI thread.
@@ -374,7 +418,7 @@ async fn midi(app: St<'_>, cmd: String, args: Value) -> R<Value> {
         return Err(format!("not a MIDI command: {cmd}"));
     }
     let a = app.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || actions::control(&*a, &cmd, &args, None)).await.map_err(es)?
+    tauri::async_runtime::spawn_blocking(move || actions::control(&*a, &cmd, &args, None, None)).await.map_err(es)?
 }
 
 #[tauri::command]
@@ -409,6 +453,80 @@ async fn flatten_comp(app: St<'_>, clip_id: u64) -> R<Value> {
     Ok(json!({ "sourceId": id }))
 }
 
+/// FL's *Export in place*: the selected clips rendered to one audio clip on a new track below
+/// them (originals muted, one undo step). Off the IPC thread; `export_cancel` stops it.
+#[tauri::command]
+async fn export_in_place(app: St<'_>, clip_ids: Vec<u64>) -> R<Value> {
+    app.export_cancel.store(false, Ordering::Relaxed);
+    let a = app.inner().clone();
+    let r = tauri::async_runtime::spawn_blocking(move || {
+        // a bounce must not start while the piano is still loading (it would be silent)
+        keys::wait(&a).map_err(wave_engine::EngineError::Msg)?;
+        a.engine.export_in_place(&clip_ids, actions::IN_PLACE_RATE, &a.export_cancel, &mut |_| {})
+    })
+    .await
+    .map_err(es)?;
+    match r {
+        Ok(v) => Ok(json!(v)),
+        Err(wave_engine::EngineError::Cancelled) => Ok(json!({ "cancelled": true })),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+async fn stems_model_status() -> R<stems_actions::StemModelStatus> {
+    Ok(stems_actions::status())
+}
+
+/// Downloads the stem model (`model-progress` with id "htdemucs"); `stems_cancel` stops it.
+#[tauri::command]
+async fn stems_model_install(app: St<'_>, handle: AppHandle) -> R<Value> {
+    app.stems_cancel.store(false, Ordering::Relaxed);
+    let a = app.inner().clone();
+    let h = handle.clone();
+    let res = tauri::async_runtime::spawn_blocking(move || {
+        models::fetch(&stems_actions::download(), Some(&a.stems_cancel), |done, total| {
+            let _ = h.emit("model-progress", json!({ "id": wave_stems::MODEL_ID, "done": done, "total": total }));
+        })
+    })
+    .await
+    .map_err(es)?;
+    match res {
+        Ok(()) => Ok(json!(stems_actions::status())),
+        Err(e) if e == models::DOWNLOAD_CANCELLED => Ok(json!({ "cancelled": true })),
+        Err(e) => {
+            let _ = handle.emit("model-progress", json!({ "id": wave_stems::MODEL_ID, "done": 0, "total": 0, "error": e }));
+            Err(e)
+        }
+    }
+}
+
+/// "Extract stems" on an audio clip, off the IPC thread: `stems-progress {clipId, stage, frac}`
+/// as it goes, `{cancelled: true}` after `stems_cancel`. See `stems_actions::extract`.
+#[tauri::command]
+async fn extract_stems(app: St<'_>, handle: AppHandle, clip_id: u64, stems: Vec<String>) -> R<Value> {
+    app.stems_cancel.store(false, Ordering::Relaxed);
+    let a = app.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // throttled: the separator reports once per 5.85 s segment, the other stages once
+        let progress = |stage: &'static str, frac: f64| {
+            let _ = handle.emit("stems-progress", json!({ "clipId": clip_id, "stage": stage, "frac": frac }));
+        };
+        match stems_actions::extract(&a.engine, clip_id, &stems, &a.stems_cancel, &progress)? {
+            Some(p) => Ok(stems_actions::placed_json(&p, a.engine.revision())),
+            None => Ok(json!({ "cancelled": true })),
+        }
+    })
+    .await
+    .map_err(es)?
+}
+
+#[tauri::command]
+async fn stems_cancel(app: St<'_>) -> R<()> {
+    app.stems_cancel.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
 #[tauri::command]
 async fn comp_audition(app: St<'_>, comp_id: u64, take_id: Option<u64>) -> R<()> {
     app.engine.audition(comp_id, take_id).map_err(es)
@@ -421,10 +539,30 @@ async fn preview_clip(app: St<'_>, clip_id: u64, from: Option<f64>) -> R<()> {
     tauri::async_runtime::spawn_blocking(move || e.preview_clip(clip_id, from)).await.map_err(es)?.map_err(es)
 }
 
+/// The sample editor's keyboard on an audio clip: its sample at `key` (see `Engine::preview_clip_key`).
+#[tauri::command]
+async fn preview_clip_key(app: St<'_>, clip_id: u64, key: u8, vel: Option<f32>) -> R<()> {
+    let e = app.engine.clone();
+    // the clip's pitch edits may render first: off the IPC thread
+    tauri::async_runtime::spawn_blocking(move || e.preview_clip_key(clip_id, key, vel.unwrap_or(0.8))).await.map_err(es)?.map_err(es)
+}
+
 #[tauri::command]
 async fn preview_file(app: St<'_>, path: String) -> R<()> {
     let e = app.engine.clone();
     tauri::async_runtime::spawn_blocking(move || e.preview_file(&PathBuf::from(path))).await.map_err(es)?.map_err(es)
+}
+
+#[tauri::command]
+async fn preview_source(app: St<'_>, id: u64) -> R<()> {
+    app.engine.preview_source(id).map_err(es)
+}
+
+/// A second Stop: cut every tail still ringing (voices, effect tails, the preview).
+#[tauri::command]
+async fn transport_silence(app: St<'_>) -> R<()> {
+    app.engine.silence();
+    Ok(())
 }
 
 #[tauri::command]
@@ -545,6 +683,16 @@ async fn midi_status(app: St<'_>) -> R<MidiStatus> {
     Ok(app.midi.status())
 }
 
+/// Plays every key at one velocity (`None` = the keyboard's own); saved and restored at startup.
+#[tauri::command]
+async fn midi_set_velocity(app: St<'_>, fixed: Option<u8>) -> R<MidiStatus> {
+    let st = app.midi.set_fixed_velocity(fixed);
+    let mut s = app.settings.lock();
+    s.midi_fixed_velocity = st.fixed_velocity;
+    s.save();
+    Ok(st)
+}
+
 /// Which Channel Rack channel (instrument) the keyboard plays; `None` = the first pitched one.
 #[tauri::command]
 async fn midi_set_target(app: St<'_>, channel: Option<u64>) -> R<MidiStatus> {
@@ -560,7 +708,7 @@ async fn library_list(app: St<'_>) -> R<Value> {
     Ok(json!({ "kits": library::kits(), "folders": app.settings.lock().folders }))
 }
 
-/// WAVE Keys: is the piano on this computer, and is it loaded?
+/// Synkopa Keys: is the piano on this computer, and is it loaded?
 #[tauri::command]
 async fn keys_status(app: St<'_>) -> R<keys::KeysStatus> {
     Ok(keys::status(&app))
@@ -587,7 +735,7 @@ async fn library_install(app: St<'_>, handle: AppHandle, id: String) -> R<()> {
 }
 
 #[tauri::command]
-async fn library_files(kit: Option<String>, folder: Option<String>) -> R<Vec<library::FileInfo>> {
+async fn library_files(kit: Option<String>, folder: Option<String>) -> R<library::Listing> {
     tauri::async_runtime::spawn_blocking(move || match (kit, folder) {
         (Some(k), _) => library::kit_files(&k),
         (None, Some(f)) => Ok(library::folder_files(&PathBuf::from(f))),
@@ -634,8 +782,10 @@ fn take_project_open_requests(requests: State<'_, ProjectOpenRequests>) -> Vec<S
 }
 
 #[tauri::command]
-async fn project_new(app: St<'_>) -> R<StateDto> {
-    app.engine.new_project(Project::empty());
+async fn project_new(app: St<'_>, demo: Option<bool>) -> R<StateDto> {
+    // clear crash recovery only once the reset really happened: a refused reset (recording)
+    // must keep the still-unsaved project's recovery copy, like open/save do
+    app.engine.new_project(if demo.unwrap_or(false) { Project::demo() } else { Project::empty() }).map_err(es)?;
     app.recovery.clear();
     Ok(app.engine.state())
 }
@@ -651,7 +801,9 @@ async fn project_open(app: St<'_>, handle: AppHandle, path: Option<String>, if_r
     let revision = if_revision.unwrap_or_else(|| app.engine.revision());
     let path = match path {
         Some(p) => Some(PathBuf::from(p)),
-        None => handle.dialog().file().add_filter("WAVE project", &["wave"]).blocking_pick_file().and_then(|p| p.into_path().ok()),
+        None => {
+            handle.dialog().file().add_filter("Synkopa project", &["synkopa", "wave"]).blocking_pick_file().and_then(|p| p.into_path().ok())
+        }
     };
     let Some(path) = path else { return Ok(json!({ "cancelled": true })) };
     let e = app.engine.clone();
@@ -659,34 +811,65 @@ async fn project_open(app: St<'_>, handle: AppHandle, path: Option<String>, if_r
     let warnings = tauri::async_runtime::spawn_blocking(move || e.open_at_revision(&p2, Some(revision))).await.map_err(es)?.map_err(es)?;
     app.recovery.clear();
     let mut s = app.settings.lock();
-    s.last_project = Some(path.display().to_string());
+    s.remember(&path.display().to_string());
     s.save();
     Ok(open_reply(app.engine.state(), warnings))
 }
 
+/// File → Open recent: the projects opened or saved lately, newest first, each with whether
+/// the file is still there.
 #[tauri::command]
-async fn project_save(app: St<'_>, handle: AppHandle, save_as: Option<bool>) -> R<Value> {
+async fn recent_projects(app: St<'_>) -> R<Value> {
+    let list = app.settings.lock().recent.clone();
+    let rows: Vec<Value> = list
+        .iter()
+        .map(|p| {
+            let path = std::path::Path::new(p);
+            let name = path.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.clone());
+            let dir = path.parent().map(|d| d.display().to_string()).unwrap_or_default();
+            json!({ "path": p, "name": name, "dir": dir, "exists": path.is_file() })
+        })
+        .collect();
+    Ok(json!(rows))
+}
+
+/// Takes a project off File → Open recent (`path` absent: clears the list).
+#[tauri::command]
+async fn recent_forget(app: St<'_>, path: Option<String>) -> R<()> {
+    let mut s = app.settings.lock();
+    s.forget(path.as_deref());
+    s.save();
+    Ok(())
+}
+
+#[tauri::command]
+async fn project_save(app: St<'_>, handle: AppHandle, save_as: Option<bool>, version: Option<bool>) -> R<Value> {
     let cur = app.engine.state().path.map(PathBuf::from);
     let path = match (cur, save_as.unwrap_or(false)) {
+        // save new version: the next free `Name_N` beside the current file; the project then continues there
+        (Some(p), false) if version.unwrap_or(false) => Some(actions::next_version_path(&p, |q| q.exists())),
         (Some(p), false) => Some(p),
-        _ => handle
-            .dialog()
-            .file()
-            .add_filter("WAVE project", &["wave"])
-            .set_file_name("Song.wave")
-            .blocking_save_file()
-            .and_then(|p| p.into_path().ok()),
+        (cur, _) => {
+            // start from the project's own name and folder, not a fixed "Song"
+            let mut dialog = handle.dialog().file().add_filter("Synkopa project", &["synkopa", "wave"]);
+            let name = cur.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
+            dialog = dialog.set_file_name(name.unwrap_or_else(|| "Song.synkopa".into()));
+            if let Some(dir) = cur.as_ref().and_then(|p| p.parent()).filter(|d| d.is_dir()) {
+                dialog = dialog.set_directory(dir);
+            }
+            dialog.blocking_save_file().and_then(|p| p.into_path().ok())
+        }
     };
     let Some(mut path) = path else { return Ok(json!({ "cancelled": true })) };
     if path.extension().is_none() {
-        path.set_extension("wave");
+        path.set_extension("synkopa");
     }
     let e = app.engine.clone();
     let p2 = path.clone();
     tauri::async_runtime::spawn_blocking(move || e.save(&p2)).await.map_err(es)?.map_err(es)?;
     app.recovery.clear();
     let mut s = app.settings.lock();
-    s.last_project = Some(path.display().to_string());
+    s.remember(&path.display().to_string());
     s.save();
     Ok(json!({ "path": path.display().to_string() }))
 }
@@ -714,7 +897,7 @@ async fn recovery_write(app: St<'_>) -> R<bool> {
     tauri::async_runtime::spawn_blocking(move || a.recovery.write(&a.engine)).await.map_err(es)?
 }
 
-/// Unsaved projects left behind by a WAVE that crashed or was killed, newest first.
+/// Unsaved projects left behind by a Synkopa that crashed or was killed, newest first.
 #[tauri::command]
 async fn recovery_list(app: St<'_>) -> R<Vec<recovery::Orphan>> {
     Ok(app.recovery.orphans())
@@ -734,6 +917,21 @@ async fn recovery_discard(app: St<'_>, id: String) -> R<()> {
     app.recovery.discard(&id)
 }
 
+/// The beat range of an export: pattern `pattern` alone (PAT mode's export, FL Studio's), the
+/// project loop (`use_loop`), or the song. A loop is needed to wrap the tail.
+fn export_span(project: &Project, use_loop: bool, wrap: bool, pattern: Option<u64>) -> R<(f64, f64)> {
+    if let Some(id) = pattern {
+        if wrap {
+            return Err("wrap tail is for a loop of the song, not a pattern export".into());
+        }
+        return Engine::pattern_range(project, id).ok_or_else(|| "that pattern no longer exists".into());
+    }
+    if wrap && (!use_loop || project.loop_range.is_none_or(|l| l.b <= l.a)) {
+        return Err("select a loop to wrap its tail".into());
+    }
+    Ok(Engine::export_range(project, use_loop))
+}
+
 /// Bounce the master mix to a 32-bit float or 16/24-bit PCM stereo WAV, or a CBR MP3 (`format: "mp3"`,
 /// `mp3_kbps` 128/192/256/320, default 320), song or loop + tail.
 ///
@@ -746,6 +944,7 @@ async fn export_audio(
     app: St<'_>,
     handle: AppHandle,
     use_loop: bool,
+    pattern: Option<u64>,
     tail: f64,
     sample_rate: u32,
     format: Option<String>,
@@ -765,11 +964,8 @@ async fn export_audio(
         return Err("tail must be 0, 2 or 8 seconds".into());
     }
     let st = app.engine.state();
-    if wrap && (!use_loop || st.project.loop_range.is_none_or(|l| l.b <= l.a)) {
-        return Err("select a loop to wrap its tail".into());
-    }
-    let (from, to) = Engine::export_range(&st.project, use_loop);
-    let bounce = actions::Bounce { from, to, tail, rate: sample_rate, wrap };
+    let (from, to) = export_span(&st.project, use_loop, wrap, pattern)?;
+    let bounce = actions::Bounce { from, to, tail, rate: sample_rate, wrap, pattern };
     let suggested = st
         .path
         .as_deref()
@@ -815,6 +1011,7 @@ async fn export_stems(
     app: St<'_>,
     handle: AppHandle,
     use_loop: bool,
+    pattern: Option<u64>,
     tail: f64,
     sample_rate: u32,
     include_master: bool,
@@ -834,11 +1031,8 @@ async fn export_stems(
         return Err("tail must be 0, 2 or 8 seconds".into());
     }
     let project = app.engine.project();
-    if wrap && (!use_loop || project.loop_range.is_none_or(|l| l.b <= l.a)) {
-        return Err("select a loop to wrap its tail".into());
-    }
-    let (from, to) = Engine::export_range(&project, use_loop);
-    let bounce = actions::Bounce { from, to, tail, rate: sample_rate, wrap };
+    let (from, to) = export_span(&project, use_loop, wrap, pattern)?;
+    let bounce = actions::Bounce { from, to, tail, rate: sample_rate, wrap, pattern };
     let Some(dir) = handle.dialog().file().blocking_pick_folder().and_then(|p| p.into_path().ok()) else {
         return Ok(json!({ "cancelled": true }));
     };
@@ -850,7 +1044,7 @@ async fn export_stems(
             let _ = h.emit("export-progress", s);
         };
         // a stem export must not start while the piano is still loading (its stems would be silent)
-        keys::wait(&a);
+        keys::wait(&a)?;
         actions::render_stems_to_dir(&a.engine, &dir, bounce, &a.export_cancel, include_master, fmt, &progress)
     })
     .await
@@ -890,14 +1084,56 @@ async fn plugin_add(
     Ok(json!({ "fxId": id, "revision": rev }))
 }
 
+/// Open or close a plugin's own window. `title` / `subtitle`: what Synkopa's header above it
+/// says (the UI's names, in its language); `pinned`: kept on top of the app. The header's
+/// gear emits `plugin-settings`, its pin `plugin-pin`.
 #[tauri::command]
-async fn plugin_editor(app: St<'_>, handle: AppHandle, fx_id: u64, open: bool) -> R<()> {
-    app.plugins.editor(&handle, fx_id, open)
+async fn plugin_editor(
+    app: St<'_>,
+    handle: AppHandle,
+    fx_id: u64,
+    open: bool,
+    title: Option<String>,
+    subtitle: Option<String>,
+    pinned: Option<bool>,
+) -> R<()> {
+    let label = wave_plugin_windows::Label { title: title.unwrap_or_default(), subtitle: subtitle.unwrap_or_default(), tag: fx_id };
+    app.plugins.editor(&handle, fx_id, open, label, pinned.unwrap_or(false))
+}
+
+/// "Load anyway": the effect or plugin channel `fx_id` loads although Synkopa's safety check
+/// refused it (see `plugin_probe`).
+#[tauri::command]
+async fn plugin_load_anyway(app: St<'_>, fx_id: u64) -> R<()> {
+    actions::plugin_load_anyway(&**app, fx_id)
+}
+
+#[tauri::command]
+async fn plugin_editor_open(app: St<'_>, fx_id: u64) -> R<bool> {
+    app.plugins.editor_open(fx_id)
+}
+
+/// The plugins that were loaded when the last session ended without exiting: the UI asks
+/// once at start, and offers to keep them out of future scans.
+#[tauri::command]
+async fn plugin_crash_suspects(app: St<'_>) -> R<Vec<plugins::CrashSuspect>> {
+    Ok(app.plugins.crash_suspects())
+}
+
+/// Keep a plugin's module out of future scans (the follow-up to `plugin_crash_suspects`).
+#[tauri::command]
+async fn plugin_block(app: St<'_>, format: String, path: String) -> R<()> {
+    app.plugins.block(&format, &path)
 }
 
 #[tauri::command]
 async fn plugin_params(app: St<'_>, fx_id: u64) -> R<Vec<plugins::ParamInfo>> {
     app.plugins.params(fx_id)
+}
+
+#[tauri::command]
+async fn plugin_state(app: St<'_>, fx_id: u64) -> R<String> {
+    app.plugins.state(fx_id)
 }
 
 #[tauri::command]
@@ -923,7 +1159,7 @@ async fn vst3_add(app: St<'_>, insert_id: u64, path: String, cid: String, index:
 
 #[tauri::command]
 async fn vst3_editor(app: St<'_>, handle: AppHandle, fx_id: u64, open: bool) -> R<()> {
-    app.plugins.editor(&handle, fx_id, open)
+    app.plugins.editor(&handle, fx_id, open, wave_plugin_windows::Label { tag: fx_id, ..Default::default() }, false)
 }
 
 #[tauri::command]
@@ -943,8 +1179,8 @@ async fn app_info(app: St<'_>, handle: AppHandle) -> R<updater::AppInfo> {
         version: handle.package_info().version.to_string(),
         seen_version: s.seen_version.clone(),
         auto_update: !s.no_auto_update,
-        plugin_editors: wave_plugin_windows::SUPPORTED,
-        updates: !cfg!(target_os = "macos"),
+        plugin_editors: wave_plugin_windows::available().is_ok(),
+        plugin_editors_why: wave_plugin_windows::available().err().map(|e| e.to_string()),
     })
 }
 
@@ -1019,6 +1255,12 @@ async fn open_ask(service: links::AskService, prompt: Option<String>) -> R<()> {
     links::open_browser(&links::ask_url(service, prompt.as_deref())?)
 }
 
+/// Help ▸ Join the Discord: opens the community server in the system browser.
+#[tauri::command]
+async fn open_discord() -> R<()> {
+    links::open_browser(links::DISCORD_URL)
+}
+
 #[tauri::command]
 async fn cli_status(app: St<'_>) -> R<CliStatus> {
     Ok(app.cli.lock().clone())
@@ -1034,6 +1276,8 @@ fn shutdown(h: &AppHandle, app: &App) {
     app.audio.stop();
     // a normal exit: the user already answered the unsaved-changes question
     app.recovery.close();
+    // nothing is suspect when Synkopa left the front door
+    app.plugins.clean_exit();
 }
 
 /// Keeps `LC_NUMERIC` in the C locale. `gtk_init` runs `setlocale(LC_ALL, "")`,
@@ -1054,6 +1298,9 @@ pub fn ensure_c_numeric_locale() {
 }
 
 pub fn run(project_arg: Option<&str>) {
+    // plugin windows are X11: keep them above Synkopa's window under Wayland too
+    #[cfg(target_os = "linux")]
+    plugin_loop::prefer_x11();
     let boot = boot::Boot::new();
     boot.mark("run() entered");
     let setup_boot = boot.clone();
@@ -1093,11 +1340,13 @@ pub fn run(project_arg: Option<&str>) {
             fx_catalog,
             transport_play,
             transport_stop,
+            transport_silence,
             transport_set,
             telemetry_subscribe,
             watch_fx,
             import_audio,
             source_peaks,
+            source_onsets,
             clip_peaks,
             pitch_analyze,
             pitch_target,
@@ -1105,6 +1354,10 @@ pub fn run(project_arg: Option<&str>) {
             melody_reference,
             f0_model_status,
             f0_model_install,
+            stems_model_status,
+            stems_model_install,
+            extract_stems,
+            stems_cancel,
             music_analyze,
             auto_vocal_plan,
             bake_rider,
@@ -1116,9 +1369,12 @@ pub fn run(project_arg: Option<&str>) {
             midi,
             fx_chain,
             flatten_comp,
+            export_in_place,
             comp_audition,
             preview_clip,
+            preview_clip_key,
             preview_file,
+            preview_source,
             preview_stop,
             note_audition,
             typing_note,
@@ -1133,6 +1389,7 @@ pub fn run(project_arg: Option<&str>) {
             midi_select_device,
             midi_status,
             midi_set_target,
+            midi_set_velocity,
             library_list,
             library_install,
             keys_status,
@@ -1143,6 +1400,8 @@ pub fn run(project_arg: Option<&str>) {
             project_open,
             take_project_open_requests,
             project_save,
+            recent_projects,
+            recent_forget,
             project_export_zip,
             recovery_write,
             recovery_list,
@@ -1154,7 +1413,12 @@ pub fn run(project_arg: Option<&str>) {
             plugin_scan,
             plugin_add,
             plugin_editor,
+            plugin_editor_open,
+            plugin_crash_suspects,
+            plugin_block,
+            plugin_load_anyway,
             plugin_params,
+            plugin_state,
             plugin_set_param,
             vst3_scan,
             vst3_add,
@@ -1169,10 +1433,11 @@ pub fn run(project_arg: Option<&str>) {
             update_download,
             update_install,
             open_release_page,
-            open_ask
+            open_ask,
+            open_discord
         ])
         .build(tauri::generate_context!())
-        .expect("error while building WAVE");
+        .expect("error while building Synkopa");
     boot.mark("tauri built, entering the event loop");
     tapp.run(|h, ev| {
         // Finder (double-click, "Open With", a drop on the Dock icon) delivers
@@ -1211,6 +1476,8 @@ fn start_app(tapp: &mut tauri::App, boot: Arc<boot::Boot>, reopen_last: bool) {
     // text parsing must stay in the C locale (see ensure_c_numeric_locale)
     ensure_c_numeric_locale();
     let plugins = plugins::Plugins::new();
+    // the plugins the installer ships (Synkopa Demo Synth): listed without a rescan
+    plugins::register_bundled(tapp.path().resource_dir().ok());
     let settings = settings::Settings::load();
     // reopened on a thread of its own once the window exists (decoding its audio is slow)
     let last_project = settings.last_project.as_ref().filter(|p| reopen_last && std::path::Path::new(p).is_file()).cloned();
@@ -1257,6 +1524,7 @@ fn start_app(tapp: &mut tauri::App, boot: Arc<boot::Boot>, reopen_last: bool) {
         settings: Mutex::new(settings),
         cli: Mutex::new(cli_shim::install()),
         export_cancel: AtomicBool::new(false),
+        stems_cancel: AtomicBool::new(false),
         model_error: Mutex::new(None),
         session: Mutex::new(None),
         keys: keys::Keys::default(),
@@ -1281,7 +1549,33 @@ fn start_app(tapp: &mut tauri::App, boot: Arc<boot::Boot>, reopen_last: bool) {
     wave_vst3::set_main_thread_executor(move |job| {
         let _ = mh.run_on_main_thread(job);
     });
-    tapp.manage(wave_plugin_windows::Service::new());
+    // Linux: GTK's loop reads the plugin windows' X11 connection and serves the plugins' IRunLoop
+    #[cfg(target_os = "linux")]
+    plugin_loop::install();
+    let plugin_windows = wave_plugin_windows::Service::new();
+    // plugin editors belong to the main window: they open in front of it and stay there
+    #[cfg(windows)]
+    if let Some(hwnd) = tapp.get_webview_window("main").and_then(|w| w.hwnd().ok()) {
+        plugin_windows.set_owner_window(hwnd.0 as isize);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(xid) = tapp.get_webview_window("main").and_then(|w| plugin_loop::owner_xid(&w)) {
+        plugin_windows.set_owner_window(xid as isize);
+    }
+    // the gear in a plugin window's header: Synkopa's own window for that effect or channel
+    let sh = tapp.handle().clone();
+    plugin_windows.set_settings_handler(std::rc::Rc::new(move |id| {
+        if let Some(w) = sh.get_webview_window("main") {
+            let _ = w.set_focus();
+        }
+        let _ = sh.emit("plugin-settings", json!({ "id": id }));
+    }));
+    // the pin in a plugin window's header: the UI keeps the per-plugin choice for next time
+    let ph = tapp.handle().clone();
+    plugin_windows.set_pinned_handler(std::rc::Rc::new(move |id, pinned| {
+        let _ = ph.emit("plugin-pin", json!({ "id": id, "pinned": pinned }));
+    }));
+    tapp.manage(plugin_windows);
     let _ = events.set(tapp.handle().clone());
     // open the audio device off the UI thread
     let a = app.clone();
@@ -1294,6 +1588,7 @@ fn start_app(tapp: &mut tauri::App, boot: Arc<boot::Boot>, reopen_last: bool) {
     keys::ensure(&app, app.engine.uses_keys());
     // reopen the saved keyboard (it may be unplugged: the status says so, and it opens when it returns)
     let a = app.clone();
+    a.midi.set_fixed_velocity(a.settings.lock().midi_fixed_velocity);
     std::thread::spawn(move || {
         let saved = a.settings.lock().midi_device.clone();
         if let Some(d) = saved {
@@ -1307,7 +1602,7 @@ fn start_app(tapp: &mut tauri::App, boot: Arc<boot::Boot>, reopen_last: bool) {
         let _ = h.emit("state", dto);
     });
     if let Some(w) = tapp.get_webview_window("main") {
-        let _ = w.set_title("WAVE");
+        let _ = w.set_title("Synkopa");
     }
     app.boot.mark("tauri setup done");
     // the last project and the CLI session come in off the critical path: the UI's first
@@ -1328,7 +1623,7 @@ fn start_app(tapp: &mut tauri::App, boot: Arc<boot::Boot>, reopen_last: bool) {
             let weak = Arc::downgrade(&a);
             let handler: Arc<wave_session::Handler> = Arc::new(move |req: &wave_session::Request| {
                 let Some(app) = weak.upgrade() else { return Err(wave_session::ErrorBody::new("GONE", "the app is closing")) };
-                let res = actions::control(app.as_ref(), &req.command, &req.args, req.if_revision);
+                let res = actions::control(app.as_ref(), &req.command, &req.args, req.if_revision, req.label.as_deref());
                 let rev = app.engine.revision();
                 res.map(|d| (d, rev)).map_err(|m| {
                     let code = m

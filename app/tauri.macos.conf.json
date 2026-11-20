@@ -4,7 +4,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "WAVE",
+        "title": "Synkopa",
         "width": 1440,
         "height": 900,
         "minWidth": 960,
@@ -37,16 +37,17 @@
     "fileAssociations": [
       {
         "ext": [
+          "synkopa",
           "wave"
         ],
-        "name": "WAVE Project",
-        "description": "WAVE Project",
+        "name": "Synkopa Project",
+        "description": "Synkopa Project",
         "role": "Editor",
         "rank": "Owner"
       }
     ],
     "macOS": {
-      "minimumSystemVersion": "12.0",
+      "minimumSystemVersion": "13.4",
       "signingIdentity": "-",
       "entitlements": "Entitlements.plist"
     }

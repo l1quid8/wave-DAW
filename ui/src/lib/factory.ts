@@ -7,14 +7,18 @@ import { SAMPLE_ROOT, samplerDefault, VOL_UNITY, type Channel, type Id, type Pro
 export interface FactoryFile { file: string; name: string; group: string; root: number; pitched: boolean; dur: number; ch: number; bytes: number; color: string }
 export const FACTORY_KIT: string = data.kit;
 export const FACTORY_FILES: readonly FactoryFile[] = data.files;
+const unlisted = new Set(data.unlisted);
+export const FACTORY_LISTED_FILES = FACTORY_FILES.filter(f => !unlisted.has(f.file));
 export const LIB_SCHEME = 'lib:';
 export const libPath = (file: string) => `${LIB_SCHEME}${FACTORY_KIT}/${file}`;
 /** The standard-library file a stored path names (`lib:Standard/<file>`), if it is one. */
-export const factoryFile = (path: string) => FACTORY_FILES.find(f => libPath(f.file) === path);
+let byPath: Map<string, FactoryFile> | undefined;
+export const factoryFile = (path: string) => (byPath ??= new Map(FACTORY_FILES.map(f => [libPath(f.file), f]))).get(path);
 /** File name → channel name of a new project's Channel Rack (model.rs `STARTER_KIT`). */
 export const STARTER_KIT: readonly [string, string][] = [['kick-808-short.flac', 'Kick'], ['clap-808.flac', 'Clap'], ['hat-808-closed.flac', 'Hat'], ['snare-808.flac', 'Snare']];
 
 export const emptyProject = (): Project => structuredClone(data.empty) as unknown as Project;
+export const demoProject = (): Project => structuredClone(data.demo) as unknown as Project;
 
 /** The project source of a standard-library file: the one already there, or a new one (factory.rs `source`). */
 export function factorySource(p: Project, file: string): Id | null {
@@ -43,4 +47,15 @@ export function addStarterKit(p: Project): Id[] {
     p.channels!.find(c => c.id === id)!.name = name;
     return id;
   });
+}
+
+/**
+ * The sources the browser's Audio tab lists: the user's audio (imports, recordings, edits, and any
+ * sample with a clip in the Playlist). A standard-library sample that only a sampler channel plays
+ * (a new project's starter kit) belongs to the Channel Rack and is left out.
+ */
+export function browserSources(p: Project): Source[] {
+  const onClip = new Set(p.clips.filter(c => c.kind === 'audio').map(c => c.ref));
+  const inRack = new Set((p.channels ?? []).flatMap(c => c.kind === 'sample' ? [c.source] : []));
+  return p.sources.filter(s => !(s.path.startsWith(LIB_SCHEME) && inRack.has(s.id) && !onClip.has(s.id)));
 }

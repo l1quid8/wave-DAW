@@ -119,7 +119,7 @@ unsafe fn malloc_copy(s: &CStr) -> *mut c_char {
     }
 }
 
-/// `state:mapPath` both ways: WAVE keeps absolute paths (collecting a plugin's files
+/// `state:mapPath` both ways: Synkopa keeps absolute paths (collecting a plugin's files
 /// into the project is not done yet).
 unsafe extern "C" fn path_copy(_handle: *mut c_void, path: *const c_char) -> *mut c_char {
     if path.is_null() {
@@ -165,7 +165,7 @@ fn log_level(ty: u32) -> Option<log::Level> {
     }
 }
 
-unsafe extern "C" fn log_printf(_handle: *mut c_void, ty: u32, fmt: *const c_char) -> c_int {
+pub(crate) unsafe extern "C" fn log_printf(_handle: *mut c_void, ty: u32, fmt: *const c_char) -> c_int {
     let Some(level) = log_level(ty) else { return 0 };
     if fmt.is_null() {
         return 0;
@@ -180,7 +180,7 @@ extern "C" {
     fn vsnprintf(buf: *mut c_char, size: usize, fmt: *const c_char, ap: *mut c_void) -> c_int;
 }
 
-unsafe extern "C" fn log_vprintf(_handle: *mut c_void, ty: u32, fmt: *const c_char, ap: *mut c_void) -> c_int {
+pub(crate) unsafe extern "C" fn log_vprintf(_handle: *mut c_void, ty: u32, fmt: *const c_char, ap: *mut c_void) -> c_int {
     let Some(level) = log_level(ty) else { return 0 };
     if fmt.is_null() {
         return 0;
@@ -308,6 +308,11 @@ impl Inst {
                 w.after_run(self.handle);
             }
         }
+    }
+
+    /// The plugin's own handle (`instance-access`: what a UI that needs it is given).
+    pub fn handle(&self) -> LV2_Handle {
+        self.handle
     }
 
     /// The raw lilv instance (state save/restore).

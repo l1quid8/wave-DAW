@@ -23,8 +23,14 @@ assets/
 # Local pnpm content-addressable store created by some agent environments.
 .pnpm-store/
 
-# WAVE Keys piano (CC-BY): prepared by scripts/fetch-keys.mjs (originals cached in target/keys-src),
+# Synkopa Keys piano (CC-BY): prepared by scripts/fetch-keys.mjs (originals cached in target/keys-src),
 # bundled by `tauri build`.
 app/resources/keys/*.flac
 app/resources/keys/ATTRIBUTION.txt
+# Synkopa Demo Synth: built by scripts/build-demo-synth.mjs, bundled by `tauri build`.
+app/resources/plugins/*.vst3
+# Linux: ONNX Runtime, fetched by scripts/fetch-onnxruntime.mjs, bundled by `tauri build`.
+app/resources/ort/libonnxruntime*
+app/resources/ort/LICENSE.txt
+graphify-out/**
 .DS_Store

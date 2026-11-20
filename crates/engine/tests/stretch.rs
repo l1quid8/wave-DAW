@@ -44,7 +44,7 @@ fn engine_with_clip(tag: &str) -> (Arc<Engine>, Clip) {
     let path = dir.join("tones.wav");
     write_tones(&path, 440.0, 1.0, 880.0, 2.0);
     let e = Engine::new(dry_project(), Arc::new(NoPlugins));
-    let (_, clips) = e.import_audio(&[path], Some((0, 0.0))).unwrap();
+    let (_, clips, _) = e.import_audio(&[path], Some((0, 0.0))).unwrap();
     let clip = e.project().clips.into_iter().find(|c| c.id == clips[0]).unwrap();
     assert!((clip.len - 4.0).abs() < 0.01, "2 s at 120 BPM is 4 beats, got {}", clip.len);
     (e, clip)
@@ -180,7 +180,7 @@ fn live_playback_renders_the_stretch_in_the_background() {
         rt.process(&mut l, &mut r, None);
         out.extend_from_slice(&l);
     }
-    e.stop();
+    let _ = e.stop();
     let f = freq(&out, sec(0.4), sec(1.5));
     assert!((f - 440.0).abs() < 5.0, "live playback at {f} Hz");
 }

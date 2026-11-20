@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { macShortcuts } from './platform';
+import { macKeyCap, macShortcuts } from './platform';
 
 describe('macShortcuts', () => {
   it('writes chords the macOS way, in Apple modifier order', () => {
@@ -44,5 +44,14 @@ describe('macShortcuts', () => {
 
   it('maps chords that have a different Mac key', () => {
     expect(macShortcuts('Alt+F4')).toBe('⌘Q');
+  });
+});
+
+describe('macKeyCap', () => {
+  it('draws modifier keycaps as their glyphs and leaves other keys alone', () => {
+    expect(['Ctrl', 'Shift', 'S'].map(macKeyCap)).toEqual(['⌘', '⇧', 'S']);
+    expect(macKeyCap('Alt')).toBe('⌥');
+    expect(macKeyCap('F4')).toBe('F4');
+    expect(macKeyCap('toString')).toBe('toString');
   });
 });

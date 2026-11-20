@@ -175,3 +175,33 @@ fn a_bounded_pre_roll_is_heard_soon_and_on_the_timeline() {
         assert!(ms < 60.0, "first sound after {ms:.1} ms");
     }
 }
+
+/// A note played while stopped (a step click, the typing keyboard, MIDI) is heard at once:
+/// nothing has to line up with anything then, so no insert waits for the 1.6 s Rider.
+#[test]
+fn a_note_played_while_stopped_is_not_delayed_by_compensation() {
+    let (e, pdc) = engine("audition");
+    // a channel routed to its own insert (FL style): compensated to the Rider while playing
+    let p = e.project();
+    let to = p.tracks[0].insert;
+    assert_ne!(to, 0);
+    let mut c = p.channels.first().expect("a channel").clone();
+    c.insert = Some(to);
+    let ch = c.id;
+    e.apply(&[Op::PutChannel { channel: c, index: None }], false, None).unwrap();
+    let mut rt = e.create_rt(SR as f32, BLOCK);
+    rt.set_instant_start(Some(0.7));
+    run(&mut rt, BLOCK * 8); // settle while stopped
+    e.note_audition(ch, None, 0.9, None).unwrap();
+    let out = run(&mut rt, pdc + SR as usize / 2);
+    let at = onset(&out, 1e-3).expect("the note is heard");
+    assert!(at < SR as usize / 50, "heard after {at} frames (> 20 ms); the compensation is {pdc} frames");
+    // and Play still lines everything up after that (covered by the tests above); the switch
+    // back on stop is a crossfade, not a jump: no sample steps by more than the music does
+    e.play(0.0);
+    run(&mut rt, SR as usize);
+    let _ = e.stop();
+    let tail = run(&mut rt, BLOCK * 4);
+    let step = tail.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0f32, f32::max);
+    assert!(step < 0.5, "the stop jumped by {step}");
+}

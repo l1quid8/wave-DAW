@@ -2,10 +2,10 @@
 // ui/theme.ts; audio and MIDI devices are saved by the engine.
 import { createSignal } from 'solid-js';
 import { setLang, type Lang } from '../lib/i18n';
-import { isTauri } from '../api/backend';
+import { be } from '../api/backend';
 import * as A from './actions';
-import { S } from './store';
 import { U } from './ui';
+import { setFullscreen } from './fullscreen';
 
 export interface Prefs {
   /** interface language */
@@ -21,10 +21,15 @@ export interface Prefs {
   autosaveMin: number;
   /** show the tool hint in the toolbar's hint line */
   hints: boolean;
+  /** FL's CPU meter (load + underrun count) in the toolbar; off by default, the bar is short
+   *  on room. The underrun count is always in Settings → Audio. */
+  cpuMeter: boolean;
+  /** open the app in full screen (F11 toggles it any time) */
+  startFullscreen: boolean;
 }
 
 const KEY = 'wave.prefs';
-const DEFAULTS: Prefs = { lang: 'en', uiScale: 1, clipIcons: true, noteAudition: true, autosaveMin: 2, hints: true };
+const DEFAULTS: Prefs = { lang: 'en', uiScale: 1, clipIcons: true, noteAudition: true, autosaveMin: 2, hints: true, cpuMeter: false, startFullscreen: false };
 
 function load(): Prefs {
   try { const v = JSON.parse(localStorage.getItem(KEY) ?? '{}'); return { ...DEFAULTS, ...v, lang: v.lang === 'pl' ? 'pl' : 'en' }; } catch { return { ...DEFAULTS }; }
@@ -51,24 +56,25 @@ let timer: ReturnType<typeof setInterval> | null = null;
 function applyPref(k: keyof Prefs, p: Prefs) {
   if (k === 'lang') setLang(p.lang);
   if (k === 'uiScale') void applyScale(p.uiScale);
+  // switching it on (or off) in Settings shows what it does now, not only at the next start
+  if (k === 'startFullscreen') void setFullscreen(p.startFullscreen);
   if (k === 'autosaveMin') {
     if (timer) clearInterval(timer);
     timer = null;
+    // the autosave is a recovery snapshot (recovery.rs), saved project or not: it never writes
+    // over the project's own file, so the last save stays as the user made it
     if (p.autosaveMin > 0) timer = setInterval(() => {
       if (U.openingProject) return;
-      if (!S.path) void A.recoveryTick(); // also drops a stale copy once nothing is unsaved
-      else if (S.dirty) void A.projectSave(false);
+      void A.recoveryTick(); // also drops a stale snapshot once nothing is unsaved
     }, p.autosaveMin * 60_000);
   }
 }
 
 async function applyScale(z: number) {
-  if (isTauri()) {
-    try { const { getCurrentWebview } = await import('@tauri-apps/api/webview'); await getCurrentWebview().setZoom(z); return; } catch { /* fall back to CSS */ }
-  }
-  // browser (and a webview that refuses setZoom): CSS zoom. 100vh is measured before the zoom,
-  // so the app would be z times the window's height and its bottom (the mixer) cut off: --ui-zoom
-  // lets the layout divide it back out.
+  // the webview's own zoom keeps text crisp; a browser (or a refusing webview) falls back to CSS zoom
+  if (await be().win?.setZoom(z) === true) return;
+  // CSS zoom. 100vh is measured before the zoom, so the app would be z times the window's
+  // height and its bottom (the mixer) cut off: --ui-zoom lets the layout divide it back out.
   const st = document.documentElement.style as CSSStyleDeclaration & { zoom: string };
   st.zoom = z === 1 ? '' : String(z);
   if (z === 1) st.removeProperty('--ui-zoom'); else st.setProperty('--ui-zoom', String(z));
@@ -79,7 +85,8 @@ export function initPrefs() {
   const p = load();
   setPrefsSig(p);
   setLang(p.lang);
-  for (const k of Object.keys(p) as (keyof Prefs)[]) if (p[k] !== DEFAULTS[k]) applyPref(k, p);
+  // full screen needs the window (the backend): main.tsx applies it once that is up
+  for (const k of Object.keys(p) as (keyof Prefs)[]) if (k !== 'startFullscreen' && p[k] !== DEFAULTS[k]) applyPref(k, p);
   // autosave is a timer, not a value: it must start at the default interval too (it never ran
   // until the setting was changed once)
   if (p.autosaveMin === DEFAULTS.autosaveMin) applyPref('autosaveMin', p);

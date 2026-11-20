@@ -24,7 +24,8 @@ export function quantizeStarts(notes: readonly Note[], idx: readonly number[], u
     const n = notes[i]; if (!n) continue;
     let s = Math.max(0, r6(Math.round(n.step / unit) * unit));
     if (s + n.len > MAX_STEP + 1e-9) s = Math.max(0, r6(Math.floor((MAX_STEP - n.len) / unit + 1e-9) * unit));
-    if (Math.abs(s - n.step) > 1e-6) { out[i] = { ...n, step: s }; moved++; }
+    // 1e-4: the engine keeps steps as f32, so a triplet start read back is off by ~1e-5
+    if (Math.abs(s - n.step) > 1e-4) { out[i] = { ...n, step: s }; moved++; }
   }
   return { notes: out, moved };
 }
@@ -147,13 +148,6 @@ export function parseKey(text: string): number | null {
   return k >= 0 && k <= 127 ? k : null;
 }
 
-/** Parses a velocity in % ("80", "80 %"); 0..100, null when invalid. */
-export function parseVel(text: string): number | null {
-  const s = text.trim().replace(/\s*%$/, '');
-  if (!/^\d+(\.\d+)?$/.test(s)) return null;
-  const v = Number(s);
-  return v <= 100 ? Math.round(v) : null;
-}
 
 /** What the properties popover shows for notes `idx`: velocity (%) and length when they all share one (else null), the earliest start, the lowest key. */
 export function readProps(notes: readonly Note[], idx: readonly number[], chan: Channel | undefined): { vel: number | null; len: number | null; start: number; key: number } {
@@ -173,8 +167,10 @@ export function readProps(notes: readonly Note[], idx: readonly number[], chan: 
  * notes keep their positions relative to each other). Returns null when a note would leave the
  * song or the keys 0..127 (nothing is changed then).
  */
+
+
 export function applyProps(notes: readonly Note[], idx: readonly number[], chan: Channel | undefined,
-  ch: { vel?: number; len?: number; start?: number; key?: number }): Note[] | null {
+  ch: { vel?: number; len?: number; start?: number; key?: number; pan?: number }): Note[] | null {
   const cur = readProps(notes, idx, chan);
   const dS = ch.start != null ? ch.start - cur.start : 0, dK = ch.key != null ? ch.key - cur.key : 0;
   const out = notes.slice();
@@ -186,7 +182,58 @@ export function applyProps(notes: readonly Note[], idx: readonly number[], chan:
     if (ch.len != null) m.trig = false;
     if (dK) m.p = key;
     if (ch.vel != null) m.v = ch.vel / 100;
+    if (ch.pan != null) { if (Math.abs(ch.pan) < 0.005) delete m.pan; else m.pan = ch.pan; }
     out[i] = m;
   }
   return out;
+}
+
+/**
+ * Where pasted notes start (FL): at the step they were copied from, so a phrase lands on the same
+ * place in the bar of another pattern or channel. When that step is left of the view or past its
+ * first bar, the block moves by whole bars onto the first bar shown, keeping its place in the bar.
+ */
+export function pasteStart(from: number, viewPos: number, viewLen: number): number {
+  if (from >= viewPos - 1e-6 && from < viewPos + viewLen) return from;
+  return Math.max(0, from + Math.ceil((viewPos - from) / 16 - 1e-9) * 16);
+}
+
+/** Moves notes `idx` by `d` steps as one block (Shift+←/→), stopping at the pattern's start and end. */
+export function nudgeNotes(notes: readonly Note[], idx: readonly number[], d: number): Note[] {
+  if (!idx.length) return notes.slice();
+  const first = Math.min(...idx.map(i => notes[i].step)), last = Math.max(...idx.map(i => notes[i].step + (notes[i].trig ? 0 : notes[i].len)));
+  const by = Math.max(-first, Math.min(MAX_STEP - last, d));
+  const out = notes.slice();
+  for (const i of idx) out[i] = { ...notes[i], step: Math.round((notes[i].step + by) * 1e6) / 1e6 };
+  return out;
+}
+
+/**
+ * The velocity lane's stroke from `a` to `b` (steps, velocity 0..1): every note of channel `ch`
+ * starting between the two points (± `tol` steps) takes the line's value at its start. One call per
+ * pointer sample draws freehand without skipping notes on a fast drag; from the press point it is
+ * FL's right-drag ramp. With a selection only the selected notes change.
+ */
+export function velocityLine(notes: readonly Note[], ch: Id, sel: ReadonlySet<number>, a: { step: number; v: number }, b: { step: number; v: number }, tol: number): Note[] {
+  const lo = Math.min(a.step, b.step) - tol, hi = Math.max(a.step, b.step) + tol, span = b.step - a.step;
+  return notes.map((n, i) => {
+    if (n.ch !== ch || n.step < lo || n.step > hi || (sel.size && !sel.has(i))) return n;
+    const f = Math.abs(span) < 1e-9 ? 1 : Math.min(1, Math.max(0, (n.step - a.step) / span));
+    return { ...n, v: Math.round(Math.min(1, Math.max(0, a.v + (b.v - a.v) * f)) * 100) / 100 };
+  });
+}
+
+/**
+ * The pan lane's stroke, as `velocityLine` but for the notes' own pan: `v` 0..1 is the lane's
+ * height (0 = hard left, 0.5 = centre, 1 = hard right). Near the middle it snaps to the centre.
+ */
+export function panLine(notes: readonly Note[], ch: Id, sel: ReadonlySet<number>, a: { step: number; v: number }, b: { step: number; v: number }, tol: number): Note[] {
+  const lo = Math.min(a.step, b.step) - tol, hi = Math.max(a.step, b.step) + tol, span = b.step - a.step;
+  return notes.map((n, i) => {
+    if (n.ch !== ch || n.step < lo || n.step > hi || (sel.size && !sel.has(i))) return n;
+    const f = Math.abs(span) < 1e-9 ? 1 : Math.min(1, Math.max(0, (n.step - a.step) / span));
+    const pan = Math.round((Math.min(1, Math.max(0, a.v + (b.v - a.v) * f)) * 2 - 1) * 100) / 100;
+    const { pan: _old, ...rest } = n;
+    return Math.abs(pan) < 0.05 ? rest : { ...rest, pan };
+  });
 }

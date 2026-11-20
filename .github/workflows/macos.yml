@@ -1,0 +1,46 @@
+name: macOS
+
+# Builds Synkopa on macOS (Apple Silicon) and uploads the .dmg as a workflow artifact.
+on:
+  push:
+    branches: [macos-build]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      # ONNX Runtime's prebuilt library (stems, pitch) is built for macOS 13.4; linking for older fails
+      MACOSX_DEPLOYMENT_TARGET: "13.4"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile everything (all errors at once)
+        run: cargo check --workspace --all-targets --keep-going
+      - uses: pnpm/action-setup@v4
+        with: { version: 10 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm, cache-dependency-path: ui/pnpm-lock.yaml }
+      - run: pnpm --dir ui install --frozen-lockfile
+      - name: Synkopa Keys piano (bundled into the installer)
+        run: node scripts/fetch-keys.mjs
+      # without a tagName tauri-action only builds (nothing is published)
+      - uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: app
+          args: --bundles app,dmg
+      # the app must start and stay up (a missing library or a crash at start fails here)
+      - name: Smoke test (starts and keeps running)
+        run: |
+          app=target/release/bundle/macos/Synkopa.app
+          codesign --verify --deep --strict "$app" && echo "signature ok"
+          "$app/Contents/MacOS/wave-app" > smoke.log 2>&1 &
+          pid=$!
+          sleep 20
+          if kill -0 $pid 2>/dev/null; then echo "still running after 20 s"; kill $pid; else echo "::error::the app exited"; cat smoke.log; exit 1; fi
+          tail -20 smoke.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: synkopa-macos
+          path: target/release/bundle/dmg/*.dmg

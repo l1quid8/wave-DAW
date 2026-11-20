@@ -1,6 +1,6 @@
 //! Backend for platforms with no plugin-window implementation (everything but
-//! Windows and macOS). Everything above this file compiles and is tested
-//! anywhere; only these calls are missing. An X11 backend would slot in here.
+//! Windows, Linux and macOS). Everything above this file compiles and is tested
+//! anywhere; only these calls are missing.
 
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
@@ -14,13 +14,20 @@ pub(crate) fn create_window(
     _size: WindowSize,
     _events: Sender<WindowEvent>,
     _ticks: Arc<AtomicU64>,
+    _owner: isize,
 ) -> Result<isize, WindowError> {
     Err(WindowError::Unsupported)
 }
 
 pub(crate) fn destroy_window(_hwnd: isize) {}
 
+pub(crate) fn embed_handle(_hwnd: isize) -> isize {
+    0
+}
+
 pub(crate) fn show_window(_hwnd: isize) {}
+
+pub(crate) fn set_always_on_top(_hwnd: isize, _pinned: bool) {}
 
 pub(crate) fn request_close(_hwnd: isize) {}
 
@@ -32,6 +39,10 @@ pub(crate) fn dpi(_hwnd: isize) -> u32 {
 
 /// "Cannot tell" rather than "no".
 pub(crate) fn has_child_window(_hwnd: isize) -> Result<bool, WindowError> {
+    Err(WindowError::Unsupported)
+}
+
+pub(crate) fn embedded_size(_hwnd: isize) -> Result<Option<WindowSize>, WindowError> {
     Err(WindowError::Unsupported)
 }
 

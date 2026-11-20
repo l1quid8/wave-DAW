@@ -1,33 +1,44 @@
-import { curPat, newPattern, openRack, patMode, rackFloating, rollFloating, setRackDock, setRollDock, stepPattern, toggleRackShown, toggleRollShown } from '../state/pattern';
+import { isFullscreen, setFullscreen, toggleFullscreen } from '../state/fullscreen';
+import { curPat, newPattern, openRack, patMode, rackFloating, rollFloating, stepPattern, toggleRackShown, toggleRollShown } from '../state/pattern';
 import { patternMenu } from './patternShared';
 import { APP_GLYPH as G } from '../ui/menuIcons';
+import { forgetRecent, recent, recentLabels, refreshRecent } from '../state/recent';
+import { samePath } from '../lib/paths';
 import { t, type TranslationKey } from '../lib/i18n';
 import { setTypingOn, typingBase, typingOn } from '../state/typingKeys';
 import { noteName } from '../lib/pitch';
 import { prefs } from '../state/prefs';
-import { createEffect, createSignal, For, onCleanup, onMount, Show } from 'solid-js';
+import { createEffect, createSignal, For, on, onCleanup, onMount, Show } from 'solid-js';
 import { be } from '../api/backend';
-import { baseName, clamp, fmtClock, fmtPos, TapTracker } from '../lib/format';
-import { autoSnap, SNAPS, snapLabel, snapName } from '../lib/snap';
+import { notify } from '../state/notice';
+import { clamp, fmtClock, fmtPos, TapTracker } from '../lib/format';
+import { snapLabel } from '../lib/snap';
 import * as A from '../state/actions';
 import { commit, Gesture, wheelEdit } from '../state/edit';
 import { S } from '../state/store';
 import { curBeat, tele } from '../state/telemetry';
 import { closeMenu, openMenu, say, setU, U, type MenuItem, type Tool } from '../state/ui';
-import { checkUpdates, showWhatsNew, upd } from '../state/updates';
-import { toggleMixView } from '../state/mixView';
+import { anyTucked } from '../state/winOrder';
+import { checkUpdates, showWhatsNew } from '../state/updates';
+import { toggleMixer, toggleMixView } from '../state/mixView';
+import { dockMenu, resetLayout } from '../state/docking';
 import { midiFlash, midiStatus } from '../state/midi';
 import { track } from '../ui/drag';
 import { addFrameTask } from '../ui/frameLoop';
-import { Icon, ICONS } from '../ui/icons';
+import { Icon } from '../ui/icons';
 import { UpdateChip } from './Updates';
 import { AskButton, openAsk } from './Ask';
+import { setCommandMenus, setPaletteOpen } from './Palette';
 import { MissingChip } from './MissingAudio';
 import { MiniKnob } from '../ui/Knob';
 import { VOL_UNITY } from '../api/types';
 import { volText } from '../lib/format';
 import { autoDisplay, isAutomated, paramMenu } from '../state/automation';
-import { IS_MAC, shortcuts as keyLabel } from '../lib/platform';
+import { IS_MAC, keyCap, shortcuts as keyLabel } from '../lib/platform';
+import { masterClip, masterClipTip, resetMasterClip } from '../state/masterClip';
+import { cpuBand, cpuText, resetUnderruns, underrunFlash, underruns } from '../state/underruns';
+import { audioStatus, openAudioSettings } from '../state/audioWatch';
+import { barFits, fitLevel, FIT_MAX } from '../lib/toolbarFit';
 
 export const TOOLS: [Tool, string, TranslationKey][] = [
   ['draw', 'P', 'a.tb.toolDraw'], ['paint', 'B', 'a.tb.toolPaint'], ['erase', 'D', 'a.tb.toolErase'], ['mute', 'T', 'a.tb.toolMute'], ['slice', 'C', 'a.tb.toolSlice'], ['select', 'E', 'a.tb.toolSelect'],
@@ -37,7 +48,30 @@ export const TOOL_HINT: Record<Tool, TranslationKey> = { draw: 'a.tb.hint_draw',
 const clampBpm = (v: number) => clamp(Math.round(v * 100) / 100, 20, 999);
 
 export function Toolbar() {
-  let clockEl!: HTMLSpanElement, inEl!: HTMLDivElement;
+  let clockEl!: HTMLSpanElement, inEl!: HTMLDivElement, barEl!: HTMLDivElement;
+  // the fit (lib/toolbarFit.ts): measured again when the bar's width or what it shows changes
+  onMount(() => {
+    const q = (sel: string) => barEl.querySelector<HTMLElement>(sel);
+    const box = (el: Element | null) => { const r = el?.getBoundingClientRect(); return { left: r?.left ?? 0, right: r?.right ?? 0 }; };
+    const over = (el: HTMLElement | null) => !!el && el.scrollWidth > el.clientWidth + 1;
+    const apply = (n: number) => { for (let i = 1; i <= FIT_MAX; i++) barEl.classList.toggle('f' + i, i <= n); };
+    const fits = () => {
+      const l = q('.tbleft'), m = q('.tbmid'), r = q('.tbright');
+      return barFits({ bar: box(barEl), left: box(l), mid: box(m), right: box(r), leftOver: over(q('.tbmenu')), midOver: over(m), rightOver: over(r) });
+    };
+    let raf = 0;
+    const refit = () => { raf = 0; if (barEl.isConnected && barEl.clientWidth > 0) fitLevel(apply, fits); };
+    const later = () => { if (!raf) raf = requestAnimationFrame(refit); };
+    // what ticks while playing (the clock, the hint line, the meters) never changes what fits
+    const ticking = (n: Node) => !!(n.nodeType === 1 ? (n as Element) : n.parentElement)?.closest('.clock, .tbhint, .cpumeter, .inmeter');
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(later) : null;
+    ro?.observe(barEl);
+    const mo = typeof MutationObserver !== 'undefined' ? new MutationObserver(rs => { if (rs.some(r => !ticking(r.target))) later(); }) : null;
+    mo?.observe(barEl, { childList: true, subtree: true, characterData: true });
+    void document.fonts?.ready.then(later);
+    later();
+    onCleanup(() => { ro?.disconnect(); mo?.disconnect(); cancelAnimationFrame(raf); });
+  });
   let lastClock = '', inHold = 0;
   onMount(() => {
     const stop = addFrameTask(() => {
@@ -86,6 +120,24 @@ export function Toolbar() {
       say(t('a.tb.tapKeep'));
     }
   };
+  const recDest = () => {
+    const pat = A.patRecords() ? curPat() : undefined;
+    if (pat) return { label: pat.name, tip: t('d.rec.destPat', { name: pat.name }) };
+    const dest = A.recTargetName(U.start);
+    return { label: dest, tip: t('d.rec.dest', { what: A.recFilterName(), dest }) };
+  };
+  // FL: right-click on Record chooses what a recording captures
+  const recMenu = (e: MouseEvent) => {
+    e.preventDefault(); e.stopPropagation();
+    openMenu(e.clientX, e.clientY, [
+      { t: 'title', label: t('a.tb.recWhat') },
+      { t: 'item', label: t('a.tb.recAudio'), title: t('a.tb.recAudioTip'), checked: T().recAudio, act: () => void A.setRecFilter('audio', !T().recAudio) },
+      { t: 'item', label: t('a.tb.recNotes'), title: t('a.tb.recNotesTip'), checked: T().recNotes, act: () => void A.setRecFilter('notes', !T().recNotes) },
+      { t: 'sep' },
+      { t: 'sub', label: t('a.tb.recQuantize'), items: A.REC_QUANTIZE.map(q => ({ t: 'item' as const, label: t(q.label), checked: T().recQuantize === q.beats, act: () => void A.setRecQuantize(q.beats) })) },
+      { t: 'item', label: t('a.tb.recTyping'), kbd: 'Ctrl+T', title: t('a.tb.typOff'), checked: typingOn(), act: () => setTypingOn(!typingOn()) },
+    ]);
+  };
   const bpmMenu = (e: MouseEvent) => {
     e.preventDefault(); e.stopPropagation();
     const b = S.project.bpm;
@@ -107,7 +159,6 @@ export function Toolbar() {
     ], 260);
   };
   const T = () => S.transport;
-  const projName = () => (S.path ? baseName(S.path) : t('a.tb.untitled'));
   // custom title bar: empty toolbar areas and the project name drag the window, 2× click maximises
   const win = be().win;
   const [maxed, setMaxed] = createSignal(false);
@@ -127,6 +178,7 @@ export function Toolbar() {
     // child of one (.tbmain holds every button: closest() swallowed their clicks).
     if (el !== e.currentTarget && !el.hasAttribute('data-drag')) return;
     const now = performance.now();
+    if (isFullscreen()) return; // nothing to drag or maximize: the window is the screen
     if (now - lastDown < 350) { lastDown = 0; void win.toggleMaximize(); return; }
     lastDown = now;
     void win.startDragging();
@@ -134,25 +186,34 @@ export function Toolbar() {
   const wins = () => U.plugs.length + (rackFloating() ? 1 : 0) + (rollFloating() ? 1 : 0);
   const hint = () => t('a.tb.statusHint', { tool: t(TOOLS.find(x => x[0] === U.tool)![2]), hint: t(TOOL_HINT[U.tool]), snap: U.alt ? 'off' : snapLabel(U.snap, U.bw).replace('Snap: ', '') });
   return (
-    <div class="toolbar" classList={{ native: !!win, mac: !!win && IS_MAC }} onMouseDown={dragDown}>
+    <div ref={barEl} class="toolbar" classList={{ native: !!win, mac: !!win && IS_MAC }} onMouseDown={dragDown}>
       {/* left: the menus over the hint line (FL): what the last action did, and what the tool does */}
       <div class="tbleft" data-drag>
         <div class="tbmenu" data-drag>
           <MenuBar />
+          <button class="cmdbtn" title={t('a.cmd.title') + ' (Ctrl+K)'} aria-label={t('a.cmd.title')} onClick={() => setPaletteOpen(true)}>
+            <Icon d="M11 4a7 7 0 1 0 0 14a7 7 0 0 0 0-14z M20 20l-4-4" size={13} /><kbd>{IS_MAC ? '⌘K' : 'Ctrl K'}</kbd>
+          </button>
           <AskButton />
-          <UpdateChip />
           <MissingChip />
-          <span data-drag class="projName" title={(S.path ?? t('a.tb.unsavedProj')) + (S.dirty ? t('a.tb.unsavedChanges') : '')}>{projName()}<Show when={S.dirty}><span data-drag class="dirty">•</span></Show></span>
+          {/* the project's name is the window's (taskbar) title; here only the unsaved mark, with the path on hover */}
+          <Show when={S.dirty}><span data-drag class="projName" title={(S.path ?? t('a.tb.unsavedProj')) + t('a.tb.unsavedChanges')}><span data-drag class="dirty">•</span></span></Show>
         </div>
         <div class="tbhint" data-drag>
           <span class="hled" style={{ background: S.transport.rec && U.playing ? 'var(--red)' : U.playing ? 'var(--green)' : 'var(--fg6)' }} />
-          <span data-drag class="readout" data-readout title={U.readout}>{U.readout}</span>
+          <span class="readout" data-readout title={U.readout}>{U.readout}</span>
           <Show when={U.alt}><span class="offgrid">OFF GRID</span></Show>
-          <Show when={prefs().hints}><span data-drag class="hinttxt">{hint()}</span></Show>
+          <Show when={prefs().hints}><span class="hinttxt">{hint()}</span></Show>
+          {/* Record armed: where the recording goes (the first free track, a new one, the looping pattern) */}
+          <Show when={T().rec}>
+            <span class="recdest" title={recDest().tip}>● {recDest().label}</span>
+          </Show>
           <div class="row inrow" title={t('a.tb.inLevel')} style={{ gap: '6px', display: T().rec || T().monitor ? 'flex' : 'none' }}>
             <span class="tag9">IN</span>
             <div class="inmeter"><div ref={inEl} /></div>
           </div>
+          {/* a found, downloading or downloaded update: the status line, where it never crowds the menus */}
+          <UpdateChip />
         </div>
       </div>
       <div class="tbmid" data-drag>
@@ -161,7 +222,7 @@ export function Toolbar() {
           <svg width="11" height="11" viewBox="0 0 14 14"><path d="M3 1.5v11l9-5.5z" fill="currentColor" /></svg>
         </button>
         <button title={t('a.tb.stopTip')} onClick={() => void A.stop(!(U.playing || U.patPlaying))}><svg width="10" height="10" viewBox="0 0 12 12"><rect x="1" y="1" width="10" height="10" rx="1" fill="currentColor" /></svg></button>
-        <button title={t('a.tb.recTip')} class="rec" classList={{ armed: T().rec }} onClick={A.toggleRec}>
+        <button title={t('a.tb.recTip', { what: A.recFilterName() })} class="rec" classList={{ armed: T().rec }} onClick={A.toggleRec} onContextMenu={recMenu}>
           <svg width="10" height="10" viewBox="0 0 12 12"><circle cx="6" cy="6" r="5" fill="currentColor" /></svg>
         </button>
         <button title={t('a.tb.monTip')} class="mon monbtn" classList={{ on: T().monitor }} onClick={A.toggleMonitor}>
@@ -172,7 +233,15 @@ export function Toolbar() {
         </button>
         <button class="count" classList={{ on: T().countIn }} title={t('a.tb.countTip')} onClick={() => void A.setTransportFlag('countIn', !T().countIn)}>1 BAR</button>
       </div>
+      {/* an input mode, like record and monitor: beside the transport, not among the panel buttons */}
+      <button class="tbtn icon typkb" aria-pressed={typingOn()} classList={{ on: typingOn() }} title={typingOn() ? t('a.tb.typOn', { z: noteName(typingBase()), q: noteName(typingBase() + 12) }) : t('a.tb.typOff')}
+        onClick={() => setTypingOn(!typingOn())}>
+        <Icon d="M3 6h18v12H3z M7 6v7 M11 6v7 M15 6v7 M19 6v7 M3 13h18" size={14} />
+        <span class="lbl">{t('a.tb.typLabel')}</span>
+        <Show when={typingOn()}><span class="mono typoct">{noteName(typingBase())}</span></Show>
+      </button>
       <MainVolume />
+      <MasterOut />
       <div class="seg patsong" title={t('a.tb.patSongTip')}>
         <button class="pat" classList={{ on: patMode() }} onClick={() => A.switchMode(true)}>PAT</button>
         <button class="song" classList={{ on: !patMode() }} onClick={() => A.switchMode(false)}>SONG</button>
@@ -180,7 +249,7 @@ export function Toolbar() {
       <PatSelector />
       <div class="clockbox" onContextMenu={bpmMenu}>
         <span ref={clockEl} class="clock">1:01:01</span>
-        <div style={{ width: '1px', height: '14px', background: 'var(--line)' }} />
+        <div class="clocksep" />
         <span class="bpm" title={t('a.tb.bpmTip')} onPointerDown={bpmDown} onWheel={bpmWheel}>{S.project.bpm.toFixed(2)}</span>
         <span class="tag9">BPM</span>
         <button class="tapbtn" classList={{ on: tapping() }} data-tap title={t('a.tb.tapTip')} onClick={e => doTap(e)}>TAP</button>
@@ -189,32 +258,29 @@ export function Toolbar() {
       <div class="tbright" data-drag>
       <span data-drag class="loopText" style={{ color: S.project.loop ? 'var(--green)' : 'var(--fg5)' }}>{S.project.loop ? 'LOOP ' + fmtPos(S.project.loop.a) + ' – ' + fmtPos(S.project.loop.b) : ''}</span>
       <div data-drag class="dragfill" />
-      <button class="ibtn typkb" classList={{ on: typingOn() }} title={typingOn() ? t('a.tb.typOn', { z: noteName(typingBase()), q: noteName(typingBase() + 12) }) : t('a.tb.typOff')}
-        onClick={() => setTypingOn(!typingOn())}>
-        <Icon d="M3 6h18v12H3z M7 6v7 M11 6v7 M15 6v7 M19 6v7 M3 13h18" size={14} />
-        <Show when={typingOn()}><span class="mono typoct">{noteName(typingBase())}</span></Show>
-      </button>
-      <div class="seg tools">
-        <For each={TOOLS}>
-          {([id, key, title]) => (
-            <button classList={{ on: U.tool === id }} title={t(title) + ' (' + key + ') — ' + t(TOOL_HINT[id])} onClick={() => setU('tool', id)}>
-              <Icon d={ICONS[id]} sw={1.9} />
-            </button>
-          )}
-        </For>
-      </div>
-      {/* the select names the setting only ("Snap: auto"); what auto resolves to is in its tooltip and the hint line */}
-      <select class="sel snapsel" title={U.snap < 0 ? t('a.tb.snapTipAuto', { unit: snapName(autoSnap(U.bw)) }) : t('a.tb.snapTip')} value={String(U.snap)} onChange={e => A.setSnap(parseFloat(e.currentTarget.value))} data-snap>
-        <For each={SNAPS}>{([label, v]) => <option value={String(v)}>{v === 0 ? t('a.snap.off') : label}</option>}</For>
-      </select>
+      <Show when={prefs().cpuMeter}><CpuMeter /></Show>
       <Show when={wins()}>
-        <button class="tbtn icon winsbtn" classList={{ on: !U.plugsHidden }} onClick={() => (U.plugsHidden ? A.showPlugs() : A.playlistFront())}
-          title={U.plugsHidden ? t('a.tb.showWins', { n: wins() }) : t('a.tb.hideWins')} aria-label={t('a.tb.windows', { n: wins() })}>
+        <button class="tbtn icon winsbtn" classList={{ on: !anyTucked() }} onClick={() => (anyTucked() ? A.showPlugs() : A.playlistFront())}
+          title={anyTucked() ? t('a.tb.showWins', { n: wins() }) : t('a.tb.hideWins')} aria-label={t('a.tb.windows', { n: wins() })}>
           <Icon d="M4 7h12v12H4z M8 3h12v12" size={14} /><span class="cnt mono">{wins()}</span>
         </button>
       </Show>
-      <button class="tbtn icon" classList={{ on: U.mixView }} onClick={toggleMixView} title={t(U.mixView ? 'a.tb.mixViewBackTip' : 'a.tb.mixerTip')} aria-label={t('a.mn.mixer')} aria-pressed={U.mixView}>
+      {/* FL's window buttons: what is open is lit; a click brings a closed (or buried) window back */}
+      <button class="tbtn icon panelbtn" classList={{ on: U.pickOpen }} onClick={() => setU('pickOpen', !U.pickOpen)} title={t('a.tb.browserTip')} aria-label={t('a.mn.browser')} aria-pressed={U.pickOpen}>
+        <Icon d="M3 5h18v14H3z M9 5v14 M5 9h2 M5 12h2 M5 15h2" size={14} />
+        <span class="lbl">{t('a.mn.browser')}</span>
+      </button>
+      <button class="tbtn icon panelbtn" classList={{ on: !!U.rackWin }} onClick={toggleRackShown} title={t('a.tb.rackTip')} aria-label={t('a.mn.rack')} aria-pressed={!!U.rackWin}>
+        <Icon d="M3 5h4v4H3z M10 5h4v4h-4z M17 5h4v4h-4z M3 15h4v4H3z M10 15h4v4h-4z M17 15h4v4h-4z" size={14} />
+        <span class="lbl">{t('a.mn.rack')}</span>
+      </button>
+      <button class="tbtn icon panelbtn" classList={{ on: !!U.rollWin }} onClick={toggleRollShown} title={t('a.tb.rollTip')} aria-label={t('a.mn.roll')} aria-pressed={!!U.rollWin}>
+        <Icon d="M3 4h18v16H3z M3 9h18 M3 14h18 M7 6.5h5 M13 11.5h6 M5 16.5h7" size={14} />
+        <span class="lbl">{t('a.mn.roll')}</span>
+      </button>
+      <button class="tbtn icon panelbtn" classList={{ on: !U.mixMin }} onClick={toggleMixer} title={t('a.tb.mixerTip')} aria-label={t('a.mn.mixer')} aria-pressed={!U.mixMin}>
         <Icon d="M5 21v-7M5 10V3M12 21v-9M12 8V3M19 21v-5M19 12V3M2 14h6M9 8h6M16 16h6" size={14} />
+        <span class="lbl">{t('a.mn.mixer')}</span>
       </button>
       <Show when={midiStatus()?.selected}>
         <button class="ibtn midibtn" onClick={() => setU('settings', true)}
@@ -226,7 +292,12 @@ export function Toolbar() {
       <Show when={win && !IS_MAC}>
         <div class="winbtns">
           <button title={t('a.tb.minimize')} aria-label={t('a.tb.minimize')} onClick={() => void win!.minimize()}><svg width="10" height="10" viewBox="0 0 10 10"><path d="M0 5h10" stroke="currentColor" /></svg></button>
-          <button title={maxed() ? t('a.tb.restore') : t('a.tb.maximize')} aria-label={maxed() ? t('a.tb.restore') : t('a.tb.maximize')} onClick={() => void win!.toggleMaximize()}>
+          <Show when={isFullscreen()}>
+            <button title={t('a.tb.exitFull')} aria-label={t('a.tb.exitFull')} onClick={() => void setFullscreen(false)}>
+              <svg width="10" height="10" viewBox="0 0 10 10"><path d="M3.5 .5v3h-3 M6.5 .5v3h3 M3.5 9.5v-3h-3 M6.5 9.5v-3h3" fill="none" stroke="currentColor" /></svg>
+            </button>
+          </Show>
+          <button hidden={isFullscreen()} title={maxed() ? t('a.tb.restore') : t('a.tb.maximize')} aria-label={maxed() ? t('a.tb.restore') : t('a.tb.maximize')} onClick={() => void win!.toggleMaximize()}>
             <Show when={maxed()} fallback={<svg width="10" height="10" viewBox="0 0 10 10"><rect x=".5" y=".5" width="9" height="9" fill="none" stroke="currentColor" /></svg>}>
               <svg width="10" height="10" viewBox="0 0 10 10"><path d="M2.5 2.5V.5h7v7h-2 M.5 2.5h7v7h-7z" fill="none" stroke="currentColor" /></svg>
             </Show>
@@ -240,8 +311,9 @@ export function Toolbar() {
 }
 
 /**
- * The application menus. A press opens one under its title; while one is open, moving over
- * another title switches to it (the bar is lifted above the menu backdrop for that).
+ * The application menus. A press opens one under its title; while one is open, pressing or
+ * moving over another title switches to it in one step (dismissal of presses elsewhere is
+ * handled at the document level — see ContextMenu — so nothing covers the bar).
  */
 function MenuBar() {
   const [open, setOpen] = createSignal(-1);
@@ -249,15 +321,35 @@ function MenuBar() {
   const win = be().win;
   const none = () => !U.sel.length;
   const wins = () => U.plugs.length + (rackFloating() ? 1 : 0) + (rollFloating() ? 1 : 0);
+  onMount(() => void refreshRecent());
+  /** File → Open recent: newest first, the open project ticked, a moved or deleted file shown but not openable. */
+  const recentItems = (): MenuItem[] => {
+    const list = recent();
+    if (!list.length) return [{ t: 'item', label: t('a.mn.recentNone'), disabled: true, act: () => {} }];
+    const labels = recentLabels(list);
+    const items: MenuItem[] = list.map((r, i) => r.exists
+      ? { t: 'item', label: labels[i], title: r.path, checked: samePath(r.path, S.path), disabled: U.openingProject, act: () => void A.projectOpen(r.path) }
+      : { t: 'item', label: t('a.mn.recentMissing', { name: labels[i] }), title: t('a.mn.recentMissingTip', { path: r.path }), disabled: true, act: () => {} });
+    items.push({ t: 'sep' });
+    if (list.some(r => !r.exists)) {
+      items.push({ t: 'item', label: t('a.mn.recentPrune'), act: () => { void (async () => { for (const r of list.filter(x => !x.exists)) await forgetRecent(r.path); })(); } });
+    }
+    items.push({ t: 'item', label: t('a.mn.recentClear'), act: () => void forgetRecent() });
+    return items;
+  };
   const menus: [TranslationKey, () => MenuItem[]][] = [
     ['a.mn.file', () => [
-      { t: 'item', label: t('a.mn.new'), glyph: G.new, kbd: 'Ctrl+N', act: () => void A.projectNew() },
-      { t: 'item', label: t('a.mn.open'), glyph: G.open, kbd: 'Ctrl+O', act: () => void A.projectOpen() },
+      { t: 'item', label: t('a.mn.new'), glyph: G.new, kbd: 'Ctrl+Shift+N', disabled: U.openingProject, act: () => void A.projectNew() },
+      { t: 'item', label: t('a.mn.open'), glyph: G.open, kbd: 'Ctrl+O', disabled: U.openingProject, act: () => void A.projectOpen() },
+      { t: 'sub', label: t('a.mn.openRecent'), glyph: G.open, items: recentItems() },
+      { t: 'item', label: t('a.mn.openDemo'), glyph: G.open, disabled: U.openingProject, act: () => void A.projectNew(true) },
       { t: 'sep' },
       { t: 'item', label: t('a.mn.save'), glyph: G.save, kbd: 'Ctrl+S', act: () => void A.projectSave(false) },
       { t: 'item', label: t('a.mn.saveAs'), glyph: G.saveAs, kbd: 'Ctrl+Shift+S', act: () => void A.projectSave(true) },
+      { t: 'item', label: t('a.mn.saveVersion'), glyph: G.saveAs, kbd: 'Ctrl+N', title: t('a.mn.saveVersionTip'), act: () => void A.projectSave(false, true) },
       { t: 'sep' },
       { t: 'item', label: t('a.mn.export'), glyph: G.export, kbd: 'Ctrl+Shift+R', act: () => setU('exportOpen', true) },
+      { t: 'item', label: t('a.pl.inPlace'), glyph: G.export, kbd: 'Ctrl+Alt+E', title: t('a.pl.inPlaceTip'), disabled: !S.project.clips.some(c => U.sel.includes(c.id) && c.kind !== 'auto'), act: () => void A.exportInPlace() },
       { t: 'item', label: t('a.mn.exportProjectZip'), glyph: G.exportZip, disabled: U.projectZipBusy || U.openingProject, act: () => void A.projectExportZip() },
       { t: 'sep' },
       { t: 'item', label: t('d.midi.mnImport'), glyph: G.midiImport, act: () => void A.midiImport() },
@@ -267,8 +359,8 @@ function MenuBar() {
       ...(win ? [{ t: 'sep' } as MenuItem, { t: 'item', label: t('a.mn.exit'), glyph: G.exit, kbd: 'Alt+F4', act: () => void win.close() } as MenuItem] : []),
     ]],
     ['a.mn.edit', () => [
-      { t: 'item', label: t('a.mn.undo'), glyph: G.undo, kbd: 'Ctrl+Z', disabled: !S.canUndo, act: () => void A.undo() },
-      { t: 'item', label: t('a.mn.redo'), glyph: G.redo, kbd: 'Ctrl+Shift+Z', disabled: !S.canRedo, act: () => void A.redo() },
+      { t: 'item', label: S.undoLabel ? `${t('a.mn.undo')}: ${S.undoLabel}` : t('a.mn.undo'), glyph: G.undo, kbd: 'Ctrl+Z', disabled: !S.canUndo, act: () => void A.undo() },
+      { t: 'item', label: S.redoLabel ? `${t('a.mn.redo')}: ${S.redoLabel}` : t('a.mn.redo'), glyph: G.redo, kbd: 'Ctrl+Shift+Z', disabled: !S.canRedo, act: () => void A.redo() },
       { t: 'sep' },
       { t: 'item', label: t('a.mn.cut'), glyph: G.cut, kbd: 'Ctrl+X', disabled: none(), act: A.cut },
       { t: 'item', label: t('a.mn.copy'), glyph: G.copy, kbd: 'Ctrl+C', disabled: none(), act: A.copy },
@@ -280,26 +372,47 @@ function MenuBar() {
     ]],
     ['a.mn.view', () => [
       { t: 'item', label: t('a.mn.browser'), kbd: 'Alt+F8', checked: U.pickOpen, act: () => setU('pickOpen', !U.pickOpen) },
-      { t: 'item', label: t('a.mn.mixer'), kbd: 'F9', checked: U.mixView, act: toggleMixView },
-      { t: 'item', label: t(U.mixMin ? 'a.mn.mixExpand' : 'a.mn.mixCollapse'), glyph: U.mixMin ? G.expand : G.collapse, disabled: U.mixView, title: t(U.mixView ? 'a.mn.mixDockOff' : 'a.mn.mixDockTip'), act: () => setU('mixMin', !U.mixMin) },
+      { t: 'item', label: t('a.mn.mixer'), kbd: 'F9', checked: !U.mixMin, act: toggleMixer },
+      { t: 'item', label: t('a.mn.mixMax'), checked: U.mixView, title: t('a.mn.mixMaxTip'), act: toggleMixView },
       { t: 'item', label: t('a.mn.rack'), kbd: 'F6', checked: !!U.rackWin, act: toggleRackShown },
       { t: 'item', label: t('a.mn.roll'), kbd: 'F7', checked: !!U.rollWin, act: toggleRollShown },
-      { t: 'item', label: t('a.mn.rackDock'), checked: U.rackDock, title: t('a.mn.rackDockTip'), act: () => setRackDock(!U.rackDock) },
-      { t: 'item', label: t('a.mn.rollDock'), checked: U.rollDock, title: t('a.mn.rollDockTip'), act: () => setRollDock(!U.rollDock) },
-      { t: 'item', label: t(U.plugsHidden ? 'a.mn.winsShow' : 'a.mn.winsHide'), glyph: G.windows, kbd: 'F5', disabled: !wins(), act: () => (U.plugsHidden ? A.showPlugs() : A.playlistFront()) },
+      { t: 'sub', label: t('a.mn.layout'), glyph: G.windows, items: [
+        { t: 'sec', label: t('a.mn.rack') }, ...dockMenu('rack'),
+        { t: 'sec', label: t('a.mn.roll') }, ...dockMenu('roll'),
+        { t: 'sec', label: t('a.mn.mixer') }, ...dockMenu('mix'),
+        { t: 'sep' },
+        { t: 'item', label: t('a.mn.layoutReset'), title: t('a.mn.layoutResetTip'), act: resetLayout },
+      ] },
+      { t: 'item', label: t(anyTucked() ? 'a.mn.winsShow' : 'a.mn.winsHide'), glyph: G.windows, kbd: 'F5', disabled: !wins(), act: () => (anyTucked() ? A.showPlugs() : A.playlistFront()) },
+      { t: 'sep' },
+      // the transport toggles the toolbar hides first on a narrow window
+      { t: 'item', label: t('a.mn.metro'), kbd: 'Ctrl+M', checked: S.transport.metro, act: () => void A.setTransportFlag('metro', !S.transport.metro) },
+      { t: 'item', label: t('a.mn.countIn'), checked: S.transport.countIn, act: () => void A.setTransportFlag('countIn', !S.transport.countIn) },
+      { t: 'item', label: t('a.mn.monitor'), checked: S.transport.monitor, act: A.toggleMonitor },
+      { t: 'item', label: t('a.mn.typing'), checked: typingOn(), act: () => setTypingOn(!typingOn()) },
       { t: 'sep' },
       { t: 'item', label: t('a.mn.follow'), kbd: 'F', checked: U.follow, act: () => setU('follow', !U.follow) },
       { t: 'item', label: t('a.mn.zoomIn'), glyph: G.zoomIn, kbd: 'Ctrl+=', act: () => A.zoomAt(1.25) },
       { t: 'item', label: t('a.mn.zoomOut'), glyph: G.zoomOut, kbd: 'Ctrl+−', act: () => A.zoomAt(0.8) },
+      { t: 'sep' },
+      { t: 'item', label: t('a.mn.fullscreen'), kbd: 'F11', checked: isFullscreen(), act: () => void toggleFullscreen() },
     ]],
     ['a.mn.help', () => [
       { t: 'item', label: t('d.ask.menu'), glyph: G.ask, kbd: 'F1', act: openAsk },
+      { t: 'item', label: t('a.cmd.title'), glyph: G.shortcuts, kbd: 'Ctrl+K', act: () => setPaletteOpen(true) },
       { t: 'item', label: t('a.mn.shortcuts'), glyph: G.shortcuts, kbd: '?', act: () => setU('help', true) },
       { t: 'sep' },
-      { t: 'item', label: t('a.mn.updates'), glyph: G.updates, disabled: !upd().updates, title: upd().updates ? undefined : t('d.upd.none'), act: () => void checkUpdates() },
+      { t: 'item', label: t('a.mn.updates'), glyph: G.updates, act: () => void checkUpdates() },
       { t: 'item', label: t('a.mn.whatsNew'), glyph: G.whatsNew, act: () => void showWhatsNew() },
+      { t: 'sep' },
+      { t: 'item', label: t('a.mn.discord'), glyph: G.discord, act: () => void be().openDiscord().catch(e => notify(t('a.mn.discordFailed', { error: String(e) }))) },
     ]],
   ];
+  setCommandMenus(menus);
+  // whether the open menu was opened by a press on its own title (vs a hover switch): a press
+  // on the open title toggles closed only then — a press on a hover-switched title keeps it,
+  // so "click Edit while File is open" ends with Edit's menu open either way
+  let byPress = false;
   const show = (i: number, el: HTMLElement) => {
     const r = el.getBoundingClientRect();
     closeMenu(); // remount: an open panel keeps the position it was mounted at
@@ -311,8 +424,8 @@ function MenuBar() {
       <For each={menus}>
         {([key], i) => (
           <button class="mbtn" role="menuitem" aria-haspopup="menu" aria-expanded={open() === i()} classList={{ on: open() === i() }}
-            onPointerDown={e => { if (e.button !== 0) return; e.preventDefault(); if (open() === i()) closeMenu(); else show(i(), e.currentTarget); }}
-            onPointerEnter={e => { if (open() >= 0 && open() !== i()) show(i(), e.currentTarget); }}>{t(key)}</button>
+            onPointerDown={e => { if (e.button !== 0) return; e.preventDefault(); if (open() === i()) { if (byPress) closeMenu(); } else { byPress = true; show(i(), e.currentTarget); } }}
+            onPointerEnter={e => { if (open() >= 0 && open() !== i()) { byPress = false; show(i(), e.currentTarget); } }}>{t(key)}</button>
         )}
       </For>
     </div>
@@ -334,8 +447,9 @@ function PatSelector() {
   };
   return (
     <div class="patselbox" data-patsel>
-      <button class="patselbtn" title={t('b.ps.title')} onWheel={wheel}
-        onClick={e => { const r = (e.currentTarget as HTMLElement).getBoundingClientRect(); patternMenu(r.left, r.bottom + 4, true); }}>
+      {/* the name shows the pattern in the Channel Rack; the arrow (or a right-click) lists the patterns */}
+      <button class="patselbtn" title={t('b.ps.title')} onWheel={wheel} onClick={() => openRack()}
+        onContextMenu={e => { e.preventDefault(); const r = (e.currentTarget as HTMLElement).getBoundingClientRect(); patternMenu(r.left, r.bottom + 4, true); }}>
         <Show when={curPat()} fallback={<span class="ell" style={{ color: 'var(--fg5)' }}>—</span>}>
           {p => <>
             <span class="num mono">{n()}</span>
@@ -343,6 +457,9 @@ function PatSelector() {
             <span class="ell">{p().name}</span>
           </>}
         </Show>
+      </button>
+      <button class="patselarrow" title={t('b.ps.list')} aria-label={t('b.ps.list')}
+        onClick={e => { const r = (e.currentTarget.previousElementSibling as HTMLElement).getBoundingClientRect(); patternMenu(r.left, r.bottom + 4, true); }}>
         <svg width="8" height="8" viewBox="0 0 8 8"><path d="M1 2.5l3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.3" /></svg>
       </button>
       <button class="patselnew" title={t('b.pat.new')} onClick={() => { newPattern(); openRack(); }}><Icon d="M12 5v14 M5 12h14" size={11} /></button>
@@ -374,6 +491,7 @@ const shortcuts = (): [string, string][] => [
   [t('a.sc.11'), 'Home'],
   ['Browser', 'Alt+F8'],
   [t('a.sc.12'), 'F8'],
+  [t('a.mn.fullscreen'), 'F11'],
   [t('a.sc.13'), t('a.sc.14')],
   [t('a.sc.15'), t('a.sc.16')],
   [t('a.sc.17'), 'Esc'],
@@ -385,10 +503,12 @@ const shortcuts = (): [string, string][] => [
   [t('a.sc.25'), 'Esc'],
   [t('a.sc.26'), t('a.sc.27')],
   [t('a.sc.28'), t('a.sc.29')],
-  [t('a.sc.30'), 'Ctrl+B · Ctrl+D'],
+  [t('a.sc.30'), 'Ctrl+B'],
+  [t('a.sc.deselect'), 'Ctrl+D'],
   [t('a.sc.31'), 'Ctrl+C · X · V'],
   [t('a.sc.32'), 'Del'],
-  [t('a.sc.33'), 'Ctrl+M'],
+  [t('a.sc.33'), 'Alt+M'],
+  [t('a.mn.metro'), 'Ctrl+M'],
   [t('a.sc.stretchMode'), 'Shift+M'],
   [t('a.sc.34'), 'Shift + ← →'],
   [t('a.sc.35'), 'Shift + ↑ ↓'],
@@ -403,7 +523,8 @@ const shortcuts = (): [string, string][] => [
   [t('a.sc.50'), t('a.sc.51')],
   [t('a.sc.52'), t('a.sc.53')],
   [t('a.sc.54'), t('a.sc.55')],
-  [t('a.sc.56'), 'Ctrl+N · Ctrl+O'],
+  [t('a.sc.56'), 'Ctrl+Shift+N · Ctrl+O'],
+  [t('a.mn.saveVersion'), 'Ctrl+N'],
   [t('a.sc.57'), 'Ctrl+S · Ctrl+Shift+S'],
   [t('a.sc.58'), 'Ctrl+Shift+R'],
   [t('a.sc.59'), t('a.sc.60')],
@@ -424,8 +545,8 @@ const shortcuts = (): [string, string][] => [
   [t('a.sc.85'), t('a.sc.86')],
   ['Velocity', t('a.sc.87')],
   [t('a.sc.88'), 'P · B · E · D'],
-  [t('a.sc.89'), '↑ ↓ · Ctrl + ↑ ↓'],
-  [t('a.sc.90'), 'Ctrl+B · Ctrl+D'],
+  [t('a.sc.89'), 'Shift + ↑ ↓ · Ctrl + ↑ ↓'],
+  [t('a.sc.90'), 'Ctrl+B'],
   [t('a.sc.91'), 'Ctrl+C · X · V'],
   [t('a.sc.112'), t('a.sc.113')],
   [t('a.sc.170'), t('a.sc.171')],
@@ -458,14 +579,35 @@ const shortcuts = (): [string, string][] => [
   [t('a.sc.105'), t('a.sc.106')],
 ];
 
+/**
+ * One alternative of a shortcut. A key combination ("Shift+Ctrl+L", "Ctrl + wheel") is drawn as key caps;
+ * a gesture described in words ("double-click an audio clip") stays plain text: a cap around a sentence reads as a button.
+ */
+function KeyCombo(props: { k: string }) {
+  // "Num + −" names two numpad keys, plus and minus: its "+" is a key, not a joiner
+  const parts = () => (props.k.startsWith('Num ') ? [props.k] : props.k.split('+').map(x => x.trim()).filter(Boolean));
+  const keys = () => parts().length > 0 && parts().every(x => x.length <= 9);
+  return (
+    <Show when={keys()} fallback={<span class="gesture">{keyLabel(props.k)}</span>}>
+      <span class="combo"><For each={parts()}>{x => <kbd>{keyCap(x)}</kbd>}</For></span>
+    </Show>
+  );
+}
+
 export function Help() {
+  // the list is for reading; finding a command by a word is the command palette's job (Ctrl+K), linked from the title
+  const close = () => setU('help', false);
   return (
     <Show when={U.help}>
-      <div class="overlay" onPointerDown={() => setU('help', false)}>
-        <div class="dialog" style={{ width: 'min(680px,92vw)', 'max-height': '90vh', 'overflow-y': 'auto' }} onPointerDown={e => e.stopPropagation()}>
-          <div class="hd"><span>{t('a.tb.helpTitle')}</span><button onClick={() => setU('help', false)}>×</button></div>
-          <div style={{ display: 'grid', 'grid-template-columns': 'repeat(auto-fit,minmax(280px,1fr))', 'column-gap': '24px' }}>
-            <For each={shortcuts()}>{([a, k]) => <div class="sc"><span class="a">{a}</span><span class="k">{keyLabel(k)}</span></div>}</For>
+      <div class="overlay" onPointerDown={close}>
+        <div class="dialog helpdlg" onPointerDown={e => e.stopPropagation()} onKeyDown={e => { if (e.key === 'Escape') { e.stopPropagation(); close(); } }}>
+          <div class="hd"><span>{t('a.tb.helpTitle')}</span>
+            <button class="chip helpcmd" onClick={() => { close(); setPaletteOpen(true); }}>{t('a.cmd.title')}<kbd>{IS_MAC ? '⌘K' : 'Ctrl K'}</kbd></button>
+            <button aria-label={t('a.tb.close')} onClick={close}>×</button></div>
+          <div class="helplist">
+            <For each={shortcuts()}>
+              {([a, k]) => <div class="sc"><span class="a">{a}</span><span class="k">{k.split(' · ').map(x => <KeyCombo k={x} />)}</span></div>}
+            </For>
           </div>
         </div>
       </div>
@@ -478,6 +620,38 @@ export function Help() {
  * the mixer's Master fader, saved with the project and undone like it). Drag ↕ (Shift = fine),
  * wheel, double-click = unity, right-click = automation menu.
  */
+/** Meter position (0..1) of a linear peak: −60 … +6 dBFS, the mixer meters' scale. */
+const meterPos = (v: number) => clamp(((v > 1e-5 ? 20 * Math.log10(v) : -90) + 60) / 66, 0, 1);
+/** Where 0 dBFS sits on that scale. */
+const FULL_POS = meterPos(1);
+
+/** The master's output level (FL Studio's toolbar peak meter) and its clip latch: red with how far
+ *  over 0 dBFS the mix went, until clicked, because an export clips exactly there. */
+function MasterOut() {
+  let l!: HTMLDivElement, r!: HTMLDivElement;
+  let hl = -1, hr = -1;
+  onMount(() => onCleanup(addFrameTask(() => {
+    const e = tele.frame.ins.get(0);
+    const nl = Math.max(e?.l ?? 0, hl * 0.9), nr = Math.max(e?.r ?? 0, hr * 0.9);
+    if (nl === hl && nr === hr) return;
+    hl = nl < 1e-5 ? 0 : nl; hr = nr < 1e-5 ? 0 : nr;
+    l.style.transform = `scaleX(${1 - meterPos(hl)})`;
+    r.style.transform = `scaleX(${1 - meterPos(hr)})`;
+  })));
+  // a clip belongs to the mix it happened in
+  createEffect(on(() => S.path, () => resetMasterClip(), { defer: true }));
+  return (
+    <button class="masterout" classList={{ clip: !!masterClip() }} title={masterClipTip()} aria-label={masterClipTip()}
+      onClick={() => { if (masterClip()) { resetMasterClip(); say(t('a.tb.clipReset')); } }}>
+      <span class="mobars" style={{ '--full': FULL_POS }}>
+        <span class="mobar"><span ref={l} /></span>
+        <span class="mobar"><span ref={r} /></span>
+      </span>
+      <Show when={masterClip()}>{c => <span class="moclip"><span class="cliplbl">{t('a.tb.clip')} </span>+{c().overDb.toFixed(1)}</span>}</Show>
+    </button>
+  );
+}
+
 function MainVolume() {
   const master = () => S.project.inserts.find(m => m.id === 0);
   const target = { kind: 'insertVol' as const, id: 0 };
@@ -497,5 +671,46 @@ function MainVolume() {
           onMenu={(x, y) => paramMenu(x, y, target, () => { const op = put(VOL_UNITY); if (op) commit([op], t('a.tb.mainVol')); })} />
       </div>
     </Show>
+  );
+}
+
+/** How often the CPU percentage is reprinted: a figure that changes 60 times a second is unreadable. */
+const CPU_TEXT_MS = 250;
+
+/**
+ * FL Studio's toolbar CPU meter: how much of each audio buffer's time the engine spends rendering
+ * it (near 100 % the output crackles), with the underrun count of its Audio settings. It flashes
+ * red when the output runs dry; a click resets the count (like the master clip latch), or, with
+ * nothing to reset, opens the audio settings where the buffer size is. Shown only when turned on
+ * in Settings → Audio (the bar is short on room); the count is always there.
+ */
+function CpuMeter() {
+  let bar!: HTMLSpanElement;
+  let hold = 0, shownW = -1, textAt = 0;
+  const [load, setLoad] = createSignal(0);
+  const off = () => audioStatus()?.running === false;
+  onMount(() => onCleanup(addFrameTask(now => {
+    const c = Math.max(0, tele.frame.cpu || 0);
+    // the engine already peak-holds per callback; this keeps a spike visible between frames
+    hold = Math.max(c, hold * 0.92);
+    const w = Math.min(1, hold);
+    if (Math.abs(w - shownW) > 0.004) { shownW = w; bar.style.transform = `scaleX(${w})`; }
+    if (now - textAt >= CPU_TEXT_MS) { textAt = now; setLoad(hold); }
+  })));
+  const tip = () => off() ? t('a.tb.cpuOff') : t('a.tb.cpuTip', {
+    pct: cpuText(load()), n: underruns(),
+    act: underruns() ? t('a.tb.cpuActReset') : t('a.tb.cpuActOpen'),
+  });
+  const click = () => {
+    if (underruns() && !off()) { resetUnderruns(); say(t('a.tb.underrunReset')); }
+    else openAudioSettings();
+  };
+  return (
+    <button class={'cpumeter ' + cpuBand(load())} classList={{ flash: underrunFlash(), xrun: underruns() > 0, off: off() }}
+      title={tip()} aria-label={tip()} onClick={click}>
+      <span class="cpuval mono">{off() ? '—' : cpuText(load())}</span>
+      <span class="cpubar"><span ref={bar} /></span>
+      <Show when={underruns() > 0 && !off()}><span class="cpuxr mono">{underruns() > 99 ? '99+' : underruns()}</span></Show>
+    </button>
   );
 }

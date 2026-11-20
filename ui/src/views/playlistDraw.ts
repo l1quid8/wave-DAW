@@ -1,9 +1,10 @@
 // Canvas rendering of the playlist: lanes, grid, clips (pattern notes / waveforms), the
 // recording clip. Only the visible window is drawn; everything is in grid coordinates.
+import { shadeBands, shadeUnit } from '../lib/gridShade';
 import type { Automation, Channel, Clip, Comp, Id, Note, Pattern, Project, Source, Take, Track } from '../api/types';
 import { keyOf } from '../lib/pattern';
 import { valueAt } from '../lib/automation';
-import { handleAt, HANDLE_MIN_W, type EnvHit } from '../lib/envEdit';
+import { EDGE_INSET, handleAt, HANDLE_MIN_W, type EnvHit } from '../lib/envEdit';
 import type { LaneOverlaps } from '../lib/overlaps';
 import { boundaries, takeEnd, toComp } from '../lib/comp';
 import { mix } from '../lib/color';
@@ -13,7 +14,7 @@ import { t } from '../lib/i18n';
 import { snapRes } from '../lib/snap';
 import { getClipPeaks, getPeaks, peakRange } from '../state/peaks';
 import { prefs } from '../state/prefs';
-import { drawGlyph, guessIcon, patternIcon, trackIcon } from '../ui/instIcons';
+import { drawGlyph, guessIcon, patternIcon, sampleIcon, trackIcon } from '../ui/instIcons';
 
 export interface View {
   offX: number; offY: number; W: number; H: number;
@@ -80,15 +81,15 @@ const rowKey = (n: Note, chans: Map<Id, Channel>, multi: Set<Id>) => (multi.has(
 const patSig = (p: Pattern, chans: Map<Id, Channel>) => { const multi = melodic(p, chans); return p.notes.map(n => rowKey(n, chans, multi) + '@' + n.step + ':' + n.len).join(','); };
 let curChans = new Map<Id, Channel>();
 /** Note rectangles [beat, y, lenBeats, h]* of a pattern clip body, cached by geometry (zoom-independent). */
-function patRects(p: Pattern, sig: string, offset: number, len: number, h: number): Float32Array {
+function patRects(p: Pattern, sig: string, offset: number, len: number, h: number, chans = curChans): Float32Array {
   const key = p.id + '|' + offset + '|' + len + '|' + h + '|' + p.len + '|' + sig;
   let r = patCache.get(key);
   if (r) return r;
   // notes past the pattern end are kept in the project but hidden (and silent)
   const notes = p.notes.filter(n => n.step < p.len * 4 - 1e-4);
-  const order = [...curChans.keys()], multi = melodic(p, curChans);
-  const drums = [...new Set(notes.map(n => rowKey(n, curChans, multi)).filter(k => k[0] === 'c'))].sort((a, b) => order.indexOf(+a.slice(1)) - order.indexOf(+b.slice(1)));
-  const pitches = [...new Set(notes.map(n => rowKey(n, curChans, multi)).filter(k => k[0] === 'p'))].sort((a, b) => +b.slice(1) - +a.slice(1));
+  const order = [...chans.keys()], multi = melodic(p, chans);
+  const drums = [...new Set(notes.map(n => rowKey(n, chans, multi)).filter(k => k[0] === 'c'))].sort((a, b) => order.indexOf(+a.slice(1)) - order.indexOf(+b.slice(1)));
+  const pitches = [...new Set(notes.map(n => rowKey(n, chans, multi)).filter(k => k[0] === 'p'))].sort((a, b) => +b.slice(1) - +a.slice(1));
   const rows = [...drums.reverse(), ...pitches];
   const nr = Math.max(rows.length, 3), rh = Math.max(1.5, Math.min(5, (h - 6) / nr));
   const top = (h - nr * rh) / 2, out: number[] = [];
@@ -96,7 +97,7 @@ function patRects(p: Pattern, sig: string, offset: number, len: number, h: numbe
     for (const n of notes) {
       const b = k * p.len + n.step / 4 - offset;
       if (b < 0 || b >= len) continue;
-      const ri = rows.indexOf(rowKey(n, curChans, multi));
+      const ri = rows.indexOf(rowKey(n, chans, multi));
       out.push(b, top + ri * rh, Math.min(n.len / 4, len - b), Math.max(1, rh - 1));
     }
     if (out.length > 6000) break;
@@ -105,6 +106,15 @@ function patRects(p: Pattern, sig: string, offset: number, len: number, h: numbe
   r = Float32Array.from(out);
   patCache.set(key, r);
   return r;
+}
+
+/**
+ * One pass of a pattern as the Playlist draws it in a clip, for previews outside the Playlist
+ * (the Project tab's pattern list): note rectangles [beat, y, lenBeats, h]* in a box `h` px
+ * tall and `p.len` beats wide. Cached with the clip previews (same key, same invalidation).
+ */
+export function patternPreview(p: Pattern, chans: Map<Id, Channel>, h: number): Float32Array {
+  return patRects(p, patSig(p, chans), 0, p.len, h, chans);
 }
 
 export function drawGrid(g: CanvasRenderingContext2D, v: View, p: Project, rec: null | { track: number; clipStart: number; seconds: number; peaks: Float32Array; nPeaks: number; pass?: number }) {
@@ -129,10 +139,10 @@ export function drawGrid(g: CanvasRenderingContext2D, v: View, p: Project, rec: 
     g.fillRect(x0, b - 1, W, 1);
   });
   const gridBottom = Math.min(y1, tops[tops.length - 1]);
-  // 2-bar shading
+  // every other bar (beat when zoomed far in, 4 bars when zoomed out) a shade lighter: odd and even are told apart at a glance
   const b0 = Math.floor(x0 / bw), b1 = Math.ceil(x1 / bw);
   g.fillStyle = T.gridShade;
-  for (let b = Math.floor(b0 / 8) * 8; b <= b1; b += 8) g.fillRect(b * bw, y0, 4 * bw, gridBottom - y0);
+  for (const [b, n] of shadeBands(b0, b1, shadeUnit(bw, 48))) g.fillRect(Math.round(b * bw), y0, Math.round((b + n) * bw) - Math.round(b * bw), gridBottom - y0);
   // sub-beat lines follow the active snap
   const sr = snapRes(v.snap, bw), u = sr > 0 && sr < 1 ? sr : 0.25;
   const stepCol = sr > 0 && sr < 1 && sr * bw >= 6 ? T.gridBeat : bw >= 36 ? T.gridBeat : null;
@@ -150,8 +160,8 @@ export function drawGrid(g: CanvasRenderingContext2D, v: View, p: Project, rec: 
   curChans = chans;
   const iconOf = (c: Clip, tr: Track, src: Pattern | Source | Automation): string | null => {
     if (c.kind === 'auto' || !prefs().clipIcons) return null;
-    if (c.kind === 'pat') { let i = patIcons.get(c.ref); if (i === undefined) { i = patternIcon(src as Pattern, curChans); patIcons.set(c.ref, i); } return i; }
-    return trackIcon(tr) ?? guessIcon(src.name);
+    if (c.kind === 'pat') { let i = patIcons.get(c.ref); if (i === undefined) { i = patternIcon(src as Pattern, curChans, id => srcs.get(id)); patIcons.set(c.ref, i); } return i; }
+    return trackIcon(tr) ?? (c.kind === 'audio' ? sampleIcon(src as Source) : guessIcon(src.name));
   };
   const anySolo = p.tracks.some(t => t.solo);
   for (const c of p.clips) {
@@ -329,9 +339,13 @@ export function drawFades(g: CanvasRenderingContext2D, v: View, p: Project) {
       g.stroke();
     }
     if (v.editable && cw > 36) {
-      g.fillStyle = rgba(T.ink, 0.85);
-      g.beginPath(); g.roundRect(cx + fi - 1, by, 9, 9, [0, 0, 3, 0]); g.fill();
-      g.beginPath(); g.roundRect(cx + cw - fo - 8, by, 9, 9, [0, 0, 0, 3]); g.fill();
+      // the fade grips: full on a selected clip and on a fade that is set; otherwise a quiet corner mark
+      const on = v.sel.has(c.id);
+      g.fillStyle = rgba(T.ink, on || fi ? 0.85 : 0.28);
+      g.beginPath(); g.roundRect(cx + fi - 1, by, on || fi ? 9 : 6, on || fi ? 9 : 6, [0, 0, 3, 0]); g.fill();
+      g.fillStyle = rgba(T.ink, on || fo ? 0.85 : 0.28);
+      const ow = on || fo ? 9 : 6;
+      g.beginPath(); g.roundRect(cx + cw - fo - ow + 1, by, ow, ow, [0, 0, 0, 3]); g.fill();
     }
     g.restore();
   }
@@ -381,9 +395,12 @@ function drawClip(g: CanvasRenderingContext2D, v: View, c: Clip, src: Pattern | 
   g.save();
   if (c.muted) g.globalAlpha = 0.38;
   g.beginPath(); g.roundRect(cx, cy, cw, ch, 3); g.clip();
-  g.fillStyle = mix(color, T.clipBodyPct, T.clipBase); g.fillRect(cx, cy, cw, ch);
+  // an automation clip is a curve, not a block of material: a faint body and no header band (its
+  // name sits on the body), so the filled area under the curve is what reads; notes and audio keep the band
+  const isAuto = c.kind === 'auto';
+  g.fillStyle = mix(color, isAuto ? T.clipBodyPct * 0.4 : T.clipBodyPct, T.clipBase); g.fillRect(cx, cy, cw, ch);
   // header
-  g.fillStyle = sel ? mix(color, T.clipHeadSelPct, T.clipHeadSelTo) : mix(color, T.clipHeadPct, T.clipBase); g.fillRect(cx, cy, cw, 15);
+  if (!isAuto || sel) { g.fillStyle = sel ? mix(color, T.clipHeadSelPct, T.clipHeadSelTo) : mix(color, T.clipHeadPct, T.clipBase); g.fillRect(cx, cy, cw, 15); }
   const ink = mix(color, T.clipInkPct, T.clipInkTo);
   const isAudio = c.kind === 'audio';
   const vis0 = Math.max(cx, vx0), vis1 = Math.min(cx + cw, vx1);
@@ -395,7 +412,8 @@ function drawClip(g: CanvasRenderingContext2D, v: View, c: Clip, src: Pattern | 
     g.font = FONT; g.fillText(src.name, tx, cy + 11);
     let ax = tx + g.measureText(src.name).width + 5;
     const st = isAudio ? c.stretch ?? 1 : 1, pt = isAudio ? c.pitch ?? 0 : 0;
-    if (st !== 1 || pt) {
+    const status0 = v.stretching?.[c.id];
+    if ((st !== 1 || pt) && (sel || status0 != null)) {
       // the stretch factor and transposition; '…' while the render is not ready (the clip plays
       // resampled, at its own pitch, meanwhile), '!' when it failed; 'rs' = resampled on purpose
       const status = v.stretching?.[c.id];
@@ -407,8 +425,13 @@ function drawClip(g: CanvasRenderingContext2D, v: View, c: Clip, src: Pattern | 
       g.fillStyle = sel ? T.clipTextSel : T.clipText;
       ax += g.measureText(label).width + 5;
     }
-    if (isAudio && c.gain) {
-      g.font = MONO9; g.globalAlpha *= 0.65; g.fillText((c.gain >= 0 ? '+' : '') + c.gain.toFixed(1) + ' dB', ax, cy + 11);
+    // not selected: one quiet dot says "this clip is stretched, transposed or gained"; selecting it shows the numbers
+    if (isAudio && !sel && status0 == null && (st !== 1 || pt || c.gain)) {
+      g.globalAlpha *= 0.6; g.beginPath(); g.arc(ax + 1, cy + 8, 2, 0, Math.PI * 2); g.fill();
+      g.globalAlpha = c.muted ? 0.38 : prevAlpha;
+    }
+    if (isAudio && c.gain && sel) {
+      g.font = MONO9; g.globalAlpha *= 0.85; g.fillText((c.gain >= 0 ? '+' : '') + c.gain.toFixed(1) + ' dB', ax, cy + 11);
       g.globalAlpha = c.muted ? 0.38 : prevAlpha;
     }
   }
@@ -482,9 +505,11 @@ function drawEnvelope(g: CanvasRenderingContext2D, v: View, c: Clip, a: Automati
   g.beginPath(); g.moveTo(x0, by + bh);
   for (const [x, y] of line) g.lineTo(x, y);
   g.lineTo(x1, by + bh); g.closePath();
-  g.fillStyle = rgba(color, 0.22); g.fill();
+  // the area under the curve: strongest at the curve, fading to the floor
+  const grad = g.createLinearGradient(0, by, 0, by + bh); grad.addColorStop(0, rgba(color, 0.42)); grad.addColorStop(1, rgba(color, 0.08));
+  g.fillStyle = grad; g.fill();
   g.beginPath(); line.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y)));
-  g.strokeStyle = ink; g.lineWidth = 1.5; g.stroke();
+  g.strokeStyle = ink; g.lineWidth = 2; g.lineJoin = 'round'; g.stroke();
   const focus = v.env?.clip === c.id ? v.env : null;
   const sel = v.autoSel?.clip === c.id ? new Set(v.autoSel.idx) : null;
   const hov = focus?.hover;
@@ -496,7 +521,7 @@ function drawEnvelope(g: CanvasRenderingContext2D, v: View, c: Clip, a: Automati
       const h = handleAt(pts, i); if (!h) continue;
       const hx = X(h.t); if (hx < vis0 - 5 || hx > vis1 + 5) continue;
       const on = hov?.kind === 'handle' && hov.i === i;
-      g.beginPath(); g.arc(hx, Y(h.v), on ? 4 : 3, 0, Math.PI * 2);
+      g.beginPath(); g.arc(hx, Y(h.v), on ? 5 : 3.5, 0, Math.PI * 2);
       g.fillStyle = on ? T.ink : T.clipBase; g.fill();
       g.strokeStyle = on ? T.ink : ink; g.lineWidth = 1.25; g.stroke();
     }
@@ -504,9 +529,10 @@ function drawEnvelope(g: CanvasRenderingContext2D, v: View, c: Clip, a: Automati
   // points: always where there is room for them, bigger on the focused clip
   if (!focus && !sel && cw / Math.max(1, pts.length) <= 8) return;
   pts.forEach((q, i) => {
-    const x = X(q.t); if (x < vis0 - 5 || x > vis1 + 5) return;
+    // a point on the clip's edge sits just inside it, whole (where the Playlist also picks it)
+    const x = Math.min(Math.max(X(q.t), cx + EDGE_INSET), cx + cw - EDGE_INSET); if (x < vis0 - 6 || x > vis1 + 6) return;
     const on = hov?.kind === 'point' && hov.i === i, picked = !!sel?.has(i);
-    g.beginPath(); g.arc(x, Y(q.v), on || picked ? 4.5 : focus ? 3.5 : 2.5, 0, Math.PI * 2);
+    g.beginPath(); g.arc(x, Y(q.v), on || picked ? 5.5 : focus ? 4.5 : 3, 0, Math.PI * 2);
     g.fillStyle = picked ? T.amber : on ? T.ink : ink; g.fill();
     if (focus || picked) { g.strokeStyle = T.clipBase; g.lineWidth = 1.25; g.stroke(); }
   });

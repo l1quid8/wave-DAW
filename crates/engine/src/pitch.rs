@@ -465,6 +465,9 @@ pub struct PitchAnalysis {
     pub notes: Vec<NoteBlob>,
     /// Which detector produced the curve: "yin" or the estimator's name.
     pub backend: String,
+    /// Spectral onset strength per frame (new syllables on a held pitch); not sent to the UI.
+    #[serde(skip)]
+    pub onsets: Vec<f32>,
 }
 
 pub const ANALYSIS_RATE: f32 = 200.0;
@@ -517,7 +520,48 @@ pub fn analyze_with(mono: &[f32], sr: f32, est: Option<&dyn F0Estimator>) -> Pit
             _ => f32::NAN,
         };
     }
-    finish(curve, levels, confidence, est.name())
+    let onsets = onset_strength(mono, sr, frames);
+    finish(curve, levels, confidence, onsets, est.name())
+}
+
+/// Spectral flux per analysis frame: how much the log energy of 24 bands (150 Hz–7 kHz) rises
+/// over 10 ms. A new syllable (consonant, vowel change) shows as a peak even where the pitch and
+/// the level hold.
+pub fn onset_strength(mono: &[f32], sr: f32, frames: usize) -> Vec<f32> {
+    use realfft::RealFftPlanner;
+    let step = (sr / ANALYSIS_RATE) as usize;
+    let n = ((sr * 0.023) as usize).next_power_of_two().max(256);
+    let fft = RealFftPlanner::<f32>::new().plan_fft_forward(n);
+    let mut buf = fft.make_input_vec();
+    let mut spec = fft.make_output_vec();
+    let win: Vec<f32> = (0..n).map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / n as f32).cos()).collect();
+    const BANDS: usize = 24;
+    let edge = |k: usize| ((150.0f32 * (7000.0f32 / 150.0).powf(k as f32 / BANDS as f32)) * n as f32 / sr) as usize;
+    let edges: Vec<usize> = (0..=BANDS).map(|k| edge(k).clamp(1, n / 2)).collect();
+    let mut prev: Vec<[f32; BANDS]> = vec![[0.0; BANDS]; 2];
+    let mut out = vec![0f32; frames];
+    for (f, o) in out.iter_mut().enumerate() {
+        let c = f * step;
+        for (i, (b, w)) in buf.iter_mut().zip(&win).enumerate() {
+            let j = (c + i).checked_sub(n / 2);
+            *b = j.and_then(|j| mono.get(j)).copied().unwrap_or(0.0) * w;
+        }
+        if fft.process(&mut buf, &mut spec).is_err() {
+            continue;
+        }
+        let mut cur = [0f32; BANDS];
+        for k in 0..BANDS {
+            let (a, b) = (edges[k], edges[k + 1].max(edges[k] + 1));
+            let e: f32 = spec[a..b].iter().map(|x| x.norm_sqr()).sum::<f32>() / (b - a) as f32;
+            cur[k] = (e + 1e-9).ln();
+        }
+        if f >= 2 {
+            *o = cur.iter().zip(&prev[0]).map(|(x, y)| (x - y).max(0.0)).sum::<f32>() / BANDS as f32;
+        }
+        prev[0] = prev[1];
+        prev[1] = cur;
+    }
+    out
 }
 
 /// RMS around each analysis frame (same window length YIN's level uses).
@@ -568,10 +612,11 @@ pub fn analyze(mono: &[f32], sr: f32) -> PitchAnalysis {
             }
         }
     }
-    finish(curve, levels, confidence, "yin")
+    let onsets = onset_strength(mono, sr, frames);
+    finish(curve, levels, confidence, onsets, "yin")
 }
 
-fn finish(mut curve: Vec<f32>, levels: Vec<f32>, confidence: Vec<f32>, backend: &str) -> PitchAnalysis {
+fn finish(mut curve: Vec<f32>, levels: Vec<f32>, confidence: Vec<f32>, onsets: Vec<f32>, backend: &str) -> PitchAnalysis {
     let frames = curve.len();
     // remove octave jumps lasting a few frames and single voiced frames
     for f in 1..frames.saturating_sub(1) {
@@ -586,8 +631,8 @@ fn finish(mut curve: Vec<f32>, levels: Vec<f32>, confidence: Vec<f32>, backend: 
     if backend == "yin" {
         fold_octave_errors(&mut curve);
     }
-    let notes = segment(&curve, &levels);
-    PitchAnalysis { rate: ANALYSIS_RATE, curve, levels, confidence, notes, backend: backend.to_string() }
+    let notes = crate::note_track::track(&curve, &levels, &onsets, ANALYSIS_RATE, &Default::default());
+    PitchAnalysis { rate: ANALYSIS_RATE, curve, levels, confidence, notes, backend: backend.to_string(), onsets }
 }
 
 /// Detector slips onto a harmonic (or an octave below) show up as frames far from
@@ -636,8 +681,10 @@ fn fold_octave_errors(curve: &mut [f32]) {
     }
 }
 
-/// Splits voiced runs into notes where the (smoothed) pitch moves to a new semitone and stays.
-pub(crate) fn segment(curve: &[f32], levels: &[f32]) -> Vec<NoteBlob> {
+/// Splits voiced runs into notes where the pitch moves to a new semitone and stays (40 ms).
+/// For stepwise curves (a reference melody); a sung take's notes come from
+/// [`crate::note_track::track`], which keeps vibrato, drift and glides inside their notes.
+pub fn segment(curve: &[f32], levels: &[f32]) -> Vec<NoteBlob> {
     let dt = 1.0 / ANALYSIS_RATE as f64;
     let mut notes = vec![];
     let mut f = 0;

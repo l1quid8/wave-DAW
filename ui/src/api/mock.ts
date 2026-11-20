@@ -1,20 +1,29 @@
 // In-browser fake engine, used when the page is not running inside Tauri.
 // Holds the demo project, applies ops with undo/gestures, plays a fake transport and
 // streams binary telemetry frames (encoded exactly like the real ones).
-import { askUrl, MAX_ASK_URL, type AskService } from '../lib/askLink';
+import { askUrl, DISCORD_URL, MAX_ASK_URL, type AskService } from '../lib/askLink';
 import { delayMs, loopGain } from '../lib/delay';
 import { loopPos, type BeatRange } from '../lib/patLoop';
 import type { Backend, EventMap, OsDropEvent } from './backend';
+import type { Json } from '../lib/projectEq';
 import { encodeFrame, SCOPE_LEN, SPEC_BANDS, type EncFx } from './telemetry';
-import { BUILTIN, emptyProject, mockCatalog, sketchProject } from './mockData';
-import { FACTORY_FILES, FACTORY_KIT, factoryFile, LIB_SCHEME, libPath } from '../lib/factory';
+import { BUILTIN, demoProject, emptyProject, mockCatalog, sketchProject } from './mockData';
+import { FACTORY_FILES, FACTORY_KIT, FACTORY_LISTED_FILES, factoryFile, LIB_SCHEME, libPath } from '../lib/factory';
 
 /** Reverb mix (%) the engine computes for the research plate at a -18 dB send (autovocal::reverb_mix_for_send). */
 const MOCK_REVERB_MIX = 37.2;
-import { applyAll } from '../lib/applyOps';
+import { ERR_EXISTS, ERR_INVALID_TARGET, ERR_NO_EDITOR, ERR_NO_STEM_MODEL, ERR_REVISION_CONFLICT } from './errors';
+import { projectEq } from '../lib/projectEq';
+import { applyAll, stripClipDefaults } from '../lib/applyOps';
+import { stripPatternDefaults } from '../lib/pattern';
 import { landTakes, takeEnd } from '../lib/comp';
+import { dropEmptyTrack, recTarget } from '../lib/recTarget';
+import { newTrack } from '../lib/clipOps';
 import { satDriveDb } from '../lib/saturator';
+import { onsetsFromPeaks } from '../lib/slicer';
+import { songEnd } from '../lib/export';
 import { eqCurve } from '../lib/eq';
+import { ATTACK as MB_ATTACK, BAND_IN_DB as MB_BAND_IN_DB, bandGain as mbBandGain, MAKEUP_DB as MB_MAKEUP_DB, RELEASE as MB_RELEASE } from '../lib/multiband';
 import { clamp, dbg } from '../lib/format';
 import { t } from '../lib/i18n';
 import { midiToHz, noteAt, scaleMask, simpleTarget, snapNote } from '../lib/pitch';
@@ -22,19 +31,29 @@ import { collectMelody, melodyFit, melodyTarget } from '../lib/melody';
 import { newFx } from '../lib/presets';
 import { synthVocal, vocalAt, vocalPeaks, type VocalSample } from './mockVocal';
 import type {
-  AudioConfig, AudioStatus, LatencyReport, AnyBuiltinKind, AutoVocalPlan, AutoVocalStyle, Catalog, Clip, ExportAudioOptions, ExportResult, ExportStemsOptions, ExportStemsResult, F0ModelStatus, Fx, Id, KeysStatus, LibFile, LibraryList, Melody, MelodyChannel, MidiDevice, MidiStatus, MusicAnalysis, Op, OpenResult, PitchAnalysis, PitchTarget, Project, RefTune, MidiBecomes, MidiExportResult, MidiImportArgs, MidiImportResult, MidiInfo, Channel, Note, Pattern, SaveResult, Source, StateDto, TransportDto, PluginInfo, PluginParam, PluginScan, RelinkCandidate,
+  AudioConfig, AudioStatus, LatencyReport, AnyBuiltinKind, AutoVocalPlan, AutoVocalStyle, Catalog, Clip, ExportAudioOptions, ExportResult, ExportStemsOptions, ExportStemsResult, F0ModelStatus, Fx, Id, KeysStatus, LibraryFiles, LibraryList, Melody, MelodyChannel, MidiDevice, MidiStatus, MusicAnalysis, Op, OpenResult, PitchAnalysis, PitchTarget, Project, RefTune, MidiBecomes, MidiExportResult, MidiImportArgs, MidiImportResult, MidiInfo, Channel, Note, Pattern, SaveResult, RecentProject, Source, StateDto, Track, TransportDto, PluginInfo, PluginParam, PluginRef, PluginScan, PluginCrashSuspect, RelinkCandidate,
+  ExtractStemsResult, StemId, StemModelStatus, StemsProgress,
 } from './types';
-import { exportRange, exportSeconds, stemInserts, uniqueFileStems } from '../lib/export';
+import { exportRange, exportSeconds, patternProject, patternSilent, stemInserts, uniqueFileStems } from '../lib/export';
 import { MockUpdates } from './mockUpdates';
 import { MOCK_LV2 } from './mockPlugins';
+import { UNSAFE_PLUGIN } from './types';
 import { fromNormalized, lv2Param } from '../lib/pluginParam';
-import { KEYS_DYNAMICS, KEYS_RELEASE, samplerDefault } from './types';
+import { KEYS_DYNAMICS, KEYS_RELEASE, SAMPLE_ROOT, samplerDefault } from './types';
 import { newSynthChannel } from '../lib/synth';
 import { candidate, rank, unambiguous } from '../lib/relink';
 
 const TC = ['#4f8ef7', '#5aa9e6', '#69c3d6', '#47b8a8', '#5fbf8a', '#7c8cf8', '#e0a44a', '#9a8cf0', '#d9678f', '#8b93a1'];
 const BAND_F = new Float32Array(SPEC_BANDS).map((_, k) => 20 * Math.pow(1000, k / (SPEC_BANDS - 1)));
 const delay = (ms = 0) => new Promise<void>(r => setTimeout(r, ms));
+/** The stem model download (crates/stems `MODEL_BYTES`). */
+const MOCK_STEM_MODEL_BYTES = 90_358_774;
+const STEM_IDS: StemId[] = ['drums', 'bass', 'other', 'vocals'];
+/** stems_actions.rs `STEMS` (names and colours of the new tracks); `scale` shapes the mock's fake waveforms. */
+const STEM_META: Record<StemId, { label: string; color: string; scale: number }> = {
+  drums: { label: 'Drums', color: '#e8a33d', scale: 0.9 }, bass: { label: 'Bass', color: '#8f6ee8', scale: 0.7 },
+  other: { label: 'Other', color: '#47b8a8', scale: 0.55 }, vocals: { label: 'Vocals', color: '#e05a8a', scale: 0.6 },
+};
 const hash = (s: string) => { let h = 2166136261; for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619); return h >>> 0; };
 
 function rng(seed: number) {
@@ -96,22 +115,31 @@ function vocalSpec(s: VocalSample, out: Float32Array) {
   }
 }
 
+/** A VST3 plugin the mock reports as installed (class id derived from its name, like a real scan's stable id). */
+const mockVst3 = (name: string, vendor: string, category: string): PluginInfo => ({ format: 'vst3', name, vendor, category, path: 'C:\\Program Files\\Common Files\\VST3\\' + name + '.vst3', cid: hash(name).toString(16).padStart(32, '0') });
+/** The VST3 instruments the mock's scan finds: name, vendor, category. */
+const MOCK_INSTRUMENTS: [string, string, string][] = [['Serum', 'Xfer Records', 'Instrument|Synth'], ['Analog Lab V', 'Arturia', 'Instrument|Synth'], ['Kontakt 7', 'Native Instruments', 'Instrument|Sampler'], ['Vital', 'Vital Audio', 'Instrument|Synth']];
+
 export class MockBackend implements Backend {
   readonly isMock = true;
   /** No window chrome in a browser; `?chrome` previews the custom title bar with inert buttons. */
   readonly win = typeof location !== 'undefined' && new URLSearchParams(location.search).has('chrome')
-    ? { minimize: async () => {}, toggleMaximize: async () => {}, close: async () => {}, isMaximized: async () => false, startDragging: async () => {}, onResized: async () => () => {} }
+    ? { minimize: async () => {}, toggleMaximize: async () => {}, close: async () => {}, isMaximized: async () => false, startDragging: async () => {}, isFullscreen: async () => !!document.fullscreenElement, setFullscreen: async (on: boolean) => { if (on) await document.documentElement.requestFullscreen?.(); else if (document.fullscreenElement) await document.exitFullscreen(); }, onResized: async () => () => {}, onCloseRequested: async () => () => {}, setZoom: async () => false }
     : null;
   private cat: Catalog = mockCatalog();
   // perf harness hook: perf/ui_bench.mjs injects a generated long project here (see perf/README)
-  private p: Project = (typeof window !== 'undefined' && (window as unknown as { __waveFixture?: Project }).__waveFixture) || sketchProject(this.cat);
+  private p: Project = this.adoptFixture();
   private revision = 1;
   private savedRev = 1;
   private path: string | null = null;
-  private undoStack: Project[] = [];
-  private redoStack: Project[] = [];
+  /** Undo steps: the project before the edit and what the edit was called (engine.rs `UndoStep`). */
+  private undoStack: { p: Project; label?: string }[] = [];
+  private redoStack: { p: Project; label?: string }[] = [];
+  private gestureLabel: string | undefined = undefined;
   private gesture: Project | null = null;
-  private tr: TransportDto = { playing: false, rec: false, monitor: false, metro: false, countIn: true, startBeat: 0 };
+  /** A gesture's transient batches changed the project without a state event (engine.rs gesture_unreported). */
+  private gestureUnreported = false;
+  private tr: TransportDto = { playing: false, rec: false, monitor: false, metro: false, countIn: true, startBeat: 0, recAudio: true, recNotes: true, recQuantize: 0 };
   private listeners = new Map<string, Set<(p: unknown) => void>>();
   private teleCb: ((b: ArrayBuffer) => void) | null = null;
   private watched: Id[] = [];
@@ -127,10 +155,10 @@ export class MockBackend implements Backend {
   private srcMeta = new Map<Id, MockSource>();
   private takeN = 0;
   private kits = [
-    { id: FACTORY_KIT, name: 'Standard library', description: 'Drums, percussion and tonal one-shots that ship with WAVE', bytes: FACTORY_FILES.reduce((n, f) => n + f.bytes, 0), count: FACTORY_FILES.length, installed: true },
-    { id: 'wave-drums', name: 'WAVE Drums', description: 'Stopy, werble, hi-haty i pętle perkusyjne', bytes: 86e6, count: 240, installed: false },
-    { id: 'wave-keys', name: 'WAVE Keys & Pads', description: 'Akordy, pady i tekstury', bytes: 142e6, count: 96, installed: true },
-    { id: 'wave-fx', name: 'WAVE FX', description: 'Uplightery, impakty, szumy', bytes: 38e6, count: 64, installed: false },
+    { id: FACTORY_KIT, name: 'Standard library', description: 'Drums, percussion and tonal one-shots that ship with Synkopa', bytes: FACTORY_FILES.reduce((n, f) => n + f.bytes, 0), count: FACTORY_LISTED_FILES.length, installed: true },
+    { id: 'wave-drums', name: 'Synkopa Drums', description: 'Stopy, werble, hi-haty i pętle perkusyjne', bytes: 86e6, count: 240, installed: false },
+    { id: 'wave-keys', name: 'Synkopa Keys & Pads', description: 'Akordy, pady i tekstury', bytes: 142e6, count: 96, installed: true },
+    { id: 'wave-fx', name: 'Synkopa FX', description: 'Uplightery, impakty, szumy', bytes: 38e6, count: 64, installed: false },
   ];
   private folders = ['C:\\Users\\michal\\Music\\Samples'];
   /** Live plugin instances' parameters (VST3: normalized only; LV2: by port, with their real values). */
@@ -142,30 +170,67 @@ export class MockBackend implements Backend {
     unavailableOutput: null,
     recOffsetMs: 0, inputUnderruns: 0, inputOverruns: 0, inputDriftPpm: 0, restarts: 0,
   };
+  /** Output underruns since the engine started (telemetry `underruns`): the browser renders
+   *  nothing, so none happen unless a test injects them with {@link mockUnderrun}. */
+  private underrunTotal = 0;
   private focusritePresent = true;
   private wasapiOutputPresent = true;
 
   private midiPorts: MidiDevice[] = [{ id: 'mock-keys', name: 'Mock Keystation 61' }, { id: 'mock-pads', name: 'Mock Pad Controller' }];
-  private midi: MidiStatus = { connected: null, selected: null, error: null, lastNote: null, noteCount: 0, target: null };
+  private midi: MidiStatus = { connected: null, selected: null, error: null, lastNote: null, noteCount: 0, target: null, fixedVelocity: null };
 
+  private clock: ReturnType<typeof setInterval>;
   constructor() {
-    setInterval(() => this.tick(), 1000 / 60);
+    this.clock = setInterval(() => this.tick(), 1000 / 60);
     (window as unknown as { __waveMock: MockBackend }).__waveMock = this;
+  }
+
+  /** Stops the frame clock (tests call this so intervals do not outlive a case). */
+  dispose() { clearInterval(this.clock); }
+
+  /** The engine never writes a field at its serde default, so its state JSON never carries
+   * one; an injected fixture may. Normalize once at the door — the engine compares structs,
+   * where "missing" and "default value" are not two states, and the no-op check below must
+   * see what the engine sees. */
+  private adoptFixture(): Project {
+    const f = typeof window !== 'undefined' && (window as unknown as { __waveFixture?: Project }).__waveFixture;
+    if (!f) return sketchProject(this.cat);
+    const p = structuredClone(f);
+    for (const c of p.clips) stripClipDefaults(c);
+    for (const pt of p.patterns) stripPatternDefaults(pt);
+    for (const a of p.automations ?? []) {
+      for (const q of a.points) {
+        if (!q.tension) delete (q as { tension?: number }).tension;
+        if (q.shape === 'curve') delete (q as { shape?: unknown }).shape;
+      }
+    }
+    // old projects may lack `key`; the engine writes it as null (no skip on the field)
+    if (p.key === undefined) p.key = null;
+    return p;
   }
 
   // ---------- state ----------
   private dto(): StateDto {
     return structuredClone({ project: this.p, revision: this.revision, canUndo: this.undoStack.length > 0, canRedo: this.redoStack.length > 0,
+      undoLabel: this.undoStack.at(-1)?.label ?? null, redoLabel: this.redoStack.at(-1)?.label ?? null,
       transport: this.tr, path: this.path, dirty: this.revision !== this.savedRev, audition: this.liveAudition(), missing: this.missing(), fxErrors: this.fxErrors() });
   }
-  /** Like the engine's `fx_errors`: LV2 slots whose plugin is not "installed" here, or cannot run. */
+  /**
+   * Like the engine's `fx_errors`: LV2 slots whose plugin is not "installed" here, or cannot run, and plugin
+   * channels whose instrument is not one of the mock's installed ones (by channel id).
+   */
   private fxErrors(): Record<string, string> {
     const out: Record<string, string> = {};
+    const installed = new Set(MOCK_INSTRUMENTS.map(([name, vendor, category]) => mockVst3(name, vendor, category).cid));
+    for (const c of this.p.channels ?? []) {
+      if (c.kind === 'plugin' && !installed.has(c.plugin.cid)) out[c.id] = `${c.plugin.name}: VST3 plugin module not found: ${c.plugin.path}`;
+    }
     for (const f of this.p.inserts.flatMap(m => m.fx)) {
       if (f.type !== 'plugin' || f.plugin?.format !== 'lv2') continue;
       const p = MOCK_LV2[f.plugin.cid];
       if (!p) out[f.id] = `${f.plugin.name} (LV2): the LV2 plugin ${f.plugin.cid} is not installed`;
       else if (p.unsupported) out[f.id] = `${f.plugin.name} (LV2): ${p.name} cannot be used: ${p.unsupported}`;
+      else if (p.crashes && !this.trusted.has(f.plugin.cid)) out[f.id] = `${f.plugin.name}: ${UNSAFE_PLUGIN}it crashed in Synkopa's safety check (the test process was killed by signal 11), so it was not loaded: loaded here it would close WAVE. Update the plugin, or load it anyway at your own risk.`;
     }
     return out;
   }
@@ -174,7 +239,13 @@ export class MockBackend implements Backend {
     setTimeout(() => ls.forEach(cb => cb(payload)), 0);
   }
   private changed() { this.revision++; this.emit('state', this.dto()); }
-  private pushUndo(prev: Project) { this.undoStack.push(prev); if (this.undoStack.length > 300) this.undoStack.shift(); this.redoStack = []; }
+  /** engine.rs `import_base`: a file loaded for the next edit (and the revision it left) is undone with that edit. */
+  private importBase: { rev: number; p: Project } | null = null;
+  private pushUndo(prev: Project, label?: string) {
+    const base = this.importBase; this.importBase = null;
+    if (base && base.rev === this.revision) prev = base.p;
+    // engine.rs UNDO_LIMIT
+    this.undoStack.push({ p: prev, label }); if (this.undoStack.length > 200) this.undoStack.shift(); this.redoStack = []; }
 
   async getState() { return this.dto(); }
   async applyOps(ops: Op[], opts?: { label?: string; transient?: boolean }) {
@@ -186,40 +257,82 @@ export class MockBackend implements Backend {
         const { fxId, paramId } = op.automation.target;
         const fx = this.p.inserts.flatMap(m => m.fx).find(f => f.id === fxId);
         if (fx?.type !== 'plugin' || !(await this.pluginParams(fxId).catch(() => [])).some(q => q.id === paramId))
-          throw new Error(`INVALID_TARGET: effect ${fxId} has no plugin parameter ${paramId} to automate`);
+          throw new Error(`${ERR_INVALID_TARGET} effect ${fxId} has no plugin parameter ${paramId} to automate`);
       }
     }
     const prev = this.p;
-    this.p = applyAll(this.p, ops); // throws (rejects) on an invalid batch
+    const next = applyAll(prev, ops); // throws (rejects) on an invalid batch
+    if (projectEq(prev as unknown as Json, next as unknown as Json)) {
+      // like the engine (engine.rs apply): an unchanged batch is not an edit — no undo
+      // step, no revision, no state event
+      return { revision: this.revision };
+    }
+    this.p = next;
+    // like the engine (engine.rs only_track_heights): lane heights are view state — no undo step, and
+    // the history takes the new heights so undoing an older edit keeps the lanes as they are now
+    const heightsOnly = ops.every(op => op.op === 'putTrack') && prev.tracks.length === next.tracks.length
+      && prev.tracks.every((t, i) => projectEq({ ...t, h: next.tracks[i].h } as unknown as Json, next.tracks[i] as unknown as Json));
+    if (heightsOnly) {
+      // only the lanes that changed, and only into the same track (ids stay with their slots when lanes
+      // swap): like the engine (carry_height) the history is walked from now, nearest state first, and the
+      // carry stops where the lane at that id became another track (a rename keeps it the same track)
+      const changed = next.tracks.filter((t, i) => prev.tracks[i].h !== t.h);
+      const sameLane = (a: Track, b: Track) => a.name === b.name
+        || projectEq({ ...a, name: b.name, h: b.h } as unknown as Json, b as unknown as Json);
+      const carry = (states: { p: Project; label?: string }[]) => {
+        for (const now of changed) {
+          let last: Track = now;
+          for (let i = 0; i < states.length; i++) {
+            const t = states[i].p.tracks.find(x => x.id === now.id);
+            if (!t || !sameLane(last, t)) break;
+            last = t;
+            states[i] = { ...states[i], p: { ...states[i].p, tracks: states[i].p.tracks.map(x => x.id === now.id ? { ...x, h: now.h } : x) } };
+          }
+        }
+        return states;
+      };
+      // nearest first: the undo stack's newest is last, the redo stack's next state is last
+      this.undoStack = carry([...this.undoStack].reverse()).reverse();
+      this.redoStack = carry([...this.redoStack].reverse()).reverse();
+      if (this.gesture) this.gesture = carry([{ p: this.gesture }])[0].p;
+      if (opts?.transient && this.gesture) { this.revision++; this.gestureUnreported = true; } else this.changed();
+      return { revision: this.revision };
+    }
     // like the engine: no state event per transient batch of a gesture (endGesture reports it)
-    if (opts?.transient && this.gesture) this.revision++;
-    else { this.pushUndo(prev); this.changed(); }
+    if (opts?.transient && this.gesture) { this.revision++; this.gestureUnreported = true; }
+    else { this.pushUndo(prev, opts?.label); this.changed(); }
     return { revision: this.revision };
   }
-  async beginGesture() { this.gesture = structuredClone(this.p); }
+  async beginGesture(label?: string) { this.gesture = structuredClone(this.p); this.gestureLabel = label; }
   async endGesture() {
     const g = this.gesture; this.gesture = null;
+    const unreported = this.gestureUnreported; this.gestureUnreported = false;
     if (g && JSON.stringify(g) !== JSON.stringify(this.p)) {
-      this.pushUndo(g);
+      this.pushUndo(g, this.gestureLabel);
+      this.gestureLabel = undefined;
       // pitch edits are rendered offline at the end of a gesture: the state event comes after the render
       const tuned = this.p.clips.some(c => { const o = g.clips.find(x => x.id === c.id); return JSON.stringify(o?.tune ?? null) !== JSON.stringify(c.tune ?? null); });
       if (tuned) { this.revision++; this.renderReady = performance.now() + 380; setTimeout(() => this.emit('state', this.dto()), 380); } else this.changed();
+    } else if (g && unreported) {
+      // like the engine (end_gesture, gesture_unreported): nothing to undo — dragged and back, or lane
+      // heights only — but listeners have not seen the revisions of the gesture's batches
+      this.emit('state', this.dto());
     }
   }
   async undo() {
-    const prev = this.undoStack.pop();
-    if (prev) { this.redoStack.push(this.p); this.p = prev; this.changed(); }
+    const step = this.undoStack.pop();
+    if (step) { this.redoStack.push({ p: this.p, label: step.label }); this.p = step.p; this.changed(); }
     return this.dto();
   }
   async redo() {
-    const next = this.redoStack.pop();
-    if (next) { this.undoStack.push(this.p); this.p = next; this.changed(); }
+    const step = this.redoStack.pop();
+    if (step) { this.undoStack.push({ p: this.p, label: step.label }); this.p = step.p; this.changed(); }
     return this.dto();
   }
 
   // ---------- transport ----------
   private spb() { return 60 / this.p.bpm; }
-  private songEnd() { return Math.ceil(Math.max(4, ...this.p.clips.map(c => c.start + c.len)) / 4) * 4; }
+  private songEnd() { return songEnd(this.p); }
   /** Playhead without loop wrapping (beats since start, negative during count-in). */
   private rawBeat(): number { return this.playFrom + (performance.now() - this.playT0) / 1000 / this.spb(); }
   private beatNow(): number {
@@ -251,8 +364,13 @@ export class MockBackend implements Backend {
     this.tr = { ...this.tr, playing: false };
     this.changedTransport();
   }
+  /** Like the engine's Silence: the preview stops (the mock renders no tails to cut). */
+  async transportSilence() { this.preview = null; }
   async transportSet(patch: Partial<TransportDto>) {
     const wasRec = this.tr.rec;
+    // like the engine: the recording filter keeps one kind on
+    const ra = patch.recAudio ?? this.tr.recAudio, rn = patch.recNotes ?? this.tr.recNotes;
+    if (!ra && !rn) patch = { ...patch, recAudio: this.tr.recAudio, recNotes: this.tr.recNotes };
     this.tr = { ...this.tr, ...patch };
     if (wasRec && !this.tr.rec) this.finishRec();
     if (!wasRec && this.tr.rec && this.tr.playing) this.startRec(this.beatNow());
@@ -261,12 +379,32 @@ export class MockBackend implements Backend {
   }
   private changedTransport() { this.emit('state', this.dto()); }
   private startRec(clipStart: number) {
-    // like the engine: without an armed track nothing is recorded
-    const t = this.p.tracks.findIndex(x => x.arm);
-    if (t < 0) return;
+    // the mock has no MIDI keyboard: with Audio unticked nothing is recorded
+    if (!this.tr.recAudio) return;
+    // like the native engine: with no running audio device there is no take either, so a
+    // reset stays allowed (a take needs the input the device would deliver)
+    if (!this.audio.running) return;
+    // like the engine: the armed track, else the first one with room, else a new track
     const lp = this.p.loop;
     const lap: [number, number] | null = lp && lp.b > lp.a && clipStart >= lp.a && clipStart < lp.b ? [lp.a, lp.b] : null;
+    let t = recTarget(this.p, clipStart, lap ? lap[1] : Infinity);
+    if (t === 'new') {
+      t = this.p.tracks.length;
+      const id = this.p.nextId++;
+      this.p.tracks.push(newTrack(id, t));
+      this.recAdded = id;
+      this.changed();
+    }
     this.rec = { track: t, clipStart: Math.max(0, clipStart), t0: 0, peaks: [], sent: 0, lap, pass: 0 };
+  }
+  /** The track a recording added for want of room (the engine's `rec_added`). */
+  private recAdded: Id | null = null;
+  /** After a take: a track added for it that stayed empty goes, also from the undo snapshots. */
+  private settleRecTrack() {
+    const id = this.recAdded; this.recAdded = null;
+    if (id == null) return;
+    for (const snap of this.undoStack) dropEmptyTrack(snap.p, id);
+    if (dropEmptyTrack(this.p, id)) this.changed();
   }
   /** Peak-pair index where each pass after the first begins (100 pairs per second). */
   private passMarks(r: NonNullable<MockBackend['rec']>, total: number): number[] {
@@ -287,7 +425,7 @@ export class MockBackend implements Backend {
       if (n < (cutShort ? 100 * spb : 10)) continue; // a pass cut off right after the wrap is not a take
       passes.push([Float32Array.from(r.peaks.slice(bounds[k] * 2, bounds[k + 1] * 2)), k === 0 ? r.clipStart : r.lap![0]]);
     }
-    if (!passes.length) return;
+    if (!passes.length) return this.settleRecTrack();
     const prev = structuredClone(this.p);
     const landed: [Id, number, number][] = [];
     for (const [pk, start] of passes) {
@@ -300,6 +438,7 @@ export class MockBackend implements Backend {
     }
     landTakes(this.p, r.track, landed, () => this.p.nextId++);
     this.pushUndo(prev); this.changed();
+    this.settleRecTrack();
   }
   private recPeaks = new Map<Id, Float32Array>();
 
@@ -320,14 +459,17 @@ export class MockBackend implements Backend {
       live.set(tr.insert, Math.max(live.get(tr.insert) ?? 0, lvl));
     }
     // pattern loop preview and auditions (engine: rt.rs schedule_pattern / Cmd::Audition)
-    let patBeat = -1;
+    let patBeat = -1, direct = 0; // `direct`: what plays straight into the master
     if (this.patPlay) {
       const pt = this.p.patterns.find(x => x.id === this.patPlay!.id);
       if (!pt) this.patPlay = null;
       else {
         patBeat = this.patPos(pt.len, spb);
-        const ins = this.patHome(pt.id) ?? 0, pf = ((patBeat % 1) + 1) % 1;
-        live.set(ins, Math.max(live.get(ins) ?? 0, 0.25 + 0.55 * Math.exp(-pf * 5)));
+        // each channel into its own insert, else the master: never the playlist track's insert
+        const pf = ((patBeat % 1) + 1) % 1, lvl = 0.25 + 0.55 * Math.exp(-pf * 5);
+        for (const id of new Set(pt.notes.map(n => this.p.channels?.find(c => c.id === n.ch)?.insert ?? 0))) {
+          if (id === 0) direct = Math.max(direct, lvl); else live.set(id, Math.max(live.get(id) ?? 0, lvl));
+        }
       }
     }
     for (const [id, at] of this.flash) {
@@ -335,7 +477,7 @@ export class MockBackend implements Backend {
       if (age > 0.6) { this.flash.delete(id); continue; }
       live.set(id, Math.max(live.get(id) ?? 0, 0.7 * Math.exp(-age * 9)));
     }
-    let master = 0;
+    let master = direct;
     const lvOf = new Map<Id, number>();
     for (const m of this.p.inserts) if (m.id !== 0) {
       const lv = (live.get(m.id) ?? 0) * (m.muted ? 0 : 2 * m.vol ** 3) * (0.9 + 0.1 * Math.random());
@@ -372,7 +514,7 @@ export class MockBackend implements Backend {
     const inLevel = this.tr.rec ? 0.2 + 0.5 * Math.abs(Math.sin(t * 3)) * Math.random() : 0;
     void spb;
     this.teleCb(encodeFrame({ seq, beat, playing, recording: !!this.rec && this.rawBeat() >= (this.rec?.clipStart ?? 0), previewing: !!this.preview,
-      inLevel, previewPos, cpu: playing ? 0.12 + 0.03 * Math.random() : 0.02, ins, fx, rec, patBeat }));
+      inLevel, previewPos, cpu: playing ? 0.12 + 0.03 * Math.random() : 0.02, ins, fx, rec, patBeat, underruns: this.underrunTotal }));
   }
 
   private findFx(id: Id): { fx: Fx; ins: Id } | null {
@@ -398,6 +540,7 @@ export class MockBackend implements Backend {
     const specIn = new Float32Array(SPEC_BANDS), specOut = new Float32Array(SPEC_BANDS);
     const scopeIn = new Float32Array(SCOPE_LEN), scopeOut = new Float32Array(SCOPE_LEN);
     const meters = new Float32Array(32);
+    let xy: Float32Array | undefined;
     let sim = this.sims.get(fx.id); if (!sim) { sim = newSim(); this.sims.set(fx.id, sim); }
     const dt = sim.t ? clamp(t - sim.t, 0, 0.25) : 1 / 30; sim.t = t;
     const voc = this.vocalFor(fx, ins, beat, t, playing);
@@ -525,15 +668,85 @@ export class MockBackend implements Backend {
         meters[2] = [2, 4, 6, 8, 12][Math.round(pr.stages ?? 1)] ?? 4; meters[3] = ph;
       }
       for (let k = 0; k < SPEC_BANDS; k++) specOut[k] = specIn[k];
+    } else if (fx.type === 'stereo' || fx.type === 'analyzer') {
+      // a beat with a centred kick and bass and a wide top, as X/Y points (analysis.rs XY) and the
+      // meters of dsp::stereo / dsp::loudness
+      const st = fx.type === 'stereo', w = st ? (pr.width ?? 100) / 100 : 1, sp = st ? (pr.spread ?? 0) / 100 : 0;
+      const bassMono = st && (pr.bass ?? 0) >= 0.5, n = 512, sr = 48000;
+      xy = new Float32Array(2 * n);
+      let ll = 0, rr = 0, lr = 0, il = 0, ir = 0, ilr = 0, bl = 0, br = 0, blr = 0;
+      for (let i = 0; i < n; i++) {
+        const tt = t + i / sr;
+        const bass = level * 0.5 * Math.sin(2 * Math.PI * 55 * tt) * (0.4 + 0.6 * pulse);
+        const top = level * 0.22 * (Math.random() - 0.5);
+        const side = level * 0.16 * (Math.sin(2 * Math.PI * 330 * tt) + (Math.random() - 0.5));
+        const lowSide = level * 0.08 * Math.sin(2 * Math.PI * 61 * tt);
+        const inL = bass + top + side + lowSide, inR = bass + top - side - lowSide;
+        const s2 = side * w + top * sp * 0.9, ls = bassMono ? 0 : lowSide * w;
+        const L = bass + top + s2 + ls, R = bass + top - s2 - ls;
+        xy[2 * i] = L; xy[2 * i + 1] = R;
+        ll += L * L; rr += R * R; lr += L * R; il += inL * inL; ir += inR * inR; ilr += inL * inR;
+        const bL = bass + ls, bR = bass - ls; bl += bL * bL; br += bR * bR; blr += bL * bR;
+      }
+      const corr = (a: number, b: number, c: number) => (a * b > 1e-12 ? clamp(c / Math.sqrt(a * b), -1, 1) : 1);
+      const smDb = (a: number, b: number, c: number) => { const m = a + b + 2 * c, s = a + b - 2 * c; return m + s > 1e-12 ? clamp(10 * Math.log10((Math.max(0, s) + 1e-12) / (Math.max(0, m) + 1e-12)), -60, 30) : -60; };
+      if (st) {
+        meters[0] = corr(ll, rr, lr); meters[1] = ll + rr > 1e-12 ? (rr - ll) / (rr + ll) : 0; meters[2] = smDb(ll, rr, lr);
+        meters[3] = corr(bl, br, blr); meters[4] = corr(il, ir, ilr); meters[5] = smDb(il, ir, ilr); meters[6] = pr.bassf ?? 120; meters[7] = level > 0 ? 1 : 0;
+        const g = (pr.gain ?? 0) <= -59.5 ? 0 : dbg(pr.gain ?? 0);
+        out = level * g;
+        for (let k = 0; k < SPEC_BANDS; k++) specOut[k] = specIn[k] + 20 * Math.log10(Math.max(1e-6, g));
+      } else {
+        // loudness: momentary follows the level, short-term and integrated are slow averages;
+        // integrated and the peak hold start over when playback starts (dsp::loudness)
+        if (playing && !sim.held) { sim.m = [0, 0, 0, 0, -200, 0]; }
+        sim.held = playing ? 1 : 0;
+        const mom = level > 0 ? lvDb - 7 + 2 * pulse : -200;
+        sim.center = sim.center ? sim.center + (Math.max(mom, -70) - sim.center) * Math.min(1, dt / 1.5) : Math.max(mom, -70);
+        if (playing && mom > -70) { sim.m[0] += Math.pow(10, mom / 10) * dt; sim.m[1] += dt; sim.m[2] = Math.max(sim.m[2], 0); }
+        const integ = sim.m[1] > 0.4 ? 10 * Math.log10(sim.m[0] / sim.m[1]) : -200;
+        sim.m[4] = playing ? Math.max(sim.m[4], lvDb + 0.6) : sim.m[4];
+        meters[0] = mom; meters[1] = level > 0 ? sim.center : -200; meters[2] = integ; meters[3] = sim.m[1] > 3 ? 6.5 : -1;
+        meters[4] = sim.m[4]; meters[5] = lvDb + 0.6; meters[6] = corr(ll, rr, lr); meters[7] = 0; meters[8] = sim.m[1]; meters[9] = smDb(ll, rr, lr);
+        for (let k = 0; k < SPEC_BANDS; k++) specOut[k] = specIn[k];
+      }
+    } else if (fx.type === 'multiband') {
+      // dsp::multiband: band level → gain computers → smoothed gain; meters [0..3] in, [3..6] gain, [6..9] out
+      const edges = [20, pr.xlo ?? 88.3, pr.xhi ?? 2500, 20000], inG = pr.in ?? 0, depth = (pr.depth ?? 40) / 100;
+      const time = (pr.time ?? 100) / 100;
+      const bandOf = (f: number) => (f < edges[1] ? 0 : f < edges[2] ? 1 : 2);
+      const gains = [0, 0, 0];
+      for (let b = 0; b < 3; b++) {
+        let e = 0;
+        for (let k = 0; k < SPEC_BANDS; k++) if (bandOf(BAND_F[k]) === b) e += Math.pow(10, specIn[k] / 10);
+        const lvl = level > 0 ? 10 * Math.log10(e + 1e-12) - 8 + inG + MB_BAND_IN_DB : -120;
+        const target = mbBandGain(b, lvl, pr);
+        const prev = sim.dyn[b];
+        const tau = (target < prev ? MB_ATTACK[b] : MB_RELEASE[b]) * time;
+        sim.dyn[b] = prev + (target - prev) * (1 - Math.exp(-dt / Math.max(1e-3, tau)));
+        gains[b] = sim.dyn[b];
+        meters[b] = Math.max(-120, lvl); meters[3 + b] = sim.dyn[b];
+        meters[6 + b] = Math.max(-120, lvl + sim.dyn[b] + MB_MAKEUP_DB[b] + (pr['g' + ['l', 'm', 'h'][b]] ?? 0) + (pr.out ?? 0));
+      }
+      meters[9] = edges[1]; meters[10] = edges[2];
+      for (let k = 0; k < SPEC_BANDS; k++) {
+        const b = bandOf(BAND_F[k]);
+        const wet = gains[b] + MB_MAKEUP_DB[b] + MB_BAND_IN_DB + inG + (pr['g' + ['l', 'm', 'h'][b]] ?? 0) + (pr.out ?? 0);
+        specOut[k] = specIn[k] + 20 * Math.log10(Math.max(1e-6, (1 - depth) + depth * dbg(wet)));
+      }
+      out = level * ((1 - depth) + depth * dbg((gains[0] + gains[1] + gains[2]) / 3 + 12));
     } else if (fx.type === 'delay') {
-      // dsp::delay meters: [0]/[1] read heads ms (LFO on time), [2] loop dB, [3] drive dB, [4] LFO, [5] model, [6] wet dB, [7] time ms
+      // dsp::delay meters: [0]/[1] read heads ms (LFO on time), [2] loop dB, [3] drive dB, [4] LFO, [5] model, [6] wet dB, [7] time ms, [8] ducking dB
       const model = Math.round(pr.model ?? 1), base = delayMs(pr, this.p.bpm), lfo = Math.sin(t * 2 * Math.PI * (pr.rate ?? 0.5));
       const mod = (pr.mtime ?? 0) / 100 * lfo * Math.min(6, 0.45 * base), off = (pr.offset ?? 0) / 100;
       const loopDb = level > 0 ? lvDb + 20 * Math.log10(Math.max(1e-3, Math.min(1, loopGain(pr)) * 0.9)) : -120;
       meters[0] = model === 3 ? 0 : base * (model === 0 ? 1 + Math.max(0, -off) : 1) + mod;
       meters[1] = model === 3 ? 0 : base * (model === 0 ? 1 + Math.max(0, off) : 1) + mod;
       meters[2] = Math.min(loopDb, pr.level ?? 0); meters[3] = Math.min(0, (pr.level ?? 0) - Math.max(lvDb, -60)) * 0.3;
-      meters[4] = lfo; meters[5] = model; meters[6] = loopDb + 20 * Math.log10(Math.max(1e-3, (pr.mix ?? 25) / 100)); meters[7] = base;
+      // dsp::ducker: −45 … −15 dBFS of input ramps the wet down by 0 … Ducking dB
+      const duckDb = level > 0 ? -(pr.duck ?? 0) * Math.min(1, Math.max(0, (lvDb + 45) / 30)) : 0;
+      meters[4] = lfo; meters[5] = model; meters[6] = loopDb + duckDb + 20 * Math.log10(Math.max(1e-3, (pr.mix ?? 25) / 100)); meters[7] = base;
+      meters[8] = duckDb;
       for (let k = 0; k < SPEC_BANDS; k++) specOut[k] = specIn[k] + 20 * Math.log10(1 + (pr.mix ?? 25) / 100);
     } else {
       for (let k = 0; k < SPEC_BANDS; k++) specOut[k] = specIn[k] + 20 * Math.log10(1 + (pr.mix ?? 25) / 100);
@@ -544,7 +757,7 @@ export class MockBackend implements Backend {
       scopeIn[i] = x;
       scopeOut[i] = fx.type === 'sat' ? Math.tanh(x * drive) / ((pr.auto ?? 1) ? drive : 0.6) * dbg(pr.out ?? 0) : x * dbg(gr);
     }
-    return { id: fx.id, inPeak: level, outPeak: out, grDb: gr, meters, specIn, specOut, scopeIn, scopeOut };
+    return { id: fx.id, inPeak: level, outPeak: out, grDb: gr, meters, specIn, specOut, scopeIn, scopeOut, xy };
   }
 
   /** vocal.rs `Tune::process`, stepped every 4 ms hop. */
@@ -576,7 +789,7 @@ export class MockBackend implements Backend {
 
   // ---------- catalog / audio files ----------
   async fxCatalog() { await delay(); return structuredClone(this.cat); }
-  async importAudio(a: { paths: string[]; track?: number; beat?: number }) {
+  async importAudio(a: { paths: string[]; track?: number; beat?: number; step?: boolean }) {
     await delay(30);
     const prev = structuredClone(this.p);
     const sourceIds: Id[] = [], clipIds: Id[] = [];
@@ -602,9 +815,17 @@ export class MockBackend implements Backend {
         this.p.clips.push(mkClip(cid, tr, a.beat, len, 'audio', id)); clipIds.push(cid);
       }
     });
-    if (clipIds.length) this.pushUndo(prev);
+    // like the engine (import_audio_with): one undo step, unless the caller loads the files for an edit
+    // that follows; a new source then still clears redo
+    const added = this.p.sources.length !== prev.sources.length;
+    const errors: { path: string; error: string }[] = [];
+    const fold = a.step === false && !clipIds.length && added;
+    if (!fold && (a.step !== false || clipIds.length)) this.pushUndo(prev);
+    else if (added) this.redoStack = [];
     this.changed();
-    return { sourceIds, clipIds };
+    // the edit that follows (the sampler channel) is the step, and it takes the source with it
+    if (fold) this.importBase = { rev: this.revision, p: this.importBase && this.importBase.rev + 1 === this.revision ? this.importBase.p : prev };
+    return { sourceIds, clipIds, errors };
   }
   async pickAudioFiles(): Promise<string[] | null> {
     return new Promise(res => {
@@ -613,6 +834,11 @@ export class MockBackend implements Backend {
       inp.onchange = () => res(inp.files && inp.files.length ? [...inp.files].map(f => f.name) : null);
       inp.click();
     });
+  }
+  /** engine `source_onsets`: the mock finds them in the peak envelope (lib/slicer `onsetsFromPeaks`). */
+  async sourceOnsets(id: Id) {
+    const o = onsetsFromPeaks(await this.sourcePeaks(id));
+    return Float32Array.from(o.flatMap(x => [x.pos, x.strength]));
   }
   async sourcePeaks(id: Id, norm?: boolean, rev?: boolean) {
     await delay(5);
@@ -1007,10 +1233,12 @@ export class MockBackend implements Backend {
       ? this.p.patterns.filter(p => p.id === a.pattern)
       : this.p.clips.filter(c => c.kind === 'pat' && !c.muted).map(c => this.p.patterns.find(p => p.id === c.ref)).filter((p): p is Pattern => !!p);
     if (a.pattern != null && !pats.length) throw new Error(`no pattern ${a.pattern}`);
-    const notes = pats.reduce((n, p) => n + p.notes.length, 0);
+    // slide notes have no sound of their own and no MIDI equivalent: left out, as the engine does
+    const sounding = pats.flatMap(p => p.notes.filter(n => !n.slide));
+    const notes = sounding.length;
     const what = a.pattern != null ? pats[0].name : 'song';
     if (!notes) throw new Error(`the ${what} has no notes to export`);
-    return { out: a.out, what, tracks: new Set(pats.flatMap(p => p.notes.map(n => n.ch))).size, notes, bpm: this.p.bpm };
+    return { out: a.out, what, tracks: new Set(sounding.map(n => n.ch)).size, notes, bpm: this.p.bpm };
   }
   // ---- FX chain presets (app/src/fx_chains.rs): kept for the session, across projects
   private chains = new Map<string, { name: string; fx: Fx[] }>();
@@ -1038,7 +1266,7 @@ export class MockBackend implements Backend {
     const n = this.chainName(name), m = this.p.inserts.find(x => x.id === insert);
     if (!m) throw new Error(`no insert ${insert}`);
     if (!m.fx.length) throw new Error(`${m.name.trim() || 'the insert'} has no effects to save`);
-    if (this.chains.has(n.toLowerCase()) && !overwrite) throw new Error(`EXISTS: a preset called ${n} already exists`);
+    if (this.chains.has(n.toLowerCase()) && !overwrite) throw new Error(`${ERR_EXISTS} a preset called ${n} already exists`);
     this.chains.set(n.toLowerCase(), { name: n, fx: m.fx.map(f => ({ ...structuredClone(f), id: 0 })) });
     return { name: n, effects: m.fx.length };
   }
@@ -1061,7 +1289,7 @@ export class MockBackend implements Backend {
   async fxChainRename(name: string, to: string) {
     await delay(10);
     const c = this.chainOf(name), n = this.chainName(to), other = this.chains.get(n.toLowerCase());
-    if (other && other !== c) throw new Error(`EXISTS: a preset called ${n} already exists`);
+    if (other && other !== c) throw new Error(`${ERR_EXISTS} a preset called ${n} already exists`);
     this.chains.delete(c.name.toLowerCase());
     this.chains.set(n.toLowerCase(), { ...c, name: n });
     return { name: n };
@@ -1100,6 +1328,119 @@ export class MockBackend implements Backend {
     this.pushUndo(prev); this.changed();
     return { sourceId: id, track: at, insertId };
   }
+  /** engine.rs `export_in_place`: one audio clip over the selection's span on a new track below it, routed to the master.
+   *  The engine's clip also carries the effect tail past the span; the mock renders no effects, so it has none. */
+  async exportInPlace(clipIds: Id[]) {
+    await delay(30);
+    const cs = this.p.clips.filter(c => clipIds.includes(c.id) && c.kind !== 'auto');
+    if (!cs.length) throw new Error('select the clips to export in place (automation clips alone make no sound)');
+    const from = Math.min(...cs.map(c => c.start)), to = Math.max(...cs.map(c => c.start + c.len));
+    const first = [...cs].sort((a, b) => a.track - b.track || a.start - b.start)[0];
+    const low = Math.max(...cs.map(c => c.track));
+    const srcName = (c: Clip) => (c.kind === 'pat' ? this.p.patterns.find(x => x.id === c.ref)?.name : this.p.sources.find(x => x.id === c.ref)?.name) ?? 'Render';
+    const color = (first.kind === 'pat' ? this.p.patterns.find(x => x.id === first.ref)?.color : this.p.sources.find(x => x.id === first.ref)?.color) ?? '#47b8a8';
+    const name = cs.length === 1 ? srcName(first) + ' (in place)' : srcName(first) + ' + ' + (cs.length - 1) + ' (in place)';
+    const prev = structuredClone(this.p), sourceId = this.p.nextId++;
+    const src: MockSource = { id: sourceId, name, color, path: 'C:\\Users\\michal\\Music\\' + name + '.wav', dur: (to - from) * this.spb(), sr: 48000, ch: 2, peakDb: -3, seed: hash(name) };
+    this.srcMeta.set(sourceId, src); this.p.sources.push(strip(src));
+    const at = Math.min(low + 1, this.p.tracks.length);
+    this.p.tracks.splice(at, 0, { id: this.p.nextId++, name, color, muted: false, solo: false, arm: false, vol: 0.7937, h: this.p.tracks[low]?.h ?? 60, insert: 0 });
+    for (const c of this.p.clips) { if (c.track >= at) c.track++; if (clipIds.includes(c.id) && c.kind !== 'auto') c.muted = true; }
+    const clipId = this.p.nextId++;
+    this.p.clips.push(mkClip(clipId, at, from, to - from, 'audio', sourceId));
+    this.pushUndo(prev); this.changed();
+    return { sourceId, clipId, track: at };
+  }
+  // ---------- stem separation (app/src/stems_actions.rs) ----------
+  private stemModel = false;
+  private stemsCancelled = false;
+  private stemsBusy = false;
+  /** Dev/tests: the model download fails (also `?offline` in the URL, like the updater mock). */
+  stemsOffline = (() => { try { return new URLSearchParams(location.search).has('offline'); } catch { return false; } })();
+  async stemsModelStatus(): Promise<StemModelStatus> {
+    return {
+      id: 'htdemucs', name: 'HTDemucs stem separation model', bytes: MOCK_STEM_MODEL_BYTES, installed: this.stemModel,
+      licenseNote: 'Demucs v4 (HTDemucs) by Meta AI Research: code and pretrained weights under the MIT licence.',
+      licenseUrl: 'https://github.com/facebookresearch/demucs/blob/main/LICENSE',
+      path: 'C:\\Users\\michal\\AppData\\Local\\WAVE\\Models\\htdemucs.onnx', stems: [...STEM_IDS],
+    };
+  }
+  async stemsModelInstall(): Promise<StemModelStatus | { cancelled: true }> {
+    this.stemsCancelled = false;
+    const total = MOCK_STEM_MODEL_BYTES;
+    for (let k = 0; k <= 20; k++) {
+      if (this.stemsCancelled) return { cancelled: true };
+      if (this.stemsOffline) { this.emit('model-progress', { id: 'htdemucs', done: 0, total: 0, error: 'download failed: offline' }); throw new Error('download failed: io: offline'); }
+      this.emit('model-progress', { id: 'htdemucs', done: Math.round(total * k / 20), total });
+      await delay(60);
+    }
+    this.stemModel = true;
+    return this.stemsModelStatus();
+  }
+  async stemsCancel() { this.stemsCancelled = true; }
+  /** stems_actions.rs `extract` + engine.rs `stem_region`/`place_stems`: the region under the clip plus 3 s either side is
+   *  "separated" (fake stems: the source's waveform, scaled per stem), then one track per stem right below the clip, a clip at
+   *  the same place playing the same part the same way, the clip muted — one undo step. */
+  async extractStems(clipId: Id, stems: StemId[]): Promise<ExtractStemsResult | { cancelled: true }> {
+    const picked = STEM_IDS.filter(s => stems.includes(s));
+    const bad = stems.find(s => !STEM_IDS.includes(s));
+    if (bad) throw new Error(`no stem called \`${bad}\` (drums, bass, other, vocals)`);
+    if (!picked.length) throw new Error('pick at least one stem');
+    if (!this.stemModel) throw new Error(`${ERR_NO_STEM_MODEL} the stem separation model is not installed (90 MB download)`);
+    if (this.stemsBusy) throw new Error('stems are already being extracted from another clip; wait for it or cancel it');
+    const c0 = this.p.clips.find(x => x.id === clipId);
+    if (!c0) throw new Error('no such clip');
+    if (c0.kind !== 'audio') throw new Error('stems can be extracted from audio clips only');
+    if (this.missing()[c0.ref]) throw new Error(`the clip's audio file is missing (${this.missing()[c0.ref]}); relink it first`);
+    const s = this.p.sources.find(x => x.id === c0.ref); if (!s) throw new Error('audio not loaded');
+    const snap = { ...c0 }, spb0 = this.spb(), st0 = c0.stretch ?? 1;
+    const sa0 = c0.offset * spb0 / st0, sb0 = Math.min(s.dur, (c0.offset + c0.len) * spb0 / st0);
+    if (sb0 - sa0 < 0.05) throw new Error('the clip plays less than 50 ms of its audio: nothing to separate');
+    if (sb0 - sa0 > 1800) throw new Error(`the clip plays ${Math.round((sb0 - sa0) / 60)} minutes of audio; stems can be extracted from at most 30 minutes at a time (split the clip first)`);
+    const fromS = Math.max(0, sa0 - 3), toS = Math.min(s.dur, sb0 + 3);
+    this.stemsBusy = true; this.stemsCancelled = false;
+    try {
+      const prog = (stage: StemsProgress['stage'], frac: number) => this.emit('stems-progress', { clipId, stage, frac });
+      prog('prepare', 0); await delay(40);
+      prog('load', 0); await delay(120);
+      const steps = Math.max(4, Math.min(30, Math.ceil((toS - fromS) / 5.85)));
+      for (let k = 0; k < steps; k++) {
+        if (this.stemsCancelled) return { cancelled: true };
+        prog('separate', k / steps); await delay(150);
+      }
+      prog('separate', 1);
+      if (this.stemsCancelled) return { cancelled: true };
+      prog('place', 1);
+      // like place_stems: the clip as it is now must still play that region of that source
+      const c = this.p.clips.find(x => x.id === clipId);
+      if (!c) throw new Error('the clip was deleted while its stems were extracted; nothing was added');
+      const spb = this.spb(), st = c.stretch ?? 1, sa = c.offset * spb / st, sb = (c.offset + c.len) * spb / st;
+      if (c.kind !== 'audio' || c.ref !== snap.ref || !!c.norm !== !!snap.norm || !!c.rev !== !!snap.rev || sa < fromS - 1e-6 || Math.min(sb, s.dur) > toS + 1e-3)
+        throw new Error('the clip changed while its stems were extracted (another sample or region); extract them again');
+      const tr = this.p.tracks[c.track]; if (!tr) throw new Error("the clip's track is missing");
+      const pk = await this.sourcePeaks(c.ref, c.norm, c.rev);
+      const prev = structuredClone(this.p), at = c.track + 1, n = picked.length;
+      for (const x of this.p.clips) { if (x.track >= at) x.track += n; if (x.id === c.id) x.muted = true; }
+      const name = s.name, offset = (sa - fromS) * st / spb;
+      const sourceIds: Id[] = [], clipIds: Id[] = [];
+      picked.forEach((stem, k) => {
+        const meta = STEM_META[stem], sname = `${name} – ${meta.label}`, id = this.p.nextId++;
+        const src: MockSource = { id, name: sname, color: meta.color, path: `C:\\Users\\michal\\Music\\${name} - ${meta.label}.wav`, dur: toS - fromS, sr: 44100, ch: 2, peakDb: s.peakDb - 3, seed: hash(sname) };
+        this.srcMeta.set(id, src); this.p.sources.push(strip(src));
+        this.recPeaks.set(id, pk.slice(Math.floor(fromS * 100) * 2, Math.ceil(toS * 100) * 2).map((v, i) => v * meta.scale * (stem === 'drums' && (i >> 4) % 3 ? 0.35 : 1)));
+        this.p.tracks.splice(at + k, 0, { id: this.p.nextId++, name: sname, color: meta.color, muted: false, solo: false, arm: false, vol: 0.7937, h: tr.h, insert: tr.insert });
+        const cid = this.p.nextId++;
+        const nc: Clip = { ...structuredClone(c), id: cid, track: at + k, ref: id, offset, muted: false, norm: false, rev: false };
+        delete nc.tune;
+        this.p.clips.push(nc);
+        sourceIds.push(id); clipIds.push(cid);
+      });
+      this.pushUndo(prev); this.changed();
+      return { sourceIds, clipIds, track: at, mutedClip: c.id, revision: this.revision };
+    } finally {
+      this.stemsBusy = false;
+    }
+  }
   async previewClip(clipId: Id, from?: number) {
     const c = this.p.clips.find(x => x.id === clipId); if (!c) return;
     // like the engine: positions in seconds of the source (a stretched clip plays `stretch` times longer)
@@ -1109,8 +1450,20 @@ export class MockBackend implements Backend {
     if (f >= b) throw new Error('nothing to play after that point');
     this.preview = { t0: performance.now(), dur: b - f, off: f, rate: 1 };
   }
+  async previewClipKey(a: { clipId: Id; key: number; vel?: number }) {
+    const c = this.p.clips.find(x => x.id === a.clipId && x.kind === 'audio'); if (!c) throw new Error('no such clip');
+    // like the engine: the region at the sample's own speed, read faster by the distance from the root
+    const st = c.stretch ?? 1, a0 = c.offset * this.spb() / st, b0 = (c.offset + c.len) * this.spb() / st;
+    const rate = 2 ** ((Math.min(127, a.key) - (c.root ?? SAMPLE_ROOT) + (c.pitch ?? 0)) / 12);
+    this.preview = { t0: performance.now(), dur: (b0 - a0) / rate, off: a0, rate };
+  }
   async previewFile(path: string) { this.preview = { t0: performance.now(), dur: 0.6 + (hash(path) % 400) / 100, off: 0 }; }
   async previewStop() { this.preview = null; }
+  async previewSource(id: Id) {
+    const src = this.p.sources.find(s => s.id === id);
+    if (!src) throw new Error('audio not loaded');
+    this.preview = { t0: performance.now(), dur: src.dur, off: 0 };
+  }
   /** Insert of the track of the pattern's first clip (rt.rs `PatRt.home`). */
   private patHome(id: Id): Id | null {
     const c = this.p.clips.filter(x => x.kind === 'pat' && x.ref === id).sort((a, b) => a.start - b.start)[0];
@@ -1119,7 +1472,8 @@ export class MockBackend implements Backend {
   async noteAudition(a: { ch: Id; key?: number; vel?: number; pattern?: Id }) {
     const c = this.p.channels?.find(x => x.id === a.ch); if (!c) throw new Error('no channel ' + a.ch);
     const heard = this.p.patterns.find(pt => pt.notes.some(n => n.ch === c.id));
-    const ins = c.insert ?? (a.pattern != null ? this.patHome(a.pattern) : null) ?? (heard ? this.patHome(heard.id) : null) ?? 0;
+    // over a pattern loop it goes where the loop goes (rt.rs `Cmd::Audition`)
+    const ins = this.patPlay ? c.insert ?? 0 : c.insert ?? (a.pattern != null ? this.patHome(a.pattern) : null) ?? (heard ? this.patHome(heard.id) : null) ?? 0;
     this.flash.set(ins, performance.now());
   }
   async typingNote(a: { ch: Id; key: number; vel?: number; on: boolean }) { if (a.on) await this.noteAudition({ ch: a.ch, key: a.key, vel: a.vel }); }
@@ -1179,6 +1533,11 @@ export class MockBackend implements Backend {
 
   setWasapiOutputPresent(present: boolean) { this.wasapiOutputPresent = present; }
 
+  /** Test hook: the output could not be opened (the engine's status after a WASAPI/ASIO open error); the next `audioSetConfig` opens it again. */
+  audioOpenFailed(err: string) {
+    this.audio = { ...this.audio, running: false, error: err };
+    this.emit('audio-status', { ...this.audio });
+  }
   /** Dev tools / tests: the device stops by itself and the audio thread reopens it, as in the app. */
   audioDeviceLost(why = 'The requested device is no longer available') {
     this.audio = { ...this.audio, running: true, error: null, restarts: this.audio.restarts + 1, note: `Audio restarted by itself: ${why}.` };
@@ -1202,6 +1561,10 @@ export class MockBackend implements Backend {
     return { ...this.midi };
   }
   async midiStatus() { return { ...this.midi }; }
+  async midiSetVelocity(fixed: number | null) {
+    this.midi = { ...this.midi, fixedVelocity: fixed == null ? null : Math.min(127, Math.max(1, Math.round(fixed))) };
+    return { ...this.midi };
+  }
   async midiSetTarget(channel: Id | null) {
     this.midi = { ...this.midi, target: channel };
     this.emit('midi-status', { ...this.midi });
@@ -1221,17 +1584,17 @@ export class MockBackend implements Backend {
   }
   /** The browser preview has no recordings to load: the piano is always "ready" (and silent, like every mock instrument). */
   async keysStatus(): Promise<KeysStatus> { await delay(); return { state: 'ready', error: null, kit: 'salamander-piano', installed: true }; }
-  async libraryFiles(q: { kit?: string; folder?: string }): Promise<LibFile[]> {
+  async libraryFiles(q: { kit?: string; folder?: string }): Promise<LibraryFiles> {
     await delay(10);
     // the standard library is listed by its portable paths (the app lists where it is installed; importing either gives `lib:` sources)
-    if (q.kit === FACTORY_KIT) return FACTORY_FILES.map(f => ({ name: f.name, path: libPath(f.file), group: f.group, root: f.root, ...(f.pitched ? { pitched: true } : {}) }));
+    if (q.kit === FACTORY_KIT) return { truncated: false, files: FACTORY_LISTED_FILES.map(f => ({ name: f.name, path: libPath(f.file), group: f.group, root: f.root, ...(f.pitched ? { pitched: true } : {}) })) };
     const root = q.kit ? 'C:\\WAVE\\Library\\' + q.kit : q.folder ?? '';
     const groups: Record<string, string[]> = q.kit === 'wave-keys'
       ? { Pady: ['Warm Pad C', 'Glass Pad Am', 'Choir Pad F'], Akordy: ['Rhodes Chord 1', 'Rhodes Chord 2', 'Piano Stab'], Pętle: ['Keys Loop 120', 'Pad Loop Am-F'] }
       : q.kit === 'wave-fx' ? { Uplightery: ['Riser 8 bar', 'Riser 4 bar'], Impakty: ['Impact Deep', 'Impact Metal'], Szumy: ['White Sweep', 'Vinyl Crackle'] }
       : q.kit ? { Kick: ['Kick 808', 'Kick Punch', 'Kick Deep'], Snare: ['Snare Tight', 'Snare Room', 'Clap 909'], Hats: ['Hat Closed', 'Hat Open', 'Ride'], Loops: ['Drum Loop 128', 'Perc Loop 128', 'Top Loop'] }
       : { '': ['vox_take1', 'vox_take2', 'guitar_di', 'bass_di', 'fx_loop'] };
-    return Object.entries(groups).flatMap(([group, names]) => names.map(n => ({ name: n + '.wav', path: root + '\\' + (group ? group + '\\' : '') + n + '.wav', group })));
+    return { truncated: false, files: Object.entries(groups).flatMap(([group, names]) => names.map(n => ({ name: n + '.wav', path: root + '\\' + (group ? group + '\\' : '') + n + '.wav', group }))) };
   }
   async libraryAddFolder() { this.folders.push('D:\\Sample packs\\Pack ' + (this.folders.length + 1)); return [...this.folders]; }
   async libraryRemoveFolder(path: string) { this.folders = this.folders.filter(f => f !== path); return [...this.folders]; }
@@ -1245,7 +1608,11 @@ export class MockBackend implements Backend {
     this.tr = { ...this.tr, playing: false }; this.revision++; this.savedRev = this.revision;
     this.emit('state', this.dto());
   }
-  async projectNew() { this.resetTo(emptyProject(), null); this.recovery = null; return this.dto(); }
+  async projectNew(demo?: boolean) {
+    // like the engine: a refused reset (recording) keeps the project and its recovery copy
+    if (this.rec) throw new Error('recording: stop it first');
+    this.resetTo(demo ? demoProject() : emptyProject(), null); this.recovery = null; return this.dto();
+  }
   /** Tests: the next native file dialog is dismissed, as when the user presses Cancel. */
   dismissNextDialog = false;
   private dialog(): boolean { const ok = !this.dismissNextDialog; this.dismissNextDialog = false; return ok; }
@@ -1253,47 +1620,76 @@ export class MockBackend implements Backend {
     if (path == null && !this.dialog()) return { cancelled: true };
     // the engine's `open_at_revision`: a take in progress first, then the approved revision
     if (this.rec) throw new Error('recording: stop it first');
-    if (ifRevision != null && ifRevision !== this.revision) throw new Error('REVISION_CONFLICT: project changed');
-    this.resetTo(sketchProject(this.cat), path ?? 'C:\\Users\\michal\\Music\\Demo.wave');
+    if (ifRevision != null && ifRevision !== this.revision) throw new Error(`${ERR_REVISION_CONFLICT} project changed`);
+    if (path != null && this.gone.has(path)) throw new Error(`could not open ${path}: the file is not there`);
+    this.resetTo(sketchProject(this.cat), path ?? 'C:\\Users\\michal\\Music\\Demo.synkopa');
+    this.remember(this.path!);
     this.recovery = null;
     return { state: this.dto(), warnings: [] };
   }
   async takeProjectOpenRequests(): Promise<string[]> { return []; }
-  async projectSave(saveAs?: boolean): Promise<SaveResult> {
+  // ---------- File → Open recent (app/src/settings.rs `remember` / `forget`) ----------
+  /** Newest first, at most 10. The mock pretends a user who has worked on a few songs, one since deleted. */
+  private recent: string[] = ['C:\\Users\\michal\\Music\\Demo.synkopa', 'C:\\Users\\michal\\Music\\Night drive.synkopa',
+    'D:\\Beats\\2026\\Beat.synkopa', 'C:\\Users\\michal\\Music\\Beat.synkopa', 'E:\\Old\\idea 3.synkopa'];
+  /** Files the mock's pretend disk no longer has. */
+  private gone = new Set(['E:\\Old\\idea 3.synkopa']);
+  private remember(path: string) {
+    const key = (p: string) => p.replace(/\\/g, '/').toLowerCase();
+    this.recent = [path, ...this.recent.filter(p => key(p) !== key(path))].slice(0, 10);
+    this.gone.delete(path);
+  }
+  async recentProjects(): Promise<RecentProject[]> {
+    return this.recent.map(path => {
+      const m = /^(.*)[\\/]([^\\/]+?)(\.[^.\\/]+)?$/.exec(path);
+      return { path, name: m?.[2] ?? path, dir: m?.[1] ?? '', exists: !this.gone.has(path) };
+    });
+  }
+  async recentForget(path?: string): Promise<void> {
+    const key = (p: string) => p.replace(/\\/g, '/').toLowerCase();
+    this.recent = path == null ? [] : this.recent.filter(p => key(p) !== key(path));
+  }
+  async projectSave(saveAs?: boolean, version?: boolean): Promise<SaveResult> {
+    // save new version: Name → Name_2 → Name_3 beside the current file (actions.rs next_version_path)
+    if (this.path && !saveAs && version) {
+      const m = /^(.*[\\/])?(.+?)(\.[^.\\/]+)?$/.exec(this.path)!, v = /^(.+)_(\d{1,6})$/.exec(m[2]);
+      this.path = (m[1] ?? '') + (v ? v[1] + '_' + Math.max(2, +v[2] + 1) : m[2] + '_2') + (m[3] ?? '.synkopa');
+    }
     if (!this.path || saveAs) {
       if (!this.dialog()) return { cancelled: true };
-      this.path = 'C:\\Users\\michal\\Music\\Projekt ' + (1 + (this.revision % 9)) + '.wave';
+      this.path = 'C:\\Users\\michal\\Music\\Projekt ' + (1 + (this.revision % 9)) + '.synkopa';
     }
-    this.savedRev = this.revision; this.recovery = null; this.emit('state', this.dto());
+    this.savedRev = this.revision; this.recovery = null; this.remember(this.path); this.emit('state', this.dto());
     return { path: this.path };
   }
 
   async projectExportZip(ifRevision: number): Promise<SaveResult> {
     if (!this.dialog()) return { cancelled: true };
     if (this.rec) throw new Error('recording: stop it first');
-    if (ifRevision !== this.revision) throw new Error('REVISION_CONFLICT: project changed');
-    return { path: this.path?.replace(/\.wave$/i, '.zip') ?? 'Song.zip' };
+    if (ifRevision !== this.revision) throw new Error(`${ERR_REVISION_CONFLICT} project changed`);
+    return { path: this.path?.replace(/\.(synkopa|wave)$/i, '.zip') ?? 'Song.zip' };
   }
 
   // ---------- crash recovery (app/src/recovery.rs) ----------
-  /** This session's copy of a project that was never saved. */
-  private recovery: { project: Project; savedMs: number } | null = null;
-  /** Copies left by sessions that "crashed" (see `simulateCrash`). */
-  private orphans = new Map<string, { project: Project; savedMs: number }>();
+  /** This session's snapshot of the unsaved changes; `path`: the project file they belong to. */
+  private recovery: { project: Project; savedMs: number; path: string | null } | null = null;
+  /** Snapshots left by sessions that "crashed" (see `simulateCrash`). */
+  private orphans = new Map<string, { project: Project; savedMs: number; path: string | null }>();
+  /** Like recovery.rs: a snapshot whenever something is unsaved, saved project or not; the project's own file is never written. */
   async recoveryWrite() {
-    if (this.path || this.revision === this.savedRev) { this.recovery = null; return false; }
-    this.recovery = { project: JSON.parse(JSON.stringify(this.p)), savedMs: Date.now() };
+    if (this.revision === this.savedRev) { this.recovery = null; return false; }
+    this.recovery = { project: JSON.parse(JSON.stringify(this.p)), savedMs: Date.now(), path: this.path };
     return true;
   }
   async recoveryList() {
-    return [...this.orphans].map(([id, o]) => ({ id, savedMs: o.savedMs })).sort((a, b) => b.savedMs - a.savedMs);
+    return [...this.orphans].map(([id, o]) => ({ id, savedMs: o.savedMs, ...(o.path ? { project: o.path } : {}) })).sort((a, b) => b.savedMs - a.savedMs);
   }
   async recoveryRestore(id: string) {
     const o = this.orphans.get(id);
     if (!o) throw new Error(`no recovered project \`${id}\``);
     this.orphans.delete(id);
-    this.resetTo(o.project, null);
-    this.revision++; // unsaved changes: Save asks where to put it
+    this.resetTo(o.project, o.path);
+    this.revision++; // unsaved changes: Save writes them to the project (or asks where, for one never saved)
     this.recovery = o;
     this.emit('state', this.dto());
     return { state: this.dto(), warnings: [] };
@@ -1311,14 +1707,15 @@ export class MockBackend implements Backend {
   private exportAbort = false;
   async exportAudio(opts: ExportAudioOptions): Promise<ExportResult> {
     this.exportAbort = false;
-    const { from, to } = exportRange(this.p, opts.useLoop);
+    this.checkExportRange(opts);
+    const { from, to } = exportRange(this.p, opts.useLoop, opts.pattern);
     const tail = opts.format !== 'mp3' && opts.wrapTail ? 0 : opts.tail;
     const secs = exportSeconds(from, to, this.p.bpm, tail);
-    const name = (this.path ? this.path.replace(/\.wave$/i, '') : 'C:\\Users\\michal\\Music\\Song') + (opts.format === 'mp3' ? '.mp3' : '.wav');
+    const name = (this.path ? this.path.replace(/\.(synkopa|wave)$/i, '') : 'C:\\Users\\michal\\Music\\Song') + (opts.format === 'mp3' ? '.mp3' : '.wav');
     // a short offline bounce with the engine's progress reports, so the dialog's readout and cancel work
     if (!(await this.mockBounce(0, 1, name.split(/[\\/]/).pop()!, from, to, 12))) return { cancelled: true };
     this.emit('export-progress', { done: 1, total: 1, name: '', stage: 'done', frac: 1, beat: to, peak: 0, wave: [] });
-    const silent = this.p.clips.length === 0 || this.p.tracks.every(t => t.muted);
+    const silent = opts.pattern != null ? patternSilent(this.p, opts.pattern) : this.p.clips.length === 0 || this.p.tracks.every(t => t.muted);
     return {
       out: name,
       fromBeat: from,
@@ -1338,13 +1735,14 @@ export class MockBackend implements Backend {
   /** Like the engine: one file per insert with sound (+ Master), the same names, nothing written when cancelled. */
   async exportStems(opts: ExportStemsOptions): Promise<ExportStemsResult> {
     this.exportAbort = false;
-    const { from, to } = exportRange(this.p, opts.useLoop);
+    this.checkExportRange(opts);
+    const { from, to } = exportRange(this.p, opts.useLoop, opts.pattern);
     const format = opts.format ?? 'wav';
     const tail = opts.format !== 'mp3' && opts.wrapTail ? 0 : opts.tail;
     const secs = exportSeconds(from, to, this.p.bpm, tail);
     const jobs = [
       ...(opts.includeMaster ? [{ name: 'Master', master: true }] : []),
-      ...stemInserts(this.p).map(m => ({ name: m.name.trim() || `Insert ${m.id}`, master: false })),
+      ...stemInserts(opts.pattern != null ? patternProject(this.p, opts.pattern) : this.p).map(m => ({ name: m.name.trim() || `Insert ${m.id}`, master: false })),
     ];
     if (!jobs.length) throw new Error('nothing to export: every mixer track is muted or has no sound routed to it');
     const stems = uniqueFileStems(jobs.map(j => j.name));
@@ -1361,6 +1759,12 @@ export class MockBackend implements Backend {
     return { dir, fromBeat: from, toBeat: to, tail, format, files, skipped: [] };
   }
   async exportCancel() { this.exportAbort = true; }
+  /** The checks of lib.rs `export_span`: a pattern export names a pattern that exists and has no wrapped tail. */
+  private checkExportRange(opts: ExportAudioOptions) {
+    if (opts.pattern == null) return;
+    if (opts.format !== 'mp3' && opts.wrapTail) throw new Error('wrap tail is for a loop of the song, not a pattern export');
+    if (!this.p.patterns.some(x => x.id === opts.pattern)) throw new Error('that pattern no longer exists');
+  }
   /** One file of a mock export: prepare, `steps` render reports with a growing waveform, write. False when cancelled. */
   private async mockBounce(done: number, total: number, name: string, from: number, to: number, steps: number): Promise<boolean> {
     const SLICES = 240, wave: number[] = new Array(SLICES).fill(0);
@@ -1385,23 +1789,67 @@ export class MockBackend implements Backend {
   // ---------- hosted plugins ----------
   async pluginScan(rescan: boolean): Promise<PluginScan> {
     await delay(rescan ? 600 : 20);
-    const mk = (name: string, vendor: string, category: string): PluginInfo => ({ format: 'vst3', name, vendor, category, path: 'C:\\Program Files\\Common Files\\VST3\\' + name + '.vst3', cid: hash(name).toString(16).padStart(32, '0') });
+    const mk = mockVst3;
     const lv2 = Object.entries(MOCK_LV2).map(([cid, p]): PluginInfo => ({ format: 'lv2', cid, name: p.name, vendor: p.vendor, category: p.category, path: '/usr/lib/lv2/' + p.bundle, ...(p.unsupported ? { unsupported: p.unsupported } : {}) }));
     return {
       plugins: [mk('Pro-Q 3', 'FabFilter', 'Fx|EQ'), mk('Pro-C 2', 'FabFilter', 'Fx|Dynamics'), mk('Valhalla VintageVerb', 'Valhalla DSP', 'Fx|Reverb'),
         mk('Decapitator', 'Soundtoys', 'Fx|Distortion'), mk('EchoBoy', 'Soundtoys', 'Fx|Delay'), mk('OTT', 'Xfer Records', 'Fx|Dynamics'), mk('Serum FX', 'Xfer Records', 'Fx'), ...lv2],
+      instruments: MOCK_INSTRUMENTS.map(([name, vendor, category]) => mk(name, vendor, category)),
       unavailable: {},
     };
   }
-  /** Like the engine: only a VST3 plugin has an editor window here. */
-  async pluginEditor(fxId: Id, open: boolean) {
-    const fx = this.p.inserts.flatMap(m => m.fx).find(f => f.id === fxId);
-    if (fx?.type !== 'plugin') throw new Error(`effect ${fxId} is not a loaded plugin`);
-    if (open && fx.plugin?.format === 'lv2') throw new Error('LV2 plugins are edited in WAVE\'s parameter list (their own editor windows are not supported yet)');
+  /** A loaded hosted plugin by id, like the engine's handles: an effect slot, or a plugin channel that loaded. */
+  private hosted(id: Id): PluginRef | undefined {
+    const fx = this.p.inserts.flatMap(m => m.fx).find(f => f.id === id);
+    if (fx?.type === 'plugin') return fx.plugin;
+    const ch = (this.p.channels ?? []).find(c => c.id === id);
+    return ch?.kind === 'plugin' && !this.fxErrors()[id] ? ch.plugin : undefined;
+  }
+  /** Like the engine: a plugin's own window under Synkopa's header (`label`), pinned on top when `pinned`; WAVE Demo Synth has none (plugins.rs `NO_EDITOR`). */
+  async pluginEditor(fxId: Id, open: boolean, label?: { title: string; subtitle: string }, pinned?: boolean) {
+    const pl = this.hosted(fxId);
+    if (!pl) throw new Error(`${fxId} is not a loaded plugin effect or instrument`);
+    if (open && /demo synth/i.test(pl.name)) throw new Error(ERR_NO_EDITOR + ' this plugin has no window of its own; its parameters are listed below');
+    if (open) { this.editors.set(fxId, label ?? { title: '', subtitle: '' }); this.editorPins.set(fxId, !!pinned); } else { this.editors.delete(fxId); this.editorPins.delete(fxId); }
+  }
+  private editors = new Map<Id, { title: string; subtitle: string }>();
+  private editorPins = new Map<Id, boolean>();
+  async pluginEditorOpen(fxId: Id) { return this.editors.has(fxId); }
+  /** Like the engine: the mock's sessions always exit cleanly, so nobody is ever a suspect. */
+  async pluginCrashSuspects(): Promise<PluginCrashSuspect[]> { return []; }
+  async pluginBlock(_format: string, _path: string) { /* nothing to block in the mock */ }
+  /** Plugins loaded although the safety check refused them (the engine keeps this per user, not per project). */
+  private trusted = new Set<string>();
+  async pluginLoadAnyway(fxId: Id) {
+    await delay();
+    const f = this.p.inserts.flatMap(m => m.fx).find(x => x.id === fxId);
+    const c = (this.p.channels ?? []).find(x => x.id === fxId);
+    const plugin = f?.plugin ?? (c?.kind === 'plugin' ? c.plugin : undefined);
+    if (!plugin) throw new Error(`no plugin effect or plugin channel has id ${fxId}`);
+    this.trusted.add(plugin.cid);
+    // not an edit: the state is sent again without a new revision
+    this.emit('state', this.dto());
+  }
+  /** Test hook: the output ran dry `n` times (a late callback or a driver xrun in the engine). */
+  mockUnderrun(n = 1) { this.underrunTotal += n; }
+  /** Test hook: the header a plugin window shows (undefined when closed). */
+  editorLabel(fxId: Id) { return this.editors.get(fxId); }
+  /** Test hook: whether the plugin's window is pinned on top (undefined when closed). */
+  editorPinned(fxId: Id) { return this.editorPins.get(fxId); }
+  /** Test hook: the user closed the plugin's window with its X. */
+  closeEditorWindow(fxId: Id) { this.editors.delete(fxId); this.editorPins.delete(fxId); }
+  /** Test hook: the gear in a plugin window's header. */
+  pressEditorSettings(fxId: Id) { this.emit('plugin-settings', { id: fxId }); }
+  /** Test hook: the pin in a plugin window's header (toggles, like the real header). */
+  pressEditorPin(fxId: Id) { const pinned = !this.editorPins.get(fxId); this.editorPins.set(fxId, pinned); this.emit('plugin-pin', { id: fxId, pinned }); }
+  async pluginState(fxId: Id): Promise<string> {
+    if (!this.hosted(fxId)) throw new Error(`${fxId} is not a loaded plugin effect or instrument`);
+    // the mock's "state" is its parameter values
+    return btoa(JSON.stringify((this.plugParams.get(fxId) ?? []).map(p => [p.id, p.value])));
   }
   async pluginParams(fxId: Id): Promise<PluginParam[]> {
-    const fx = this.p.inserts.flatMap(m => m.fx).find(f => f.id === fxId);
-    if (fx?.type !== 'plugin' || !fx.plugin) throw new Error(`effect ${fxId} is not a loaded plugin`);
+    const fx = { plugin: this.hosted(fxId) };
+    if (!fx.plugin) throw new Error(`${fxId} is not a loaded plugin effect or instrument`);
     const lv2 = fx.plugin.format === 'lv2' ? MOCK_LV2[fx.plugin.cid] : undefined;
     if (fx.plugin.format === 'lv2') {
       if (!lv2 || lv2.unsupported) throw new Error(`effect ${fxId} is not a loaded plugin`);
@@ -1417,8 +1865,9 @@ export class MockBackend implements Backend {
   }
   async pluginSetParam(fxId: Id, id: number, value: number) {
     if (!(value >= 0 && value <= 1)) throw new Error('plugin parameter values are normalised 0..1');
-    const fx = this.p.inserts.flatMap(m => m.fx).find(f => f.id === fxId);
-    if (fx?.plugin?.format === 'lv2') {
+    const fx = { plugin: this.hosted(fxId) };
+    if (!fx.plugin) throw new Error(`${fxId} is not a loaded plugin effect or instrument`);
+    if (fx.plugin.format === 'lv2') {
       await this.pluginParams(fxId);
       const spec = MOCK_LV2[fx.plugin.cid]?.ports.find(s => s.id === id);
       if (!spec) throw new Error(`${fx.plugin.name} has no parameter ${id}`);
@@ -1443,7 +1892,10 @@ export class MockBackend implements Backend {
     if (!url) throw new Error(`the question is too long for a link (> ${MAX_ASK_URL} characters)`);
     try { window.open(url, '_blank', 'noopener'); } catch { /* no window */ }
   }
-  async cliStatus() { return { installed: false, command: 'wave', path: null, note: t('d.mock.nocli') }; }
+  async openDiscord() {
+    try { window.open(DISCORD_URL, '_blank', 'noopener'); } catch { /* no window */ }
+  }
+  async cliStatus() { return { installed: false, command: 'synkopa', path: null, note: t('d.mock.nocli') }; }
 
   async on<K extends keyof EventMap>(ev: K, cb: (p: EventMap[K]) => void) {
     let s = this.listeners.get(ev); if (!s) this.listeners.set(ev, s = new Set());

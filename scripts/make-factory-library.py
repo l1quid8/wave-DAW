@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
 """Builds the factory sample library that ships inside the app.
 
-Every pick is a CC0 recording at a pinned commit: either a file of a kit in
-assets-manifest.json (`<kit id>/<file>`) or a path in one of SOURCES (`vcsl:<path>` …), whose
-SHA-256 is pinned under `factory` in the same manifest. The script downloads what it needs
+Every pick is a recording free to redistribute (CC0, or the Unlicense for the steel drum),
+pinned: a file of a kit in assets-manifest.json (`<kit id>/<file>`), a path in one of the
+repositories of SOURCES at a pinned commit (`vcsl:<path>` …), or a Freesound sound by its id
+(`fs:<id>`, its public high-quality preview, see FREESOUND), whose SHA-256 is pinned under
+`factory` in the same manifest. The script downloads what it needs
 into a cache and refuses a file that does not match its pin. For every pick it trims
 silence before the hit and the dead tail, fades the end, normalises the peak to -1 dBFS and
-writes 16-bit FLAC. A pick can also be a list of layers, each tuned to a key and mixed (the
+writes 16-bit FLAC without the 8 KiB of padding ffmpeg reserves (it is embedded in the app). A loop (option `loop`) is instead cut to a whole number of bars at its
+tempo, from its first sample and without fades, so it repeats in time, and stored as Ogg
+Vorbis: the Freesound loops are lossy previews already, and FLAC would make them five times
+bigger for nothing. A pick can also be a list of layers, each tuned to a key and mixed (the
 orchestra hits). It also writes the table the engine embeds
-(crates/engine/src/factory_files.rs).
+(crates/engine/src/factory_files.rs) and the credits of the files by other authors than
+Versilian and the TR-808 set (THIRD_PARTY_NOTICES.md, between the `factory-credits` marks).
 
     python3 scripts/make-factory-library.py            # rebuild
     python3 scripts/make-factory-library.py --pin      # after adding picks: record their hashes
 
 A file whose audio did not change is left as it is, so a rebuild with another ffmpeg does not
-rewrite the whole folder. Needs ffmpeg, curl and numpy.
+rewrite the whole folder (an Ogg file is rewritten only when its source or options changed:
+its tag names them). Needs ffmpeg (with libvorbis), curl and numpy.
 """
 import argparse, hashlib, json, os, subprocess, sys, urllib.parse
 import numpy as np
@@ -24,11 +31,122 @@ OUT = os.path.join(ROOT, "crates", "engine", "library")
 MANIFEST = os.path.join(ROOT, "assets-manifest.json")
 SR = 44100
 
-# CC0 repositories picks are taken from directly (the manifest's kits pin their own).
+# Repositories picks are taken from directly (the manifest's kits pin their own): repo, commit,
+# licence, and for the credits who made the recordings (None: credited in the notices' text).
 SOURCES = {
-    "808": ("tidalcycles/sounds-tr808-fischer", "85fbecf1bec32553395625ea659e2a56dfd7c0e1"),
-    "vcsl": ("sgossner/VCSL", "c1ea7bcc3c7309650ab0da9d15c9cd1fbc4a4c7e"),
-    "vsco": ("sgossner/VSCO-2-CE", "440300901dfe9275fd84e0b7763af1f8443ae62e"),
+    "808": ("tidalcycles/sounds-tr808-fischer", "85fbecf1bec32553395625ea659e2a56dfd7c0e1", "CC0-1.0", None),
+    "vcsl": ("sgossner/VCSL", "c1ea7bcc3c7309650ab0da9d15c9cd1fbc4a4c7e", "CC0-1.0", None),
+    "vsco": ("sgossner/VSCO-2-CE", "440300901dfe9275fd84e0b7763af1f8443ae62e", "CC0-1.0", None),
+    "stargate": ("stargatedaw/stargate-sample-pack", "dbfd6ec52d4ed53b60bdbea5fc6adf295127c027", "CC0-1.0", "Kevin B. (Fugue State Audio), Stargate DAW sample pack"),
+    "mck": ("MckAudio/MckSamplePacks", "5db40e8fe26785c256845a5bb38921b2654a887f", "CC0-1.0", "MckAudio, recorded from a Roland TR-8"),
+    "omi": ("Yale-OMI/sample-pack-vol-1", "9ad3da067dff97aa4bd8588a97ee0419b02c0acc", "CC0-1.0", "Yale Open Music Initiative, Sample Pack Vol. 1"),
+    "steeldrum": ("sfzinstruments/jlearman.SteelDrum", "dc15a36ad69a43b0d240fcbd0cc78fbc61b2b47e", "Unlicense", "Jeff Learman, SteelDrum"),
+}
+LICENSE_URL = {"CC0-1.0": "https://creativecommons.org/publicdomain/zero/1.0/", "Unlicense": "https://unlicense.org/"}
+# Freesound sounds released under CC0 (each one's page shows the licence): id -> (high-quality
+# preview, uploader, title). The preview is public, the original needs a login; its SHA-256 is
+# pinned in the manifest like any other source file.
+FREESOUND = {
+    "514880": ("https://cdn.freesound.org/previews/514/514880_3173681-hq.mp3", "tkky", "Sorrow State zay 808.wav"),
+    "729532": ("https://cdn.freesound.org/previews/729/729532_15200476-hq.mp3", "James_KuKu", "XXX - C"),
+    "501761": ("https://cdn.freesound.org/previews/501/501761_4600366-hq.mp3", "kbeezy88", "MPC_808_F1.aif"),
+    "353396": ("https://cdn.freesound.org/previews/353/353396_6397561-hq.mp3", "TechGeekMusic", "Kick - Proper Bottom.wav"),
+    "190942": ("https://cdn.freesound.org/previews/190/190942_2661752-hq.mp3", "Elektronikz", "808 Kick (wav format)"),
+    "240893": ("https://cdn.freesound.org/previews/240/240893_4206277-hq.mp3", "OllieOllie", "trappy kick"),
+    "517297": ("https://cdn.freesound.org/previews/517/517297_10137963-hq.mp3", "muffin3k", "Trap Snare 2"),
+    "355065": ("https://cdn.freesound.org/previews/355/355065_1973065-hq.mp3", "eryps", "Clap Snare"),
+    "75037": ("https://cdn.freesound.org/previews/75/75037_1151436-hq.mp3", "CBeeching", "Hat_04.wav"),
+    "91791": ("https://cdn.freesound.org/previews/91/91791_1491361-hq.mp3", "zinzan_101", "short open.aif"),
+    "816813": ("https://cdn.freesound.org/previews/816/816813_5511175-hq.mp3", "tboneaudio", "HellCat Hi Hats"),
+    "132418": ("https://cdn.freesound.org/previews/132/132418_2412414-hq.mp3", "Sajmund", "Rimshot (sweet)"),
+    "219266": ("https://cdn.freesound.org/previews/219/219266_170215-hq.mp3", "radiopassiveboy", "Tambourine_Single_Hit_1.wav"),
+    "199823": ("https://cdn.freesound.org/previews/199/199823_3485902-hq.mp3", "connermusician", "Egg Shaker - 1 Throw"),
+    "332604": ("https://cdn.freesound.org/previews/332/332604_167075-hq.mp3", "vckhaze", "Single Finger Snap"),
+    "177242": ("https://cdn.freesound.org/previews/177/177242_3277771-hq.mp3", "a deleted account", "Cinematic Impact"),
+    "428073": ("https://cdn.freesound.org/previews/428/428073_4067257-hq.mp3", "newagesoup", "Sub Drop Smooth.wav"),
+    "561207": ("https://cdn.freesound.org/previews/561/561207_10825267-hq.mp3", "Rizzard", "Riser"),
+    "240745": ("https://cdn.freesound.org/previews/240/240745_3215867-hq.mp3", "majoranman", "Choir One-Shot"),
+    "574346": ("https://cdn.freesound.org/previews/574/574346_11532701-hq.mp3", "deadrobotmusic", "SOS Dark Piano Loop [148bpm] [C Minor]"),
+    "428292": ("https://cdn.freesound.org/previews/428/428292_1117259-hq.mp3", "Djeuphoria", "DSV1_SuspensfulRhodes02_C#_70bpm.wav"),
+    "663687": ("https://cdn.freesound.org/previews/663/663687_9959691-hq.mp3", "Orboram", "Soft Piano Loop 160BPM"),
+    "491285": ("https://cdn.freesound.org/previews/491/491285_4882128-hq.mp3", "Xinematix", "Emotional Piano 005 (Am-80)"),
+    "484645": ("https://cdn.freesound.org/previews/484/484645_10392137-hq.mp3", "Loop_Cult", "LCCPTL_140_Synth_Am_ThinPluck.wav"),
+    "697731": ("https://cdn.freesound.org/previews/697/697731_9839964-hq.mp3", "harrisonlace", "guitar_loop_heatwave_129_F#min.wav"),
+    "474961": ("https://cdn.freesound.org/previews/474/474961_10100847-hq.mp3", "skratan", "guitar [fmin 148 bpm].wav"),
+    "521664": ("https://cdn.freesound.org/previews/521/521664_10327019-hq.mp3", "urmom123543", "Blade runner pads (Free)"),
+    "713120": ("https://cdn.freesound.org/previews/713/713120_14632469-hq.mp3", "DYEKHO", "Arabic Flute 04 130BPM"),
+    "852268": ("https://cdn.freesound.org/previews/852/852268_12574855-hq.mp3", "holizna", "Trap Melody Loop #5 Ebmin 165 BPM"),
+    "646403": ("https://cdn.freesound.org/previews/646/646403_9839964-hq.mp3", "harrisonlace", "808_dalmation_C.wav"),
+    "347136": ("https://cdn.freesound.org/previews/347/347136_369949-hq.mp3", "NovaSoundTechnology", "Custom Mini Lex Trap Snare - Nova Sound"),
+    "647745": ("https://cdn.freesound.org/previews/647/647745_9839964-hq.mp3", "harrisonlace", "clap_caviar.wav"),
+    "703686": ("https://cdn.freesound.org/previews/703/703686_11532701-hq.mp3", "deadrobotmusic", "Drk Vox Loop [120bpm] [D Minor]"),
+    "542893": ("https://cdn.freesound.org/previews/542/542893_6414380-hq.mp3", "Rippleys_Circus", "Kick (19).wav"),
+    "508909": ("https://cdn.freesound.org/previews/508/508909_10137963-hq.mp3", "muffin3k", "Trap Kick 2"),
+    "542899": ("https://cdn.freesound.org/previews/542/542899_6414380-hq.mp3", "Rippleys_Circus", "Kick (4).wav"),
+    "421108": ("https://cdn.freesound.org/previews/421/421108_8323444-hq.mp3", "Nilzner", "Gucci Kick.wav"),
+    "666823": ("https://cdn.freesound.org/previews/666/666823_4819210-hq.mp3", "Johnnie_Holiday", "JH Trap Kick (F#).wav"),
+    "501553": ("https://cdn.freesound.org/previews/501/501553_10137963-hq.mp3", "muffin3k", "Trap Kick 1"),
+    "832660": ("https://cdn.freesound.org/previews/832/832660_17675683-hq.mp3", "CAT-FOX_ALEX", "Phonk Kick 4"),
+    "542877": ("https://cdn.freesound.org/previews/542/542877_6414380-hq.mp3", "Rippleys_Circus", "Kick (11).wav"),
+    "717631": ("https://cdn.freesound.org/previews/717/717631_15556857-hq.mp3", "nobody0101", "Short Kick"),
+    "691738": ("https://cdn.freesound.org/previews/691/691738_4819210-hq.mp3", "Johnnie_Holiday", "JH Kick 6 (F 100 bpm).wav"),
+    "866443": ("https://cdn.freesound.org/previews/866/866443_17675683-hq.mp3", "CAT-FOX_ALEX", "Rnb Kick 5"),
+    "836743": ("https://cdn.freesound.org/previews/836/836743_17675683-hq.mp3", "CAT-FOX_ALEX", "Phonk Kick 1"),
+    "704245": ("https://cdn.freesound.org/previews/704/704245_9839964-hq.mp3", "harrisonlace", "kick_uppercut.wav"),
+    "542889": ("https://cdn.freesound.org/previews/542/542889_6414380-hq.mp3", "Rippleys_Circus", "Kick (7).wav"),
+    "729513": ("https://cdn.freesound.org/previews/729/729513_15200476-hq.mp3", "James_KuKu", "Rough And Tumble - C"),
+    "729507": ("https://cdn.freesound.org/previews/729/729507_15200476-hq.mp3", "James_KuKu", "Oak - C"),
+    "729512": ("https://cdn.freesound.org/previews/729/729512_15200476-hq.mp3", "James_KuKu", "Poster - C"),
+    "729508": ("https://cdn.freesound.org/previews/729/729508_15200476-hq.mp3", "James_KuKu", "Outer Edge - C"),
+    "729468": ("https://cdn.freesound.org/previews/729/729468_15200476-hq.mp3", "James_KuKu", "Chill Blaster - C"),
+    "729491": ("https://cdn.freesound.org/previews/729/729491_15200476-hq.mp3", "James_KuKu", "Heartless - C"),
+    "729464": ("https://cdn.freesound.org/previews/729/729464_15200476-hq.mp3", "James_KuKu", "Box - C"),
+    "729490": ("https://cdn.freesound.org/previews/729/729490_15200476-hq.mp3", "James_KuKu", "Gucci Gang - C"),
+    "729484": ("https://cdn.freesound.org/previews/729/729484_15200476-hq.mp3", "James_KuKu", "Fort Night - C"),
+    "679775": ("https://cdn.freesound.org/previews/679/679775_4819210-hq.mp3", "Johnnie_Holiday", "Drill 808 bass (JH).wav"),
+    "679780": ("https://cdn.freesound.org/previews/679/679780_4819210-hq.mp3", "Johnnie_Holiday", "JH 808 2 C (1 sec).wav"),
+    "635285": ("https://cdn.freesound.org/previews/635/635285_11990934-hq.mp3", "1LOVE", "Cuff 808 [1lovewav]"),
+    "679781": ("https://cdn.freesound.org/previews/679/679781_4819210-hq.mp3", "Johnnie_Holiday", "JH 808 3 C (2 sec).wav"),
+    "679779": ("https://cdn.freesound.org/previews/679/679779_4819210-hq.mp3", "Johnnie_Holiday", "JH 808 1 C (0.5 sec).wav"),
+    "729480": ("https://cdn.freesound.org/previews/729/729480_15200476-hq.mp3", "James_KuKu", "Drop - C"),
+    "506452": ("https://cdn.freesound.org/previews/506/506452_4600366-hq.mp3", "kbeezy88", "505 CLOSEDHH.wav"),
+    "509965": ("https://cdn.freesound.org/previews/509/509965_8033171-hq.mp3", "blakengouda", "Hi-Hat Closed 10.mp3"),
+    "509968": ("https://cdn.freesound.org/previews/509/509968_8033171-hq.mp3", "blakengouda", "Hi-Hat Closed 6.mp3"),
+    "509971": ("https://cdn.freesound.org/previews/509/509971_8033171-hq.mp3", "blakengouda", "Hi-Hat Closed 9.mp3"),
+    "542802": ("https://cdn.freesound.org/previews/542/542802_6414380-hq.mp3", "Rippleys_Circus", "Hihat 8.wav"),
+    "542796": ("https://cdn.freesound.org/previews/542/542796_6414380-hq.mp3", "Rippleys_Circus", "Hihat 2.wav"),
+    "513363": ("https://cdn.freesound.org/previews/513/513363_938351-hq.mp3", "pomeroyjoshua", "HH Cl 02.wav"),
+    "513367": ("https://cdn.freesound.org/previews/513/513367_938351-hq.mp3", "pomeroyjoshua", "HH Cl 06.wav"),
+    "588131": ("https://cdn.freesound.org/previews/588/588131_11532701-hq.mp3", "deadrobotmusic", "DR Hi Hat 049"),
+    "509984": ("https://cdn.freesound.org/previews/509/509984_8033171-hq.mp3", "blakengouda", "Hi-Hat Open 1.mp3"),
+    "612837": ("https://cdn.freesound.org/previews/612/612837_12074381-hq.mp3", "PopoMagoo", "Hat Open.wav"),
+    "513383": ("https://cdn.freesound.org/previews/513/513383_938351-hq.mp3", "pomeroyjoshua", "HH Op 03.wav"),
+    "240434": ("https://cdn.freesound.org/previews/240/240434_4181817-hq.mp3", "WillOlis", "Punchy Snare"),
+    "399747": ("https://cdn.freesound.org/previews/399/399747_7079194-hq.mp3", "nbmusic098", "Trap Snare 1"),
+    "169950": ("https://cdn.freesound.org/previews/169/169950_2875663-hq.mp3", "Musictart", "Punchy Snare 4 (Small Tail).wav"),
+    "542850": ("https://cdn.freesound.org/previews/542/542850_6414380-hq.mp3", "Rippleys_Circus", "Snare (10).wav"),
+    "632704": ("https://cdn.freesound.org/previews/632/632704_12672694-hq.mp3", "adh.dreaming", "Fly on the Wall Snare"),
+    "542851": ("https://cdn.freesound.org/previews/542/542851_6414380-hq.mp3", "Rippleys_Circus", "Snare (1).wav"),
+    "542866": ("https://cdn.freesound.org/previews/542/542866_6414380-hq.mp3", "Rippleys_Circus", "Snare (21).wav"),
+    "542873": ("https://cdn.freesound.org/previews/542/542873_6414380-hq.mp3", "Rippleys_Circus", "Snare (22).wav"),
+    "577235": ("https://cdn.freesound.org/previews/577/577235_11532701-hq.mp3", "deadrobotmusic", "DR Snare 058"),
+    "577207": ("https://cdn.freesound.org/previews/577/577207_11532701-hq.mp3", "deadrobotmusic", "DR Snare 112"),
+    "577226": ("https://cdn.freesound.org/previews/577/577226_11532701-hq.mp3", "deadrobotmusic", "DR Snare 102"),
+    "320870": ("https://cdn.freesound.org/previews/320/320870_2381150-hq.mp3", "alexthegr81", "Dirty Snare.wav"),
+    "252743": ("https://cdn.freesound.org/previews/252/252743_1939565-hq.mp3", "choomaque-crispydinner", "CRDN_UpgrSn_009.wav"),
+    "355068": ("https://cdn.freesound.org/previews/355/355068_1973065-hq.mp3", "eryps", "Low Snare Hit"),
+    "199266": ("https://cdn.freesound.org/previews/199/199266_1332991-hq.mp3", "Stumber", "Diamond_Clap_05.wav"),
+    "542834": ("https://cdn.freesound.org/previews/542/542834_6414380-hq.mp3", "Rippleys_Circus", "Clap  (7).wav"),
+    "513415": ("https://cdn.freesound.org/previews/513/513415_938351-hq.mp3", "pomeroyjoshua", "Anu Clap 01.wav"),
+    "542837": ("https://cdn.freesound.org/previews/542/542837_6414380-hq.mp3", "Rippleys_Circus", "Clap  (9).wav"),
+    "532248": ("https://cdn.freesound.org/previews/532/532248_473017-hq.mp3", "JoshuaPomeroy", "Snap Layered 05.wav"),
+    "542831": ("https://cdn.freesound.org/previews/542/542831_6414380-hq.mp3", "Rippleys_Circus", "Clap  (2).wav"),
+    "828843": ("https://cdn.freesound.org/previews/828/828843_17675683-hq.mp3", "CAT-FOX_ALEX", "Clap 1"),
+    "513421": ("https://cdn.freesound.org/previews/513/513421_938351-hq.mp3", "pomeroyjoshua", "Anu Clap 09.wav"),
+    "513413": ("https://cdn.freesound.org/previews/513/513413_938351-hq.mp3", "pomeroyjoshua", "Anu Clap 03.wav"),
+    "513419": ("https://cdn.freesound.org/previews/513/513419_938351-hq.mp3", "pomeroyjoshua", "Anu Clap 05.wav"),
+    "532245": ("https://cdn.freesound.org/previews/532/532245_473017-hq.mp3", "JoshuaPomeroy", "Snap Layered 08.wav"),
+    "532246": ("https://cdn.freesound.org/previews/532/532246_473017-hq.mp3", "JoshuaPomeroy", "Snap Layered 07.wav"),
 }
 I = "vcsl:Idiophones/Struck Idiophones/"
 M = "vcsl:Membranophones/Struck Membranophones/"
@@ -93,22 +211,48 @@ PIZZ = [
 
 # (output file, display name, group, source, max seconds, root key[, options])
 # root key None = measured (`pitch`). Options: tune (resample so the note is exactly on the
-# root key given), soft (keep a quiet start: swells), drive (dB into a tanh saturator).
+# root key given), soft (keep a quiet start: swells), drive (dB into a tanh saturator),
+# unlisted (keep embedded for saved projects, omit from the browser),
+# loop ((bpm, bars): a loop of that many bars, see the module comment; max seconds unused).
 T = {"tune": True}
 SOFT = {"soft": True}
+UNLISTED = {"unlisted": True}
+SG = "stargate:stargate-sample-pack/fugue-state-audio/drums/"
+TR8 = "mck:TR8/"
+
+
+def loop(bpm, bars):
+    return {"loop": (bpm, bars)}
 PICKS = [
     ("kick-808.flac", "808 Kick", "Kicks", "808-kit/kick-tone50-decay50.wav", 1.2, 60),
     ("kick-808-short.flac", "808 Kick Short", "Kicks", "808-kit/kick-tone00-decay25.wav", 0.5, 60),
-    ("kick-808-tight.flac", "808 Kick Tight", "Kicks", "808-kit/kick-tone50-decay00.wav", 0.25, 60),
-    ("kick-808-bright.flac", "808 Kick Bright", "Kicks", "808-kit/kick-tone100-decay25.wav", 0.5, 60),
+    ("kick-808-tight.flac", "808 Kick Tight", "Kicks", "808-kit/kick-tone50-decay00.wav", 0.25, 60, UNLISTED),
+    ("kick-808-bright.flac", "808 Kick Bright", "Kicks", "808-kit/kick-tone100-decay25.wav", 0.5, 60, UNLISTED),
     ("kick-studio.flac", "Studio Kick", "Kicks", "studio-drums/kick-v4.wav", 0.9, 60),
-    ("kick-studio-soft.flac", "Studio Kick Soft", "Kicks", "studio-drums/kick-v3.wav", 0.9, 60),
+    ("kick-studio-soft.flac", "Studio Kick Soft", "Kicks", "studio-drums/kick-v3.wav", 0.9, 60, UNLISTED),
     ("kick-cajon.flac", "Cajon Kick", "Kicks", "percussion-fx/cajon-bass-v3.wav", 0.9, 60),
-    ("kick-808-long.flac", "808 Kick Long", "Kicks", "808:bd8/BD5075.WAV", 1.5, 60),
-    ("kick-808-boom.flac", "808 Kick Boom", "Kicks", "808:bd8/BD0010.WAV", 2.0, 60),
-    ("kick-808-deep.flac", "808 Kick Deep", "Kicks", "808:bd8/BD0075.WAV", 1.5, 60),
-    ("kick-808-punch.flac", "808 Kick Punch", "Kicks", "808:bd8/BD7550.WAV", 1.2, 60),
-    ("kick-808-click.flac", "808 Kick Click", "Kicks", "808:bd8/BD1000.WAV", 0.25, 60),
+    ("kick-808-long.flac", "808 Kick Long", "Kicks", "808:bd8/BD5075.WAV", 1.5, 60, UNLISTED),
+    ("kick-808-boom.flac", "808 Kick Boom", "Kicks", "808:bd8/BD0010.WAV", 2.0, 60, UNLISTED),
+    ("kick-808-deep.flac", "808 Kick Deep", "Kicks", "808:bd8/BD0075.WAV", 1.5, 60, UNLISTED),
+    ("kick-808-punch.flac", "808 Kick Punch", "Kicks", "808:bd8/BD7550.WAV", 1.2, 60, UNLISTED),
+    ("kick-808-click.flac", "808 Kick Click", "Kicks", "808:bd8/BD1000.WAV", 0.25, 60, UNLISTED),
+    ("kick-trap.flac", "Trap Kick", "Kicks", "fs:353396", 0.8, 60, UNLISTED),
+    ("kick-trap-knock.flac", "Trap Kick Knock", "Kicks", "fs:190942", 1.0, 60, UNLISTED),
+    ("kick-trap-boom.flac", "Trap Kick Boom", "Kicks", "fs:240893", 1.6, 60, UNLISTED),
+    ("kick-trap-rack.flac", "Trap Kick Rack", "Kicks", "fs:542893", 0.5, 60),
+    ("kick-trap-knock-2.flac", "Trap Kick Knock 2", "Kicks", "fs:508909", 0.5, 60),
+    ("kick-trap-clip.flac", "Trap Kick Clip", "Kicks", "fs:542899", 0.5, 60),
+    ("kick-trap-hard.flac", "Trap Kick Hard", "Kicks", "fs:421108", 0.5, 60),
+    ("kick-trap-punch.flac", "Trap Kick Punch", "Kicks", "fs:666823", 0.5, 60),
+    ("kick-trap-top.flac", "Trap Kick Top", "Kicks", "fs:501553", 0.4, 60),
+    ("kick-trap-phonk.flac", "Trap Kick Phonk", "Kicks", "fs:832660", 0.5, 60),
+    ("kick-trap-tight.flac", "Trap Kick Tight", "Kicks", "fs:542877", 0.5, 60),
+    ("kick-trap-bounce.flac", "Trap Kick Bounce", "Kicks", "fs:717631", 0.5, 60),
+    ("kick-trap-stomp.flac", "Trap Kick Stomp", "Kicks", "fs:691738", 0.6, 60),
+    ("kick-trap-clean.flac", "Trap Kick Clean", "Kicks", "fs:866443", 0.5, 60),
+    ("kick-trap-brick.flac", "Trap Kick Brick", "Kicks", "fs:836743", 0.4, 60),
+    ("kick-trap-heavy.flac", "Trap Kick Heavy", "Kicks", "fs:704245", 0.5, 60),
+    ("kick-trap-dark.flac", "Trap Kick Dark", "Kicks", "fs:542889", 0.5, 60),
     ("snare-808.flac", "808 Snare", "Snares", "808-kit/snare-tone50-snap75.wav", 0.5, 60),
     ("snare-808-bright.flac", "808 Snare Bright", "Snares", "808-kit/snare-tone100-snap75.wav", 0.5, 60),
     ("snare-808-dark.flac", "808 Snare Dark", "Snares", "808-kit/snare-tone00-snap75.wav", 0.5, 60),
@@ -127,12 +271,46 @@ PICKS = [
     ("crossstick-studio.flac", "Studio Cross Stick", "Snares", M + "Snare Drum, Modern 3/Snare4_Xstick_v2_rr1_Mid.wav", 0.6, 60),
     ("snare-rope.flac", "Rope Snare", "Snares", M + "Snare Drum, Rope Tension/Hi/RopeSnare_hi_sn_Main_vl4_rr1.wav", 1.2, 60),
     ("snare-field.flac", "Field Drum", "Snares", M + "Snare Drum, Rope Tension/Low/RopeSnare_low_sn_Main_vl3_rr1.wav", 1.4, 60),
+    ("snare-trap.flac", "Trap Snare", "Snares", "fs:517297", 0.5, 60),
+    ("snare-trap-crisp.flac", "Trap Snare Crisp", "Snares", "fs:347136", 0.6, 60),
+    ("snare-tr8.flac", "TR-8 Snare", "Snares", TR8 + "SD/001_808_Snare_Drum_1.wav", 0.6, 60),
+    ("rimshot-tight.flac", "Rimshot Tight", "Snares", "fs:132418", 1.1, 60),
+    ("snare-trap-punch.flac", "Trap Snare Punch", "Snares", "fs:240434", 0.6, 60),
+    ("snare-trap-tight.flac", "Trap Snare Tight", "Snares", "fs:399747", 0.6, 60),
+    ("snare-trap-hard.flac", "Trap Snare Hard", "Snares", "fs:169950", 0.6, 60),
+    ("snare-trap-sharp.flac", "Trap Snare Sharp", "Snares", "fs:542850", 0.6, 60),
+    ("snare-trap-classic.flac", "Trap Snare Classic", "Snares", "fs:632704", 0.6, 60),
+    ("snare-trap-layered.flac", "Trap Snare Layered", "Snares", "fs:542851", 0.6, 60),
+    ("snare-trap-clean.flac", "Trap Snare Clean", "Snares", "fs:542866", 0.6, 60),
+    ("snare-trap-smack.flac", "Trap Snare Smack", "Snares", "fs:542873", 0.6, 60),
+    ("snare-trap-clap.flac", "Trap Snare Clap", "Snares", "fs:577235", 0.6, 60),
+    ("snare-trap-round.flac", "Trap Snare Round", "Snares", "fs:577207", 0.6, 60),
+    ("snare-trap-snap.flac", "Trap Snare Snap", "Snares", "fs:577226", 0.6, 60),
+    ("snare-trap-dirty.flac", "Trap Snare Dirty", "Snares", "fs:320870", 0.6, 60),
+    ("snare-trap-rage.flac", "Trap Snare Rage", "Snares", "fs:252743", 0.2, 60),
+    ("snare-trap-low.flac", "Trap Snare Low", "Snares", "fs:355068", 0.6, 60),
     ("clap-808.flac", "808 Clap", "Claps", "808-kit/clap.wav", 1.0, 60),
     ("clap-hand.flac", "Hand Clap", "Claps", "percussion-fx/clap-v4.wav", 0.45, 60),
     ("clap-hand-soft.flac", "Hand Clap Soft", "Claps", "percussion-fx/clap-v3.wav", 0.6, 60),
     ("clap-group.flac", "Group Clap", "Claps", I + "Claps/Clap_rr1.wav", 0.7, 60),
     ("clap-group-2.flac", "Group Clap 2", "Claps", I + "Claps/Clap_rr4.wav", 0.7, 60),
     ("whip.flac", "Whip Crack", "Claps", I + "Slapstick/slapstick_rr1.wav", 0.6, 60),
+    ("clap-snare.flac", "Clap Snare", "Claps", "fs:355065", 0.7, 60),
+    ("clap-trap-crisp.flac", "Trap Clap Crisp", "Claps", "fs:647745", 0.4, 60),
+    ("clap-tr8.flac", "TR-8 Clap", "Claps", TR8 + "PERC/017_808_Hand_Clap.wav", 0.8, 60),
+    ("clap-trap-punch.flac", "Trap Clap Punch", "Claps", "fs:199266", 0.5, 60),
+    ("clap-trap-warm.flac", "Trap Clap Warm", "Claps", "fs:542834", 0.5, 60),
+    ("clap-trap-thick.flac", "Trap Clap Thick", "Claps", "fs:513415", 0.5, 60),
+    ("clap-trap-layered.flac", "Trap Clap Layered", "Claps", "fs:542837", 0.5, 60),
+    ("clap-trap-tight.flac", "Trap Clap Tight", "Claps", "fs:532248", 0.5, 60),
+    ("clap-trap-bright.flac", "Trap Clap Bright", "Claps", "fs:542831", 0.5, 60),
+    ("clap-trap-hard.flac", "Trap Clap Hard", "Claps", "fs:828843", 0.5, 60),
+    ("clap-trap-short.flac", "Trap Clap Short", "Claps", "fs:513421", 0.5, 60),
+    ("clap-trap-gritty.flac", "Trap Clap Gritty", "Claps", "fs:513413", 0.5, 60),
+    ("clap-trap-sharp.flac", "Trap Clap Sharp", "Claps", "fs:513419", 0.5, 60),
+    ("clap-trap-click.flac", "Trap Clap Click", "Claps", "fs:532245", 0.5, 60),
+    ("clap-trap-clean.flac", "Trap Clap Clean", "Claps", "fs:532246", 0.5, 60),
+    ("finger-snap.flac", "Finger Snap", "Claps", "fs:332604", 0.4, 60),
     ("hat-808-closed.flac", "808 Closed Hat", "Hats", "808-kit/hat-closed.wav", 0.25, 60),
     ("hat-808-open.flac", "808 Open Hat", "Hats", "808-kit/hat-open-decay75.wav", 0.75, 60),
     ("hat-808-pedal.flac", "808 Pedal Hat", "Hats", "808-kit/hat-open-decay00.wav", 0.25, 60),
@@ -144,6 +322,24 @@ PICKS = [
     ("hat-studio-soft.flac", "Studio Closed Hat Soft", "Hats", I + "Hi-Hat Cymbal/HiHat_HitC_v2_rr1_Mid.wav", 0.5, 60),
     ("hat-studio-loose.flac", "Studio Loose Hat", "Hats", I + "Hi-Hat Cymbal/HiHat_HitLoose_rr1_Mid.wav", 1.2, 60),
     ("hat-studio-openclose.flac", "Studio Hat Open-Close", "Hats", I + "Hi-Hat Cymbal/HiHat_HitOC_rr5_Mid.wav", 1.2, 60),
+    ("hat-trap-tick.flac", "Trap Hat Tick", "Hats", "fs:75037", 0.3, 60),
+    ("hat-x0x.flac", "x0x Hat", "Hats", SG + "hihats/x0xproc2-hatclsd.wav", 0.2, 60),
+    ("hat-tr8-closed.flac", "TR-8 Closed Hat", "Hats", TR8 + "HATS/004_808_Closed_HiHat_Short.wav", 0.3, 60),
+    ("hat-tr8-open.flac", "TR-8 Open Hat", "Hats", TR8 + "HATS/001_808_Open_HiHat.wav", 1.0, 60),
+    ("hat-open-choked.flac", "Open Hat Choked", "Hats", "fs:91791", 0.4, 60),
+    ("hat-open-zildjian.flac", "Open Hat Zildjian", "Hats", "fs:816813", 1.6, 60),
+    ("hat-trap-punch.flac", "Trap Hat Punch", "Hats", "fs:506452", 0.3, 60),
+    ("hat-trap-crisp.flac", "Trap Hat Crisp", "Hats", "fs:509965", 0.3, 60),
+    ("hat-trap-sharp.flac", "Trap Hat Sharp", "Hats", "fs:509968", 0.3, 60),
+    ("hat-trap-bright.flac", "Trap Hat Bright", "Hats", "fs:509971", 0.3, 60),
+    ("hat-trap-tight.flac", "Trap Hat Tight", "Hats", "fs:542802", 0.3, 60),
+    ("hat-trap-snap.flac", "Trap Hat Snap", "Hats", "fs:542796", 0.3, 60),
+    ("hat-trap-cut.flac", "Trap Hat Cut", "Hats", "fs:513363", 0.3, 60),
+    ("hat-trap-classic.flac", "Trap Hat Classic", "Hats", "fs:513367", 0.3, 60),
+    ("hat-trap-metal.flac", "Trap Hat Metal", "Hats", "fs:588131", 0.3, 60),
+    ("hat-trap-open-smooth.flac", "Trap Open Hat Smooth", "Hats", "fs:509984", 0.8, 60),
+    ("hat-trap-open-bright.flac", "Trap Open Hat Bright", "Hats", "fs:612837", 0.8, 60),
+    ("hat-trap-open-short.flac", "Trap Open Hat Short", "Hats", "fs:513383", 0.8, 60),
     ("cymbal-808.flac", "808 Cymbal", "Cymbals", "808-kit/cymbal-tone50-decay50.wav", 2.5, 60),
     ("crash-studio.flac", "Studio Crash", "Cymbals", "studio-drums/crash-v3.wav", 5.0, 60),
     ("ride-studio.flac", "Studio Ride", "Cymbals", "studio-drums/ride-v3.wav", 3.0, 60),
@@ -196,16 +392,40 @@ PICKS = [
     ("log-drum-low.flac", "Log Drum Low", "Percussion", I + "Slit Drum/LogDrumLo_MedM_v3_rr1_Sum.wav", 1.0, 60),
     ("anvil.flac", "Anvil", "Percussion", I + "Anvil/Anvil_Hit1_v3_rr1_Mid.wav", 1.5, 60),
     ("brake-drum.flac", "Brake Drum", "Percussion", I + "Brake Drum/BrakeDrum1_Hammer_v3_rr1_Mid.wav", 2.0, 60),
-    # tonal: the root key is measured (see `pitch`) so the piano plays them in tune
-    ("bass-808.flac", "808 Bass", "Tonal", "808-bass/bass-tone100-decay100.wav", 3.0, None),
-    ("bass-808-short.flac", "808 Bass Short", "Tonal", "808-bass/bass-tone75-decay75.wav", 1.2, None),
+    ("tambourine-hit.flac", "Tambourine Hit", "Percussion", "fs:219266", 1.2, 60),
+    ("egg-shaker.flac", "Egg Shaker", "Percussion", "fs:199823", 0.5, 60),
+    # Pitched 808s, using the measured root and octave.
+    ("bass-808.flac", "808 Bass", "808", "808-bass/bass-tone100-decay100.wav", 3.0, None),
+    ("bass-808-short.flac", "808 Bass Short", "808", "808-bass/bass-tone75-decay75.wav", 1.2, None),
+    ("bass-808-zay.flac", "808 Zay Warm", "808", "fs:729513", 2.5, 24),
+    ("bass-808-oak.flac", "808 Spinz Clean", "808", "fs:729507", 2.5, 24),
+    ("bass-808-opium.flac", "808 Opium Growl", "808", "fs:729512", 3, 24),
+    ("bass-808-mafia.flac", "808 Mafia Grit", "808", "fs:729508", 2.5, 24),
+    ("bass-808-clip.flac", "808 Distorted Clip", "808", "fs:729468", 2.5, 24),
+    ("bass-808-metro.flac", "808 Metro Deep", "808", "fs:729491", 3, 24),
+    ("bass-808-pierre.flac", "808 Pierre Short", "808", "fs:729464", 1.2, 24),
+    ("bass-808-roar.flac", "808 Overdrive Roar", "808", "fs:729490", 2.5, 24),
+    ("bass-808-rage.flac", "808 Rage Buzz", "808", "fs:729484", 2.5, 24),
+    ("bass-808-drill.flac", "808 Drill Glide", "808", "fs:679775", 2.5, 24),
+    ("bass-808-ctm.flac", "808 CTM Tight", "808", "fs:679780", 1.5, 24),
+    ("bass-808-cuff.flac", "808 Southside Dark", "808", "fs:635285", 3, 24),
+    ("bass-808-pure.flac", "808 Sub Pure", "808", "fs:679781", 2.5, 24),
+    ("bass-808-plugg.flac", "808 Plugg Short", "808", "fs:679779", 1.2, 24),
+    ("bass-808-tube.flac", "808 Dark Tube", "808", "fs:729480", 3, 24),
+    ("bass-808-deep.flac", "808 Bass Deep", "808", "808:bd8/BD0010.WAV", 3.0, None, UNLISTED),
+    ("bass-808-mid.flac", "808 Bass Mid", "808", "808:bd8/BD5010.WAV", 3.0, None, UNLISTED),
+    ("bass-808-punch.flac", "808 Bass Punch", "808", "808:bd8/BD7575.WAV", 1.5, None, UNLISTED),
+    ("bass-808-drive.flac", "808 Bass Drive", "808", "808-bass/bass-tone100-decay100.wav", 3.0, None, {"drive": 14, "unlisted": True}),
+    ("bass-808-sorrow.flac", "808 Bass Sorrow", "808", "fs:514880", 3.0, None, UNLISTED),
+    ("bass-808-sub.flac", "808 Bass Sub", "808", "fs:729532", 2.5, None, UNLISTED),
+    ("bass-808-mpc.flac", "808 Bass MPC", "808", "fs:501761", 1.0, None, UNLISTED),
+    ("bass-808-sine.flac", "808 Bass Sine", "808", SG + "kicks/sdbkit-sub-a.wav", 2.0, None, UNLISTED),
+    ("bass-808-tr8.flac", "808 Bass TR-8", "808", TR8 + "BD/008_808_Bass_Drum_Long_2.wav", 5.0, None, UNLISTED),
+    ("bass-808-spin.flac", "808 Bass Spin", "808", "fs:646403", 2.0, None, UNLISTED),
+    # Tonal instruments.
     ("marimba.flac", "Marimba", "Tonal", "marimba/marimba-C4-loud.wav", 2.5, 60),
     ("marimba-low.flac", "Marimba Low", "Tonal", "marimba/marimba-C2-loud.wav", 3.5, 36),
     ("glockenspiel.flac", "Glockenspiel", "Tonal", "glockenspiel/glockenspiel-C6-loud.wav", 3.0, 84),
-    ("bass-808-deep.flac", "808 Bass Deep", "Tonal", "808:bd8/BD0010.WAV", 3.0, None),
-    ("bass-808-mid.flac", "808 Bass Mid", "Tonal", "808:bd8/BD5010.WAV", 3.0, None),
-    ("bass-808-punch.flac", "808 Bass Punch", "Tonal", "808:bd8/BD7575.WAV", 1.5, None),
-    ("bass-808-drive.flac", "808 Bass Drive", "Tonal", "808-bass/bass-tone100-decay100.wav", 3.0, None, {"drive": 14}),
     ("vibraphone.flac", "Vibraphone", "Tonal", I + "Vibraphone/Hard Mallets/Vibes_hard_C3_v3_rr1_Main.wav", 4.0, 60, T),
     ("vibraphone-high.flac", "Vibraphone High", "Tonal", I + "Vibraphone/Hard Mallets/Vibes_hard_C5_v3_rr1_Main.wav", 3.0, 84, T),
     ("xylophone.flac", "Xylophone", "Tonal", I + "Xylophone/Hard Mallets/Xylo_Hard_C5_ff_01_far.wav", 1.5, 84, T),
@@ -218,6 +438,8 @@ PICKS = [
     ("fm-clav.flac", "FM Clav", "Tonal", "vcsl:Electrophones/TX81Z/Clavisynth/Clavisynth_C2_vl3.wav", 2.0, 48, T),
     ("pipe-organ.flac", "Pipe Organ", "Tonal", "vcsl:Aerophones/Edge-blown Aerophones/Pipe Organ/Loud/Rode_Man3Open_C3.wav", 3.0, 60, T),
     ("tenor-sax.flac", "Tenor Sax Staccato", "Tonal", "vcsl:Aerophones/Reed Aerophones/Tenor Saxophone/Staccato/BrettTenor_Staccato_Main_C3_vl2_rr4.wav", 1.5, 60, T),
+    ("choir-shot.flac", "Choir Shot", "Tonal", "fs:240745", 2.0, 68, T),
+    ("steel-drum.flac", "Steel Drum", "Tonal", "steeldrum:flac/SteelDrum_072__C5_3-2.flac", 2.5, 72, T),
     # orchestra: single notes are tuned, the stabs and hits are layers on C
     ("orch-hit.flac", "Orchestra Hit", "Orchestra", hit(None), 2.5, 60),
     ("orch-hit-minor.flac", "Orchestra Hit Minor", "Orchestra", hit(3), 2.5, 60),
@@ -248,6 +470,22 @@ PICKS = [
     ("wind-chimes-up.flac", "Wind Chimes Up", "FX", I + "Mark Trees/Legacy/windchimes_asc1.wav", 4.0, 60, SOFT),
     ("bell-tree.flac", "Bell Tree", "FX", I + "Bell Tree/Stroke/BellTree_Stroke_1_Mid.wav", 3.0, 60, SOFT),
     ("zap.flac", "Zap", "FX", "vsco:Percussion/zap1_v1.wav", 1.5, 60),
+    ("cinematic-impact.flac", "Cinematic Impact", "FX", "fs:177242", 8.0, 60),
+    ("sub-drop.flac", "Sub Drop", "FX", "fs:428073", 4.0, 60),
+    ("downlifter-dark.flac", "Dark Downlifter", "FX", "omi:OMI_FX/OMI_fx_downlifter_melodic.wav", 6.0, 60),
+    ("riser-drone.flac", "Drone Riser", "FX", "fs:561207", 2.5, 60, SOFT),
+    # loops: tempo and key are in the name (the library has no fields for them)
+    ("loop-keys-sinister-148-cmin.ogg", "Keys Sinister 148 Cm", "Loops", "fs:574346", 0, 60, loop(148, 16)),
+    ("loop-rhodes-suspense-70-csharpmin.ogg", "Rhodes Suspense 70 C#m", "Loops", "fs:428292", 0, 60, loop(70, 4)),
+    ("loop-rhodes-dream-160.ogg", "Rhodes Dream 160", "Loops", "fs:663687", 0, 60, loop(160, 8)),
+    ("loop-piano-emotional-80-amin.ogg", "Piano Emotional 80 Am", "Loops", "fs:491285", 0, 60, loop(80, 4)),
+    ("loop-piano-arp-165-ebmin.ogg", "Piano Arp 165 Ebm", "Loops", "fs:852268", 0, 60, loop(165, 16)),
+    ("loop-pluck-eerie-140-amin.ogg", "Pluck Eerie 140 Am", "Loops", "fs:484645", 0, 60, loop(140, 4)),
+    ("loop-guitar-acoustic-129-fsharpmin.ogg", "Guitar Acoustic 129 F#m", "Loops", "fs:697731", 0, 60, loop(129, 4)),
+    ("loop-guitar-nylon-148-fmin.ogg", "Guitar Nylon 148 Fm", "Loops", "fs:474961", 0, 60, loop(148, 8)),
+    ("loop-pad-cinematic-110-ebmin.ogg", "Pad Cinematic 110 Ebm", "Loops", "fs:521664", 0, 60, loop(110, 4)),
+    ("loop-flute-eastern-130-cmin.ogg", "Flute Eastern 130 Cm", "Loops", "fs:713120", 0, 60, loop(130, 8)),
+    ("loop-vox-dark-120-dmin.ogg", "Vox Dark 120 Dm", "Loops", "fs:703686", 0, 60, loop(120, 4)),
 ]
 
 
@@ -268,8 +506,11 @@ class Fetch:
     def path(self, src):
         if ":" in src:
             key, rel = src.split(":", 1)
-            repo, commit = SOURCES[key]
-            url = f"https://raw.githubusercontent.com/{repo}/{commit}/{urllib.parse.quote(rel)}"
+            if key == "fs":
+                url = FREESOUND[rel][0]
+            else:
+                repo, commit = SOURCES[key][:2]
+                url = f"https://raw.githubusercontent.com/{repo}/{commit}/{urllib.parse.quote(rel)}"
             e = self.pins.get((key, rel))
             if e is None and not self.pin:
                 sys.exit(f"{src} is not pinned in assets-manifest.json; run with --pin")
@@ -295,7 +536,10 @@ class Fetch:
     def write_pins(self):
         """The `factory` section: the repositories and exactly the files the picks use."""
         self.m["factory"] = {
-            "sources": {k: {"repo": f"https://github.com/{r}", "commit": c, "license": "CC0-1.0"} for k, (r, c) in SOURCES.items()},
+            "sources": {
+                **{k: {"repo": f"https://github.com/{r}", "commit": c, "license": lic} for k, (r, c, lic, _) in SOURCES.items()},
+                "fs": {"site": "https://freesound.org", "license": "CC0-1.0", "files": "high-quality previews of CC0 sounds"},
+            },
             "files": [self.used[k] for k in sorted(self.used)],
         }
         with open(MANIFEST, "w", newline="\n") as f:
@@ -429,8 +673,104 @@ def prepare(x, max_s, soft=False):
     return (x[:, :1] if mono else x), mono
 
 
+def strip_padding(path):
+    """Drop the FLAC's PADDING blocks (ffmpeg reserves 8 KiB in every file for tags written
+    later; the embedded library never gets any). The audio frames are untouched. True if the
+    file changed."""
+    with open(path, "rb") as f:
+        b = f.read()
+    assert b[:4] == b"fLaC", path
+    i, keep, padded = 4, [], False
+    while True:
+        h, n = b[i], int.from_bytes(b[i + 1:i + 4], "big")
+        if h & 0x7F == 1:
+            padded = True
+        else:
+            keep.append(bytearray(b[i:i + 4 + n]))
+        i += 4 + n
+        if h & 0x80:
+            break
+    if not padded:
+        return False
+    for k in keep:
+        k[0] &= 0x7F
+    keep[-1][0] |= 0x80
+    with open(path, "wb") as f:
+        f.write(b"fLaC" + b"".join(keep) + b[i:])
+    return True
+
+
 def decoded(path):
     return subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-f", "s16le", "-"], capture_output=True, check=True).stdout
+
+
+def cut_loop(x, bpm, bars):
+    """The first `bars` bars of 4/4 at `bpm`, unfaded: the source starts on the downbeat (the
+    decoder drops the MP3 encoder's padding), so the cut repeats in time."""
+    n = int(round(bars * 4 * 60 / bpm * SR))
+    if len(x) < n - int(0.01 * SR):
+        sys.exit(f"loop is {len(x) / SR:.3f} s, {bars} bars at {bpm} BPM need {n / SR:.3f} s")
+    x = np.concatenate([x, np.zeros((max(0, n - len(x)), 2))])[:n].copy()
+    return x * (10 ** (-1 / 20) / np.abs(x).max())
+
+
+def write_ogg(dst, y, mono, tag):
+    """Ogg Vorbis (quality 6, about 190 kbit/s stereo) peaking at -1 dBFS once decoded: lossy
+    coding moves the peak, so the gain is corrected from a decode and the file written again.
+    `tag` (stored as a comment) names the source and cut, so an unchanged file is kept."""
+    if os.path.isfile(dst):
+        have = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream_tags=wave_src", "-of", "csv=p=0", dst], capture_output=True, text=True).stdout.strip()
+        if have == tag:
+            return False
+    ch = "1" if mono else "2"
+    best = None
+    for _ in range(5):
+        pcm = np.clip(y, -1, 1).astype("<f4").tobytes()
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "f32le", "-ar", str(SR), "-ac", ch, "-i", "-", "-c:a", "libvorbis", "-q:a", "6",
+                        "-map_metadata", "-1", "-metadata:s:a", f"WAVE_SRC={tag}", "-bitexact", dst], input=pcm, check=True)
+        dec = subprocess.run(["ffmpeg", "-v", "error", "-i", dst, "-f", "f32le", "-"], capture_output=True, check=True).stdout
+        peak = float(np.abs(np.frombuffer(dec, dtype="<f4")).max())
+        err = 20 * np.log10(peak) + 1
+        with open(dst, "rb") as f:
+            data = f.read()
+        if best is None or abs(err) < best[0]:
+            best = (abs(err), data)
+        if abs(err) < 0.03:
+            break
+        y = y * 10 ** (-0.5 * err / 20)
+    with open(dst, "wb") as f:
+        f.write(best[1])
+    return True
+
+
+def credits(picks):
+    """Markdown list of the files by other authors than the notices' text names."""
+    lines = []
+    for out, name, group, src, *_ in picks:
+        if isinstance(src, list) or ":" not in src:
+            continue
+        key, rel = src.split(":", 1)
+        if key == "fs":
+            url, who, title = FREESOUND[rel]
+            page = f"https://freesound.org/s/{rel}/"
+            lines.append(f"* `{out}`: \"{title}\" by {who} on [Freesound]({page}), "
+                         f"[CC0-1.0]({LICENSE_URL['CC0-1.0']}) (from its high-quality preview)")
+        elif SOURCES[key][3]:
+            repo, commit, lic, who = SOURCES[key]
+            lines.append(f"* `{out}`: `{rel.rsplit('/', 1)[-1]}` by {who} "
+                         f"([source](https://github.com/{repo}/blob/{commit}/{urllib.parse.quote(rel)})), [{lic}]({LICENSE_URL[lic]})")
+    return "\n".join(lines)
+
+
+def write_credits(picks):
+    path = os.path.join(ROOT, "THIRD_PARTY_NOTICES.md")
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    a, b = "<!-- factory-credits:begin -->", "<!-- factory-credits:end -->"
+    head, rest = text.split(a, 1)
+    _, tail = rest.split(b, 1)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(f"{head}{a}\n{credits(picks)}\n{b}{tail}")
 
 
 def main():
@@ -444,7 +784,7 @@ def main():
     rows, total, kept = [], 0, 0
     for out, name, group, src, max_s, root, *rest in PICKS:
         opt = rest[0] if rest else {}
-        pitched = group == "Tonal" or isinstance(src, list) or bool(opt.get("tune") or opt.get("pitched"))
+        pitched = group in ("808", "Tonal") or isinstance(src, list) or bool(opt.get("tune") or opt.get("pitched"))
         if isinstance(src, list):
             x = layers(fetch, src)
         else:
@@ -456,13 +796,25 @@ def main():
                 root = int(round(pitch(x)))
         if "drive" in opt:
             x = np.tanh(x / np.abs(x).max() * 10 ** (opt["drive"] / 20))
-        y, mono = prepare(x, max_s, opt.get("soft", False))
         dst = os.path.join(OUT, out)
+        if "loop" in opt:
+            assert out.endswith(".ogg"), out
+            y = cut_loop(x, *opt["loop"])
+            mono = np.abs(y[:, 0] - y[:, 1]).max() < 1e-4
+            y = y[:, :1] if mono else y
+            if not write_ogg(dst, y, mono, f"{src} {opt['loop'][0]} {opt['loop'][1]}"):
+                kept += 1
+            total += os.path.getsize(dst)
+            rows.append((out, name, group, root, str(pitched).lower(), len(y) / SR, 1 if mono else 2))
+            print(f"{out:28} {len(y) / SR:5.2f} s  {'mono' if mono else 'stereo':6} loop       {os.path.getsize(dst) // 1024:4} K")
+            continue
+        y, mono = prepare(x, max_s, opt.get("soft", False))
         pcm = (np.clip(y, -1, 1) * 32767).round().astype("<i2").tobytes()
         if os.path.isfile(dst) and decoded(dst) == pcm:
             kept += 1
         else:
             subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "s16le", "-ar", str(SR), "-ac", "1" if mono else "2", "-i", "-", "-compression_level", "8", "-bitexact", "-map_metadata", "-1", dst], input=pcm, check=True)
+        strip_padding(dst)  # also files kept from a build before padding was stripped
         total += os.path.getsize(dst)
         rows.append((out, name, group, root, str(pitched).lower(), len(y) / SR, 1 if mono else 2))
         print(f"{out:28} {len(y) / SR:5.2f} s  {'mono' if mono else 'stereo':6} root {root:3} {os.path.getsize(dst) // 1024:4} K")
@@ -470,12 +822,18 @@ def main():
         os.remove(os.path.join(OUT, f))
     if a.pin:
         fetch.write_pins()
+    write_credits(PICKS)
     with open(os.path.join(ROOT, "crates", "engine", "src", "factory_files.rs"), "w", newline="\n") as f:
         f.write("// Generated by scripts/make-factory-library.py; do not edit by hand.\n\n")
         f.write("use super::FactoryFile;\n\n")
         f.write("pub(super) const FILES: &[FactoryFile] = &[\n")
         for out, name, group, root, pitched, dur, ch in rows:
             f.write(f'    FactoryFile {{ file: "{out}", name: "{name}", group: "{group}", root: {root}, pitched: {pitched}, dur: {dur:.4f}, ch: {ch}, bytes: include_bytes!("../library/{out}") }},\n')
+        f.write("];\n")
+        f.write("\npub(super) const UNLISTED: &[&str] = &[\n")
+        for out, _, _, _, _, _, *rest in PICKS:
+            if rest and rest[0].get("unlisted"):
+                f.write(f'    "{out}",\n')
         f.write("];\n")
     print(f"{len(rows)} files ({kept} unchanged), {total / 1e6:.2f} MB")
 

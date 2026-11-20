@@ -9,25 +9,34 @@ import { unwrap } from 'solid-js/store';
 import { t } from '../lib/i18n';
 import { TOTAL_BEATS, VOL_UNITY, type Channel } from '../api/types';
 import { clamp, panText, volText } from '../lib/format';
-import { barsText, cellsBetween, clearChannel, copyChannelNotes, fitCw, gridW, pasteChannelNotes, stepAt, isRollRow, keyOf, notesText, rotate, setKeyAt, setStep, setVelAt, stepsOf, type ChannelClip } from '../lib/pattern';
+import { barsText, cellsBetween, clearChannel, copyChannelNotes, gridW, pasteChannelNotes, stepAt, isRollRow, keyOf, notesText, rotate, setKeyAt, setPanAt, setShiftAt, setStep, setVelAt, shiftOf, MAX_SHIFT, stepsOf, type ChannelClip } from '../lib/pattern';
 import { moveIndex, rackMoveIndex } from '../lib/rack';
 import { noteName } from '../lib/pitch';
 import { autoDisplay, isAutomated, paramMenu } from '../state/automation';
 import { commit, Gesture } from '../state/edit';
 import {
-  addBar, RACK_MIN_W, STEP_MAX, STEP_MIN, audition, chanById, chanKindLabel, chanOp, channels, closeRack, curPat, openRoll, patOp, playStep, putNotes, RACK_LEFT, RACK_ROW,
+  addBar, RACK_MIN_W, STEP_W, audition, chanById, chanKindLabel, chanOp, channels, closeRack, curPat, openRoll, patOp, playStep, putNotes, RACK_LEFT, RACK_ROW,
   rackFront, rackPlaceFor, removeBar, selChan, selectChannel, selectChannelRange, toggleChannelSelected, isChannelSelected, stepPattern, toggleChanMute, toggleChanSolo,
+  rackChannels, rackFilter, setRackFilter,
 } from '../state/pattern';
-import { arrVersion } from '../state/store';
-import { say, setU, U } from '../state/ui';
-import { dblCheck, edgeScroller, track } from '../ui/drag';
+import { arrVersion, S } from '../state/store';
+import { ensurePluginScan } from '../state/pluginScan';
+import { openMenu, openRename, say, setU, U, type MenuItem } from '../state/ui';
+import { edgeScroller, track } from '../ui/drag';
 import { addFrameTask, fitCanvas, fonts, Layer } from '../ui/frameLoop';
 import { Icon } from '../ui/icons';
+import { cleanGroup, fullIndexFor, rackGroups } from '../lib/rackGroups';
+import { LANE_ICONS, LaneSwitch } from '../ui/LaneSwitch';
+import { T } from '../ui/theme';
 import { channelIcon, InstIcon } from '../ui/instIcons';
 import { MiniKnob, NumField, parseNum } from '../ui/Knob';
-import { closeChannelWindow, toggleChannelWindow } from './ChannelWindow';
-import { drawKeyGraph, drawLane, drawRack, drawRackHead, type RackGeo } from './patternDraw';
-import { addChannelMenu, chanMenu, DockBtn, insertMenu, insLabel, insTitle, PatFrame, patternMenu, useDataVersion, useSize } from './patternShared';
+import { PanelFrame, WinControls } from './PanelFrame';
+import { paneDock } from '../state/docking';
+import { pickFreeInsert, wheelInsert } from '../ui/InsertPicker';
+import { showInsert } from '../state/mixView';
+import { toggleChannelWindow } from './ChannelWindow';
+import { drawKeyGraph, drawLane, drawRack, drawRackHead, type RackGeo, laneColor } from './patternDraw';
+import { addChannelMenu, chanMenu, chanInsertChoice, insertMenu, insLabel, insTitle, patGeom, PatternChip, useDataVersion, useSize } from './patternShared';
 
 const GRAPH_H = 92;
 const RACK_ICON = 'M4 5h4v4H4z M10 5h4v4h-4z M16 5h4v4h-4z M4 15h4v4H4z M10 15h4v4h-4z M16 15h4v4h-4z';
@@ -46,7 +55,8 @@ function Rack(props: { z: number; docked?: boolean }) {
   let gridWrap!: HTMLDivElement, cv!: HTMLCanvasElement, head!: HTMLCanvasElement, graphCv!: HTMLCanvasElement, graphWrap!: HTMLDivElement;
   const ptM = createMemo(() => curPat()!);
   const pt = () => ptM();
-  const chans = () => channels();
+  /** The rows the rack shows: every channel, or the group the filter picks. */
+  const chans = () => rackChannels();
   const selCh = () => selChan();
   const size = useSize(() => gridWrap);
   const graphSize = useSize(() => graphWrap);
@@ -60,8 +70,8 @@ function Rack(props: { z: number; docked?: boolean }) {
   // the pointer (the rest of the run landed in the wrong columns). It refits on release.
   const [hold, setHold] = createSignal<{ cw: number; steps: number } | null>(null);
   const geo = (): RackGeo => {
-    const end = stepsOf(pt()), h = hold(), steps = h ? h.steps : Math.min(TOTAL_BEATS * 4, end + 16), w = size().w;
-    const cw = h ? h.cw : clamp(fitCw(w, steps), STEP_MIN, STEP_MAX);
+    const end = stepsOf(pt()), h = hold(), steps = h ? h.steps : Math.min(TOTAL_BEATS * 4, end + 16);
+    const cw = h ? h.cw : STEP_W;
     return { cw, sx: scroll().x, sy: scroll().y, rh: RACK_ROW, steps, end, rows: chans().length };
   };
   // the grid's own height: the add-channel row below the channels scrolls with them
@@ -74,7 +84,7 @@ function Rack(props: { z: number; docked?: boolean }) {
 
   createEffect(() => {
     data(); const G = geo(), { w, h } = size(); void fonts.epoch;
-    if (!w || !h) return;
+    if (!w || !h || U.mixView) return; // repainted on the way back from the Mix view
     fitCanvas(cv, w, h); fitCanvas(head, w, h);
     const g = cv.getContext('2d')!, dpr = window.devicePixelRatio || 1;
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -82,7 +92,7 @@ function Rack(props: { z: number; docked?: boolean }) {
     lastHead = -2;
   });
   createEffect(() => {
-    const mode = graph(); if (!mode) return;
+    const mode = graph(); if (!mode || U.mixView) return;
     data(); const G = geo(), { w, h } = graphSize(), c = selCh();
     if (!w || !h) return;
     fitCanvas(graphCv, w, h);
@@ -90,11 +100,15 @@ function Rack(props: { z: number; docked?: boolean }) {
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     const p = unwrap(pt()), notes = c ? p.notes.map((n, i) => ({ n, i })).filter(x => x.n.ch === c.id) : [];
     const roll = !!c && rollRows().has(c.id);
-    if (mode === 'vel') drawLane(g, w, h, { x0: 0, cw: G.cw, sx: G.sx, steps: G.steps, notes, color: c?.color ?? '#4f8ef7', cells: !roll, beatGap: true, muted: !!c?.mute });
+    if (mode === 'vel') drawLane(g, w, h, { x0: 0, cw: G.cw, sx: G.sx, steps: G.steps, notes, color: laneColor('vel'), cells: !roll, beatGap: true, muted: !!c?.mute });
+    else if (mode === 'pan') drawLane(g, w, h, { x0: 0, cw: G.cw, sx: G.sx, steps: G.steps, notes, color: laneColor('pan'), cells: !roll, beatGap: true, muted: !!c?.mute || !panPlays(), value: n => ((n.pan ?? 0) + 1) / 2, bipolar: true });
+    else if (mode === 'shift') drawLane(g, w, h, { x0: 0, cw: G.cw, sx: G.sx, steps: G.steps, notes, color: T.amber, cells: true, beatGap: true, muted: !!c?.mute || roll, value: n => shiftOf(n) / MAX_SHIFT });
     else drawKeyGraph(g, w, h, { cw: G.cw, sx: G.sx, steps: G.steps, notes, color: c?.color ?? '#4f8ef7', root: c?.root ?? 60, span: KEY_SPAN, off: roll });
   });
   // playhead column: only when the step changes
   let lastHead = -2;
+  // the cached plugin list (opens no plugin), so "+" lists the VST3 instruments at once
+  onMount(ensurePluginScan);
   onMount(() => onCleanup(addFrameTask(() => {
     const p = curPat(); if (!p || !head || U.mixView) return;
     const s = playStep(p);
@@ -122,7 +136,9 @@ function Rack(props: { z: number; docked?: boolean }) {
       if (e.button === 0) { e.stopPropagation(); openRoll(c.id); }
       return;
     }
-    const on = e.button === 0 ? !unwrap(pt()).notes.some(n => n.ch === c.id && Math.abs(n.step - step) < 1e-3) : false;
+    // FL: the left button lights steps, the right one clears them. A left press on a lit step keeps it
+    // (and a drag from it paints, never erases a run you only meant to extend)
+    const on = e.button === 0;
     const g = new Gesture(on ? t('b.pe.gestSteps') : t('b.pe.gestDelSteps'));
     // freeze the grid (and the window's width) before the first step can make the pattern longer
     setHold({ cw: G.cw, steps: G.steps });
@@ -149,26 +165,41 @@ function Rack(props: { z: number; docked?: boolean }) {
     const d = (e.deltaY || e.deltaX);
     setScroll(s => horiz ? { ...s, x: clamp(s.x + d, 0, m.x) } : { ...s, y: clamp(s.y + d * 0.6, 0, m.y) });
   };
-  // graph editor: drag across the steps to draw values
+  /** The selected channel plays a note's own pan (plugin instruments do not). */
+  const panPlays = () => selCh()?.kind !== 'plugin';
+  // graph editor: drag across the steps to draw values; Alt+click resets a step (FL)
   const graphDown = (e: PointerEvent) => {
     const c = selCh(), mode = graph(); if (!c || !mode || e.button !== 0) return;
     e.preventDefault();
     const roll = rollRows().has(c.id);
     if (mode === 'key' && roll) { say(t('b.rk.keyRoll', { name: c.name })); return; }
+    if (mode === 'shift' && roll) { say(t('b.rk.shiftRoll', { name: c.name })); return; }
+    if (mode === 'pan' && !panPlays()) { say(t('b.rk.panPlugin', { name: c.name })); return; }
+    if (e.altKey && mode !== 'key') {
+      const G0 = geo(), r0 = graphCv.getBoundingClientRect(), s = stepAt(e.clientX - r0.left + G0.sx, G0.cw), ns = unwrap(pt()).notes;
+      const out = mode === 'vel' ? setVelAt(ns, c.id, s, 1) : mode === 'pan' ? setPanAt(ns, c.id, s, 0) : setShiftAt(ns, c.id, s, 0);
+      commit([putNotes(pt(), out)], t('b.rk.resetStep'));
+      say(t('b.rk.resetStepDone', { name: c.name, n: s + 1 }));
+      return;
+    }
     const G = geo(), r = graphCv.getBoundingClientRect();
     const at = (ev: PointerEvent) => ({ s: stepAt(ev.clientX - r.left + G.sx, G.cw), f: clamp(1 - (ev.clientY - r.top - 6) / (r.height - 9), 0, 1) });
-    const g = new Gesture(mode === 'vel' ? 'Velocity' : t('b.rk.keyGest'));
+    const g = new Gesture(mode === 'vel' ? 'Velocity' : mode === 'pan' ? t('b.rk.panGest') : mode === 'shift' ? t('b.rk.shiftGest') : t('b.rk.keyGest'));
     let notes = unwrap(pt()).notes, last = at(e);
     const keyFor = (f: number) => clamp(Math.round(c.root - KEY_SPAN + f * 2 * KEY_SPAN), 0, 127);
     const apply = (s: number, f: number) => {
       if (mode === 'key') { notes = setKeyAt(notes, c, s, keyFor(f)); return; }
+      if (mode === 'pan') { notes = setPanAt(notes, c.id, s, f * 2 - 1); return; }
+      if (mode === 'shift') { notes = setShiftAt(notes, c.id, s, f * MAX_SHIFT); return; }
       notes = roll ? notes.map(n => n.ch === c.id && Math.floor(n.step + 1e-3) === s ? { ...n, v: Math.round(f * 100) / 100 } : n) : setVelAt(notes, c.id, s, f);
     };
-    const tell = (f: number) => say(c.name + ' · ' + (mode === 'vel' ? 'velocity ' + Math.round(f * 100) + '%' : noteName(keyFor(f))));
+    const tell = (f: number) => say(c.name + ' · ' + (mode === 'vel' ? 'velocity ' + Math.round(f * 100) + '%'
+      : mode === 'pan' ? 'pan ' + panText(Math.abs(f * 2 - 1) < 0.03 ? 0 : f * 2 - 1)
+      : mode === 'shift' ? t('b.rk.shiftSay', { pct: Math.round(f * MAX_SHIFT * 100) }) : noteName(keyFor(f))));
     apply(last.s, last.f);
     g.update([putNotes(pt(), notes)]);
     tell(last.f);
-    if (mode === 'key') { const n = notes.find(x => x.ch === c.id && Math.round(x.step) === last.s); if (n) audition(c.id, keyOf(n, c), 0.8); }
+    if (mode === 'key') { const n = notes.find(x => x.ch === c.id && Math.floor(x.step + 1e-3) === last.s); if (n) audition(c.id, keyOf(n, c), 0.8); }
     let lastKey = keyFor(last.f);
     track(ev => {
       const q = at(ev);
@@ -177,7 +208,7 @@ function Rack(props: { z: number; docked?: boolean }) {
       last = q;
       g.update([putNotes(pt(), notes)]);
       tell(q.f);
-      if (mode === 'key' && keyFor(q.f) !== lastKey) { lastKey = keyFor(q.f); if (notes.some(x => x.ch === c.id && Math.round(x.step) === q.s)) audition(c.id, lastKey, 0.8); }
+      if (mode === 'key' && keyFor(q.f) !== lastKey) { lastKey = keyFor(q.f); if (notes.some(x => x.ch === c.id && Math.floor(x.step + 1e-3) === q.s)) audition(c.id, lastKey, 0.8); }
     }, () => g.end(), 'ns-resize');
   };
   const hbar = () => { const m = maxScroll(), w = size().w, G = geo(); if (!m.x) return null; const total = gridW(G.steps, G.cw); return { left: scroll().x / total * w, width: Math.max(24, w / total * w) }; };
@@ -246,7 +277,9 @@ function Rack(props: { z: number; docked?: boolean }) {
     ]);
   };
   const moveChannelTo = (c: Channel, to: number) => {
-    commit([chanOp(c, {}, to)], t('b.rk.gestMove'));
+    // `to` is a row of the shown rack; filtered, it lands next to the shown channel it now sits by
+    const full = fullIndexFor(channels().map(x => x.id), chans().map(x => x.id), c.id, to);
+    commit([chanOp(c, {}, full)], t('b.rk.gestMove'));
     say(t('b.rk.moved', { name: c.name, n: to + 1, of: chans().length }));
     const top = to * RACK_ROW, h = size().h;
     if (top < scroll().y) setScroll(s => ({ ...s, y: top }));
@@ -307,41 +340,91 @@ function Rack(props: { z: number; docked?: boolean }) {
       if (c) editClipboard(c, k);
       return;
     }
+    const shiftSteps = (d: number) => {
+      const c = selCh(); if (!c) return;
+      commit([putNotes(pt(), rotate(unwrap(pt()).notes, c.id, stepsOf(pt()), d))], t('b.pe.shiftSteps'));
+      say(c.name + ' · ' + t(d < 0 ? 'b.pe.shiftL' : 'b.pe.shiftR'));
+    };
+    // FL: Shift+Ctrl+← / → shifts the selected channel's steps by one, wrapping around the pattern
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && !e.altKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+      e.preventDefault(); e.stopPropagation();
+      shiftSteps(e.key === 'ArrowLeft' ? -1 : 1);
+      return;
+    }
     if (e.ctrlKey || e.metaKey) return;
+    // FL: ↑ / ↓ select the channel above / below
+    if (!e.altKey && !e.shiftKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+      e.preventDefault(); e.stopPropagation();
+      const cs = chans(); if (!cs.length) return;
+      const cur = cs.findIndex(c => c.id === selCh()?.id);
+      const to = clamp(cur < 0 ? 0 : cur + (e.key === 'ArrowUp' ? -1 : 1), 0, cs.length - 1);
+      selectChannel(cs[to].id);
+      const top = to * RACK_ROW, h = size().h;
+      if (top < scroll().y) setScroll(s => ({ ...s, y: top }));
+      else if (top + RACK_ROW > scroll().y + h) setScroll(s => ({ ...s, y: Math.min(maxScroll().y, top + RACK_ROW - h) }));
+      return;
+    }
     if (e.altKey && !e.shiftKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
       e.preventDefault(); e.stopPropagation();
       moveChannel(e.key === 'ArrowUp' ? -1 : 1);
       return;
     }
-    // FL: Shift+Alt+← / → shifts the selected channel's steps by one, wrapping around the pattern
+    // the earlier binding of the same thing, kept for those used to it
     if (e.altKey && e.shiftKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
       e.preventDefault(); e.stopPropagation();
-      const c = selCh(); if (!c) return;
-      const d = e.key === 'ArrowLeft' ? -1 : 1;
-      commit([putNotes(pt(), rotate(unwrap(pt()).notes, c.id, stepsOf(pt()), d))], t('b.pe.shiftSteps'));
-      say(c.name + ' · ' + t(d < 0 ? 'b.pe.shiftL' : 'b.pe.shiftR'));
+      shiftSteps(e.key === 'ArrowLeft' ? -1 : 1);
       return;
     }
     if (e.altKey) return;
     if (e.key.toLowerCase() === 'g') { e.preventDefault(); e.stopPropagation(); toggleGraph(); }
   };
+  /** FL's filter-group menu: All, each group, the unsorted channels; rename or ungroup the shown group. */
+  const groupFilterMenu = (x: number, y: number) => {
+    const all = channels(), groups = rackGroups(all), f = rackFilter(), unsorted = all.filter(c => !c.group).length;
+    const items: MenuItem[] = [
+      { t: 'item', label: t('b.rk.groupAllN', { n: all.length }), checked: f == null, act: () => setRackFilter(null) },
+      ...groups.map((g): MenuItem => ({ t: 'item', label: `${g.name} (${g.n})`, checked: f === g.name, act: () => setRackFilter(g.name) })),
+    ];
+    if (groups.length) items.push({ t: 'item', label: t('b.rk.groupNoneN', { n: unsorted }), checked: f === '', disabled: !unsorted, act: () => setRackFilter('') });
+    else items.push({ t: 'sec', label: t('b.rk.groupHint') });
+    if (f) {
+      const members = all.filter(c => c.group === f);
+      items.push({ t: 'sep' },
+        { t: 'item', label: t('b.rk.groupRename', { name: f }), act: () => openRename(x, y, f, v => {
+          const g = cleanGroup(v); if (!g || g === f) return;
+          commit(members.map(c => chanOp(c, { group: g })), t('b.rk.groupRenameGest'));
+          setRackFilter(g); say(t('b.rk.groupRenamed', { from: f, to: g }));
+        }) },
+        { t: 'item', label: t('b.rk.groupUngroup', { name: f }), title: t('b.rk.groupUngroupTip'), act: () => {
+          commit(members.map(c => chanOp(c, { group: undefined })), t('b.rk.groupUngroupGest'));
+          setRackFilter(null); say(t('b.rk.groupUngrouped', { name: f, n: members.length }));
+        } });
+    }
+    openMenu(x, y, items);
+  };
   const notesCount = createMemo(() => { arrVersion(); return unwrap(pt()).notes.length; });
-  // wheel over the title bar: previous / next pattern, like the toolbar's pattern selector
+  // Shift+wheel over the title bar: previous / next pattern (FL). A plain wheel does nothing here, so
+  // scrolling the channel list and drifting onto the title bar no longer switches the pattern
   let headAcc = 0;
   const headWheel = (e: WheelEvent) => {
     if (e.defaultPrevented) return; // the swing field turns its own value
+    if (!e.shiftKey) return;
     e.preventDefault();
     headAcc += e.deltaY || e.deltaX;
     if (Math.abs(headAcc) < 40) return;
     stepPattern(headAcc > 0 ? 1 : -1); headAcc = 0;
   };
   return (
-    <PatFrame win={U.rackWin!} key="rackWin" z={props.z} class="rackwin" minW={RACK_MIN_W} minH={200} compactH={230} docked={props.docked} front={rackFront} onKey={onKey} onHeadWheel={headWheel}
+    <PanelFrame {...patGeom('rackWin')} z={props.z} class="rackwin" minW={RACK_MIN_W} minH={200} compactH={230} docked={props.docked} dockId="rack" front={rackFront} onKey={onKey} onHeadWheel={headWheel}
+      controls={<WinControls dock={paneDock('rack')} close={{ tip: t(props.docked ? 'b.dk.closeRack' : 'b.pe.close'), act: closeRack }} />}
       head={<>
         <span class="tile" style={{ width: '20px', height: '20px', background: pt().color + '2e', color: pt().color }}><Icon d={RACK_ICON} size={12} /></span>
         <span class="wintitle">Channel rack</span>
-        <button class="patname" title={t('b.rk.patTitle')} onClick={e => { const r = (e.currentTarget as HTMLElement).getBoundingClientRect(); patternMenu(r.left, r.bottom + 4); }}>
-          <span class="sw" style={{ background: pt().color }} /><span class="ell">{pt().name}</span>
+        <PatternChip pat={pt()} />
+        <button class="chip groupchip" classList={{ on: rackFilter() != null }} title={t('b.rk.groupTip')} aria-haspopup="menu"
+          onClick={e => { const r = (e.currentTarget as HTMLElement).getBoundingClientRect(); groupFilterMenu(r.left, r.bottom + 4); }}>
+          <Icon d="M3 5h18l-7 8v6l-4 2v-8z" size={11} />
+          <span>{rackFilter() == null ? t('b.rk.groupAll') : rackFilter() === '' ? t('b.rk.groupNone') : rackFilter()}</span>
           <svg width="8" height="8" viewBox="0 0 8 8"><path d="M1 2.5l3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.3" /></svg>
         </button>
         <div class="bars" title={t('b.rk.barsTitle')}>
@@ -354,9 +437,6 @@ function Rack(props: { z: number; docked?: boolean }) {
             drag={(v, d) => clamp(Math.round(v + d * 0.5), 0, 100)} apply={applySwing} title={t('b.pe.swingTitle')} />
         </div>
         <button class="iconbtn" classList={{ on: !!graph() }} title={t('b.rk.graphTitle')} onClick={toggleGraph}><Icon d={GRAPH_ICON} size={13} /></button>
-        <div style={{ flex: 1 }} />
-        <DockBtn which="rack" />
-        <button class="closebtn" title={t(props.docked ? 'b.dk.closeRack' : 'b.pe.close')} onClick={closeRack}>×</button>
       </>}>
       <div class="rack">
         <div class="rackbody" onWheel={wheel}>
@@ -385,10 +465,12 @@ function Rack(props: { z: number; docked?: boolean }) {
         {/* always mounted (hidden when off) so its size is observed from the start */}
         <div class="lanerow" style={{ height: GRAPH_H + 'px', display: graph() ? 'flex' : 'none' }}>
             <div class="lanelab" style={{ width: RACK_LEFT + 'px' }}>
-              <div class="seg graphtabs">
-                <button classList={{ on: graph() === 'vel' }} onClick={() => setU('rackGraph', 'vel')}>{t('b.rk.vel')}</button>
-                <button classList={{ on: graph() === 'key' }} onClick={() => setU('rackGraph', 'key')}>{t('b.rk.key')}</button>
-              </div>
+              <LaneSwitch row label={t('b.rk.graphTitle')} value={graph() ?? 'vel'} onPick={id => setU('rackGraph', id)} items={[
+                { id: 'vel', cls: 'vel', label: t('b.pr.laneVel'), icon: LANE_ICONS.vel, tip: t('b.rk.velTip') },
+                { id: 'key', cls: 'key', label: t('b.rk.key'), icon: LANE_ICONS.key, tip: t('b.rk.keyTip') },
+                { id: 'pan', cls: 'pan', label: t('b.rk.pan'), icon: LANE_ICONS.pan, tip: panPlays() ? t('b.rk.panTip') : t('b.rk.panPlugin', { name: selCh()?.name ?? '' }), disabled: !panPlays() },
+                { id: 'shift', cls: 'shift', label: t('b.rk.shift'), icon: LANE_ICONS.shift, tip: t('b.rk.shiftTip') },
+              ]} />
               <div class="lanetitle"><span class="ell" style={{ color: selCh()?.color ?? 'var(--fg3)' }}>{selCh()?.name ?? '—'}</span></div>
             </div>
             <div ref={graphWrap} class="lanecv">
@@ -398,10 +480,11 @@ function Rack(props: { z: number; docked?: boolean }) {
           </div>
         <div class="pstatus mono">
           <span>{t('b.rk.status', { ch: chans().length, notes: notesText(notesCount()), bars: barsText(pt().len / 4) })}</span>
-          <span>{t('b.rk.hint')}</span>
+          <span class="hintshort">{t('b.rk.hintShort')}</span>
+          <button class="hintlink" onClick={() => setU('help', true)}>{t('a.mn.shortcuts')}</button>
         </div>
       </div>
-    </PatFrame>
+    </PanelFrame>
   );
 }
 
@@ -410,6 +493,15 @@ function ChanRow(props: { c: Channel; onMenu: (c: Channel, e: MouseEvent) => voi
   const sel = () => isChannelSelected(c().id);
   const anySolo = () => channels().some(x => x.solo);
   let vg: Gesture | null = null, pg: Gesture | null = null;
+  // one click opens the insert menu, a double-click goes to that insert in the mixer instead
+  let insTimer = 0;
+  onCleanup(() => clearTimeout(insTimer));
+  const insClick = (e: MouseEvent) => {
+    // FL: a double-click on a channel without its own insert gives it a free one (named and coloured after it)
+    if (insTimer) { clearTimeout(insTimer); insTimer = 0; if (c().insert == null) pickFreeInsert(chanInsertChoice(live())); else showInsert(c().insert); return; }
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    insTimer = window.setTimeout(() => { insTimer = 0; insertMenu(c(), r.left, r.bottom + 2); }, 250);
+  };
   const live = () => chanById(c().id) ?? c();
   const volOp = (v: number) => chanOp(live(), { vol: Math.round(clamp(v, 0, 1) * 10000) / 10000 });
   const volT = () => ({ kind: 'chanVol' as const, id: c().id }), panT = () => ({ kind: 'chanPan' as const, id: c().id });
@@ -421,7 +513,7 @@ function ChanRow(props: { c: Channel; onMenu: (c: Channel, e: MouseEvent) => voi
     if (e.shiftKey) { e.stopPropagation(); return (e.ctrlKey || e.metaKey) ? toggleChannelSelected(c().id) : selectChannelRange(c().id); }
     selectChannel(c().id);
     if (e.ctrlKey || e.metaKey) { audition(c().id, undefined, 0.8, true); return; }
-    if (dblCheck('cname' + c().id)) { e.stopPropagation(); closeChannelWindow(); openRoll(c().id); return; }
+    // FL: every click opens / closes the channel's window; the Piano roll is F7, the mini roll or the menu
     toggleChannelWindow(c().id);
   };
   return (
@@ -429,15 +521,15 @@ function ChanRow(props: { c: Channel; onMenu: (c: Channel, e: MouseEvent) => voi
       onPointerDown={e => { if (e.button === 0 && !e.shiftKey) selectChannel(c().id); }}
       onContextMenu={e => props.onMenu(c(), e)}>
       <span class="cstrip" style={{ color: c().color }} title={t('b.rk.dragChannel')} onPointerDown={e => props.onMove(c(), e)} />
-      <button class="led" classList={{ on: !c().mute && (!anySolo() || c().solo), solo: c().solo }}
+      <button class="mini m rkm" classList={{ on: c().mute, solo: c().solo && !c().mute, quiet: anySolo() && !c().solo && !c().mute }}
         title={t('b.pe.ledTitle', { state: t(c().mute ? 'b.pe.ledMuted' : c().solo ? 'b.pe.ledSolo' : 'b.pe.ledActive') })}
         onPointerDown={e => {
           e.stopPropagation(); e.preventDefault();
           // FL: click = mute, Ctrl+click (or right-click) = solo
           if (e.button === 2 || (e.button === 0 && (e.ctrlKey || e.metaKey))) toggleChanSolo(c()); else if (e.button === 0) toggleChanMute(c());
         }}
-        onContextMenu={e => { e.preventDefault(); e.stopPropagation(); }} />
-      <MiniKnob key={'cp' + c().id} t={() => ((autoDisplay(panT()) ?? c().pan) + 1) / 2} title={t('b.pe.panTitle', { v: panText(autoDisplay(panT()) ?? c().pan) })}
+        onContextMenu={e => { e.preventDefault(); e.stopPropagation(); }}>{c().solo && !c().mute ? 'S' : 'M'}</button>
+      <MiniKnob key={'cp' + c().id} color="var(--pan)" t={() => ((autoDisplay(panT()) ?? c().pan) + 1) / 2} title={t('b.pe.panTitle', { v: panText(autoDisplay(panT()) ?? c().pan) })}
         automated={() => isAutomated(panT())} onMenu={(x, y) => paramMenu(x, y, panT(), () => commit([panOp(0.5)], t('b.cw.panCh')), c().color)}
         onStart={() => { pg = new Gesture(t('b.cw.panCh')); }} onChange={v => { pg?.update([panOp(v)]); say(c().name + ' · pan ' + panText(v * 2 - 1)); }}
         onEnd={() => { pg?.end(); pg = null; }} onReset={() => commit([panOp(0.5)], t('b.cw.panCh'))}
@@ -448,12 +540,15 @@ function ChanRow(props: { c: Channel; onMenu: (c: Channel, e: MouseEvent) => voi
         onEnd={() => { vg?.end(); vg = null; }} onReset={() => commit([volOp(VOL_UNITY)], t('b.cw.volCh'))}
         onWheel={v => commit([volOp(v)], t('b.cw.volCh'))} />
       <button class="cins" classList={{ auto: c().insert == null }} title={insTitle(c())}
-        onPointerDown={e => e.stopPropagation()} onClick={e => { const r = (e.currentTarget as HTMLElement).getBoundingClientRect(); insertMenu(c(), r.left, r.bottom + 2); }}>{insLabel(c())}</button>
-      <button class="cname" classList={{ sel: sel() }} title={t('b.pe.cnameTitle', { name: c().name, kind: chanKindLabel(c()) })}
+        onPointerDown={e => e.stopPropagation()} onClick={insClick}
+        onWheel={e => wheelInsert(chanInsertChoice(c()), e)}>{insLabel(c())}</button>
+      <button class="cname" classList={{ sel: sel() }}
+        title={t(c().kind === 'plugin' ? 'b.pe.cnameTitlePlugin' : 'b.pe.cnameTitle', { name: c().name, kind: chanKindLabel(c()) }) + (S.fxErrors[c().id] ? '\n' + t('c.fx.instNotLoaded', { e: S.fxErrors[c().id] }) : '')}
         onPointerDown={nameDown}>
-        <span class="cicon" style={{ color: c().color }}><InstIcon id={channelIcon(c())} size={11} /></span>
+        <span class="cicon" style={{ color: c().color }}><InstIcon id={channelIcon(c(), (id: number) => S.project.sources.find(s => s.id === id))} size={11} /></span>
         <span class="ell">{c().name}</span>
         <Show when={c().kind === 'keys'}><span class="ckind">KEYS</span></Show>
+        <Show when={c().kind === 'plugin'}><span class="ckind" classList={{ err: !!S.fxErrors[c().id] }}>{S.fxErrors[c().id] ? '! VST3' : 'VST3'}</span></Show>
       </button>
     </div>
   );

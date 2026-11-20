@@ -3,7 +3,10 @@
 // Every keyboard handler accepts Cmd wherever it accepts Ctrl (`e.ctrlKey || e.metaKey`),
 // so on macOS the hints say ⌘ / ⌥ / ⇧ like every other Mac app instead of Ctrl / Alt / Shift.
 
+// Never under the test runner: jsdom reports "Macintosh" on a Mac, and the UI's tests must read the
+// same text on every machine (`macShortcuts` is tested directly).
 export const IS_MAC: boolean =
+  import.meta.env.MODE !== 'test' &&
   typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || '');
 
 // Whole chords whose Mac equivalent is a different key, not just a different modifier.
@@ -37,6 +40,18 @@ export function macShortcuts(text: string): string {
     return glyphs + (isGesture(key) ? '-' : '') + key;
   });
   return chords.replace(/\bCtrl\b/g, '⌘').replace(/\bAlt\b/g, '⌥');
+}
+
+const MAC_KEYCAPS: Record<string, string> = { Ctrl: '⌘', Alt: '⌥', Shift: '⇧' };
+
+/** One key of a chord drawn as a keycap (the shortcuts table): a modifier as its Mac glyph. */
+export function macKeyCap(key: string): string {
+  return Object.prototype.hasOwnProperty.call(MAC_KEYCAPS, key) ? MAC_KEYCAPS[key] : key;
+}
+
+/** `macKeyCap` on macOS, the key itself elsewhere. */
+export function keyCap(key: string): string {
+  return IS_MAC ? macKeyCap(key) : key;
 }
 
 /** `macShortcuts` on macOS, the text itself elsewhere. */

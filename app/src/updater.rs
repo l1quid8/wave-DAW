@@ -15,7 +15,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
-pub const REPO_URL: &str = "https://github.com/miskibin/wave-DAW";
+pub const REPO_URL: &str = "https://github.com/miskibin/synkopa";
 
 /// Release notes are the CHANGELOG section; the release body continues after this line with
 /// install tips that belong on the release page, not in the app.
@@ -37,12 +37,12 @@ pub struct AppInfo {
     /// The version whose release notes were last shown (`None` on a fresh install).
     pub seen_version: Option<String>,
     pub auto_update: bool,
-    /// Whether VST3 plugins can open their own editor windows on this platform
-    /// (Windows and macOS; on Linux they are hosted with WAVE's parameter list).
+    /// Whether plugins can open their own editor windows in this session (Windows, macOS;
+    /// Linux with an X11 display, XWayland under Wayland).
     pub plugin_editors: bool,
-    /// Whether this build has an update channel. macOS has no released build yet
-    /// (it is built from source), so there is nothing to check against.
-    pub updates: bool,
+    /// Why not, when they cannot (no X11 display).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_editors_why: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]

@@ -6,9 +6,10 @@ const plain = { start: 0, t0: 0, t1: 100, spbSrc: 0.5 };
 const n = (start: number, end: number, pitch: number, level = 1): SungNote => ({ start, end, pitch, level });
 
 describe('sungToPattern (pitch editor → Piano roll)', () => {
-  it('rounds pitch to semitones and time to the 1/16 grid', () => {
+  it('rounds pitch to semitones and keeps the timing as sung (no grid)', () => {
     const r = sungToPattern([n(0, 0.5, 60.3), n(0.51, 1.0, 61.6), n(1.0, 1.24, 63.49)], plain);
-    expect(r.notes.map(x => [x.step, x.len, x.p])).toEqual([[0, 4, 60], [4, 4, 62], [8, 2, 63]]);
+    // 0.51 s = step 4.08, 1.24 s = step 9.92: off the 1/16 grid, kept
+    expect(r.notes.map(x => [x.step, x.len, x.p])).toEqual([[0, 4, 60], [4.08, 3.92, 62], [8, 1.92, 63]]);
     expect(r.songStep).toBe(0);
   });
 
@@ -26,10 +27,17 @@ describe('sungToPattern (pitch editor → Piano roll)', () => {
     expect(r.notes.map(x => [x.step, x.len, x.p])).toEqual([[0, 4, 62]]);
   });
 
-  it('gives a very short note one step and keeps the voice monophonic', () => {
-    const r = sungToPattern([n(0, 0.02, 60), n(0.5, 1.1, 62), n(1.06, 1.5, 64), n(1.5, 1.52, 65), n(1.51, 2, 67)], plain);
-    // 60: one step. 62 overlaps 64 after rounding → ends where 64 starts. 65 and 67 land on step 12 → the longer stays
-    expect(r.notes.map(x => [x.step, x.len, x.p])).toEqual([[0, 1, 60], [4, 4, 62], [8, 4, 64], [12, 4, 67]]);
+  it('gives a very short note a quarter step and keeps the voice monophonic', () => {
+    const r = sungToPattern([n(0, 0.01, 60), n(0.5, 1.1, 62), n(1.06, 1.5, 64), n(1.5, 1.52, 65), n(1.51, 2, 67)], plain);
+    // 60: 0.08 step → 0.25. 62 still sounds when 64 starts → ends there. 65 (0.16 step) is cut to
+    // 0.08 by 67 → too short to keep; quick notes on neighbouring steps are no longer merged
+    expect(r.notes.map(x => [x.step, x.len, x.p])).toEqual([[0, 0.25, 60], [4, 4.48, 62], [8.48, 3.52, 64], [12.08, 3.92, 67]]);
+  });
+
+  it('keeps quick sung notes that the 1/16 grid used to collapse', () => {
+    // a 60 ms grace note before the beat at 120 BPM (half a step)
+    const r = sungToPattern([n(0.44, 0.5, 62), n(0.5, 1, 64)], plain);
+    expect(r.notes.map(x => [x.step, x.len, x.p])).toEqual([[3.52, 0.48, 62], [4, 4, 64]]);
   });
 
   it('maps level to velocity relative to the loudest note', () => {

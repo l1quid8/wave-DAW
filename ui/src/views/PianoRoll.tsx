@@ -6,33 +6,34 @@
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show, untrack } from 'solid-js';
 import { unwrap } from 'solid-js/store';
 import { be } from '../api/backend';
-import { t, type TranslationKey } from '../lib/i18n';
-import { cloneNotes } from '../lib/noteClone';
+import type { Id, Note } from '../api/types';
+import { prefs } from '../state/prefs';
+import { t } from '../lib/i18n';
 import { zoomAround, type ZRange } from '../lib/zoomBar';
 import { ZoomScrollbar } from '../ui/ZoomScrollbar';
 import { drawRuler, rulerCursor, rulerDown, RULER_H, type RulerHost } from '../ui/timeRuler';
 import { clipOfPattern, patBeatAt, songBeatIn } from '../lib/patLoop';
 import { rgba, T, themeVersion } from '../ui/theme';
 import { curBeat } from '../state/telemetry';
-import { TOTAL_BEATS, type Note } from '../api/types';
-import { clamp } from '../lib/format';
-import { duplicateRight, keyOf, moveNotes, noteAt, noteWidth, notesText, resizeNotes, ROLL_SNAPS, SCALES, scaleMask, snapStep, stepsOf, transpose, velOf } from '../lib/pattern';
+import { clamp, panText } from '../lib/format';
+import { autoRollSnap, duplicateRight, keyOf, noteAt, noteWidth, notesText, ROLL_SNAPS, ROLL_SNAPS_TRIPLET, rollSnapName, SCALES, scaleMask, stepsOf, transpose, velOf } from '../lib/pattern';
 import { NOTE_NAMES, noteName } from '../lib/pitch';
-import {
-  applyProps, fitRange, fmtLen, fmtStart, followPage, invertSelection, legato, notesOfKey, nudgeVelocity,
-  parseKey, parseLen, parseStart, parseVel, quantizeStarts, readProps, wheelNotches,
-} from '../lib/rollEdit';
-import { commit, Gesture, wheelEdit } from '../state/edit';
-import type { TransformSelect, TransformVerb } from '../api/types';
 
 /** The project key/scale as a setKey op (the roll header's key selectors commit it). */
 const setKeyOp = (key: number, scale: number) => ({ op: 'setKey' as const, key, scale });
 import {
-  audition, chanKindLabel, channels, closeRoll, curPat, moveNotesToNewPattern, patFrom, patLoopOf, patMode, patPlayhead, patStartOf, putNotes, rollFront, selChan,
+  applyProps, fitRange, fmtLen, fmtStart, followPage, invertSelection, legato, MAX_STEP, nudgeNotes, nudgeVelocity, panLine, pasteStart, velocityLine,
+  parseKey, parseLen, parseStart, quantizeStarts, readProps, wheelNotches,
+} from '../lib/rollEdit';
+import { commit, Gesture, wheelEdit } from '../state/edit';
+import { audition, chanKindLabel, channels, closeRoll, curPat, moveNotesToNewPattern, patFrom, patLoopOf, patMode, patPlayhead, patStartOf, putNotes, rollFront, selChan,
   selectChannel, setPatLoop, setPatStart, toggleRollMax,
 } from '../state/pattern';
 import { arrVersion, S } from '../state/store';
-import { openMenu, say, U } from '../state/ui';
+import { openMenu, say, setU, U } from '../state/ui';
+import { ChipSelect, ToolSeg, type ChipOption } from '../ui/EditorBar';
+import { Knob } from '../ui/Knob';
+import { LANE_ICONS, LaneSwitch } from '../ui/LaneSwitch';
 import { selectionSpan, vocalsUnder } from '../lib/melody';
 import { fmtPos } from '../lib/format';
 import { openPitchEditor, seekSong, switchMode } from '../state/actions';
@@ -41,24 +42,32 @@ import { typingHeld } from '../state/typingKeys';
 import { noteClip, setNoteClip } from '../state/noteClipboard';
 import { addFrameTask, fitCanvas, fonts, Layer } from '../ui/frameLoop';
 import { Icon } from '../ui/icons';
-import { drawLane, drawRoll, rollX, rollY, type RollGeo } from './patternDraw';
-import { DockBtn, PatFrame, patternMenu, useDataVersion, useSize } from './patternShared';
+import { drawRollLane, drawRoll, rollX, rollY, type RollGeo } from './patternDraw';
+import { patGeom, PatternChip, useDataVersion, useSize } from './patternShared';
+import { PanelFrame, WinControls } from './PanelFrame';
+import { paneDock } from '../state/docking';
+import { KW, type RollCtx, type RollPtr, type Tool } from './roll/types';
+import { rollDown, rollMove } from './roll/grid';
+import { buildTransformOp, TOOL_META, type ToolId } from './roll/noteTools';
+import type { TransformVerb } from '../api/types';
+import { STAMP_INVS, STAMP_TYPES } from './roll/stamp';
 
-const LANE_H = 76, KW = 48;
+const LANE_H = 92;
+/** Below this much room for the grid and the velocity lane together, the lane hides so the notes keep the space (Alt+wheel still sets velocity). */
+const LANE_SHOW_AT = 300;
 /** Steps past the pattern's end the roll lets you scroll to and draw in (the pattern grows). */
 const ROOM = 64;
-const MAX_STEPS = TOTAL_BEATS * 4;
 /** Key height (px): default (about FL's density) and the vertical zoom's limits. */
 const ROW_H = 18, ROW_MIN = 6, ROW_MAX = 40;
 /** Time zoom limits, relative to the fit-the-pattern width. */
 const Z_MIN = 0.5, Z_MAX = 8;
 const ROLL_ICON = 'M4 4h16v16H4z M4 9h16 M4 14h16 M9 4v5 M15 14v6';
-type Tool = 'draw' | 'paint' | 'select' | 'erase';
 const TOOLS: { id: Tool; key: string; label: Parameters<typeof t>[0]; icon: string; tip: Parameters<typeof t>[0] }[] = [
   { id: 'draw', key: 'p', label: 'b.pe.tool.draw', icon: 'M4 20l4.5-1L19 8.5 15.5 5 5 15.5z M13.5 7l3.5 3.5', tip: 'b.pe.tool.draw.tip' },
   { id: 'paint', key: 'b', label: 'b.pe.tool.paint', icon: 'M18 3l3 3-9 9-3-3z M9 12c-3 0-4 2-4 4s-1 3-2 4c4 0 8-1 8-5', tip: 'b.pe.tool.paint.tip' },
-  { id: 'select', key: 'e', label: 'b.pe.tool.select', icon: 'M4 4h4 M12 4h4 M20 4v4 M20 12v4 M20 20h-4 M12 20H8 M4 20v-4 M4 12V8', tip: 'b.pe.tool.select.tip' },
   { id: 'erase', key: 'd', label: 'b.pe.tool.erase', icon: 'M8 20h12 M4.5 15.5L14 6l5 5-7.5 7.5H8z', tip: 'b.pe.tool.erase.tip' },
+  { id: 'select', key: 'e', label: 'b.pe.tool.select', icon: 'M4 4h4 M12 4h4 M20 4v4 M20 12v4 M20 20h-4 M12 20H8 M4 20v-4 M4 12V8', tip: 'b.pe.tool.select.tip' },
+  { id: 'stamp', key: 'c', label: 'b.pe.tool.stamp', icon: 'M5 14h3v6H5z M10.5 11h3v9h-3z M16 8h3v12h-3z', tip: 'b.pe.tool.stamp.tip' },
 ];
 
 /** The Piano roll window (shown while `U.rollWin` is set and there is a pattern and a channel). `docked`: laid out under the Playlist. */
@@ -66,25 +75,22 @@ export function PianoRoll(props: { z: number; docked?: boolean }) {
   return <Show when={U.rollWin && curPat() && selChan()}><Roll z={props.z} docked={props.docked} /></Show>;
 }
 
-const [lastLen, setLastLen] = createSignal(2);
+const [lastLen, setLastLenRaw] = createSignal(2);
+/** The last touched note was a Channel Rack step: new notes are steps (triggers) too (FL). */
+const [lastTrig, setLastTrig] = createSignal(false);
+const setLastLen = (len: number, trig = false) => { setLastLenRaw(len); setLastTrig(trig); };
 /** Velocity of the last note touched: new notes take it, like the length (FL). 1 = full, stored as none. */
 const [lastVel, setLastVel] = createSignal(1);
-const velProp = () => (lastVel() < 0.995 ? { v: lastVel() } : {});
 const [rollTool, setRollTool] = createSignal<Tool>('draw');
+/** FL's slide toggle (S): notes drawn while it is on are slide notes. */
+const [slideMode, setSlideMode] = createSignal(false);
+/** FL's slide icon: a ramp triangle. */
+const SLIDE_ICON = 'M4 19h16V6z';
+/** The stamp picker: chord type and inversion for the stamp tool (a click writes the
+ * chord rooted at the clicked key). */
+const [stampType, setStampType] = createSignal('min');
+const [stampInv, setStampInv] = createSignal(0);
 const [rollSnap, setRollSnap] = createSignal(1);
-
-/** The note tools the roll header offers: [A, B] are the two params' defaults; the
- * meaning of A/B is per tool (timing/velocity, grid/amount, hits/slots, width/ramp,
- * hits/slots, density/motif-bars). */
-const TOOL_META: Record<'humanize' | 'quantize' | 'euclid' | 'strum' | 'drums' | 'melody', { label: TranslationKey; labelA: TranslationKey; labelB: TranslationKey; defA: number; defB: number }> = {
-  humanize: { label: 'b.pr.tool.humanize', labelA: 'b.pr.tool.humanizeA', labelB: 'b.pr.tool.humanizeB', defA: 0.3, defB: 0.2 },
-  quantize: { label: 'b.pr.tool.quantize', labelA: 'b.pr.tool.quantizeA', labelB: 'b.pr.tool.quantizeB', defA: 1, defB: 1 },
-  euclid: { label: 'b.pr.tool.euclid', labelA: 'b.pr.tool.euclidA', labelB: 'b.pr.tool.euclidB', defA: 4, defB: 16 },
-  strum: { label: 'b.pr.tool.strum', labelA: 'b.pr.tool.strumA', labelB: 'b.pr.tool.strumB', defA: 0.5, defB: 0.05 },
-  drums: { label: 'b.pr.tool.drums', labelA: 'b.pr.tool.drumsA', labelB: 'b.pr.tool.drumsB', defA: 4, defB: 16 },
-  melody: { label: 'b.pr.tool.melody', labelA: 'b.pr.tool.melodyA', labelB: 'b.pr.tool.melodyB', defA: 0.5, defB: 2 },
-};
-type ToolId = keyof typeof TOOL_META;
 
 /** Key and scale to highlight: the project key (chosen here; also what scale-aware
  * transforms use), else the project's Pitch Correct (a detected key), else C in the
@@ -107,54 +113,57 @@ function Roll(props: { z: number; docked?: boolean }) {
   const notesRaw = () => unwrap(pt()).notes;
   const size = useSize(() => wrap);
   const laneSize = useSize(() => laneWrap);
+  // grid + lane together stay the same height whether the lane shows or not, so this does not flip back and forth
+  const [laneOn, setLaneOn] = createSignal(true);
+  /** What the lane under the grid edits (FL's event editor target): the notes' velocity or their own pan. */
+  const [laneMode, setLaneMode] = createSignal<'vel' | 'pan'>('vel');
+  createEffect(() => { const h = size().h; if (h > 0) setLaneOn(h + (untrack(laneOn) ? LANE_H : 0) >= LANE_SHOW_AT); });
   const data = useDataVersion();
   const layer = new Layer();
   const [sel, setSel] = createSignal<Set<number>>(new Set());
   const [hoverKey, setHoverKey] = createSignal<number | null>(null);
   const [marq, setMarq] = createSignal<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
+  /** The chord name under the pointer (status bar): every note of the channel at the hovered note's step. */
+  const [hoverChord, setHoverChord] = createSignal('');
+  /** The stamp tool's ghost: what a click at the hovered cell would write, drawn in the grid. */
+  const [stampGhost, setStampGhost] = createSignal<{ s: number; len: number; pitches: number[] } | null>(null);
   const [zbox, setZbox] = createSignal<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
   /** The note properties popover (double-click a note): the notes it edits, the clicked one last. */
   const [propsFor, setPropsFor] = createSignal<number[] | null>(null);
   const [view, setViewS] = createSignal({ sx: 0, sy: 0, zoom: 1, rowH: ROW_H });
   const pk = createMemo(projectKey, undefined, { equals: (a, b) => a.root === b.root && a.scale === b.scale });
-  // the note tools strip: verb + two params (meaning per verb) + an optional seed
-  const [toolId, setToolId] = createSignal<'humanize' | 'quantize' | 'euclid' | 'strum' | 'drums' | 'melody'>('humanize');
-  const [toolA, setToolA] = createSignal(0.3);
-  const [toolB, setToolB] = createSignal(0.2);
+  // the note tools strip: verb + its declared fields (meaning per verb) + an optional seed
+  const [toolId, setToolId] = createSignal<ToolId>('humanize');
+  const [vals, setVals] = createSignal<unknown[]>(TOOL_META.humanize.fields.map(f => f.def));
+  const setField = (i: number, v: unknown) => setVals(xs => { const c = xs.slice(); c[i] = v; return c; });
   const [toolSeed, setToolSeed] = createSignal('');
+  // the note tools (humanize, strum, ...) live in a popover: used now and then, they do not hold toolbar space
+  const [pop, setPop] = createSignal<'tools' | 'key' | null>(null);
+  const toolsOpen = () => pop() === 'tools', setToolsOpen = (f: boolean | ((v: boolean) => boolean)) => setPop((typeof f === 'function' ? f(toolsOpen()) : f) ? 'tools' : null);
+  let toolMenu!: HTMLDivElement, keyMenu!: HTMLDivElement;
+  createEffect(() => {
+    const open = pop(); if (!open) return;
+    const away = (e: PointerEvent) => { if (!(open === 'key' ? keyMenu : toolMenu).contains(e.target as Node)) setPop(null); };
+    document.addEventListener('pointerdown', away, true);
+    onCleanup(() => document.removeEventListener('pointerdown', away, true));
+  });
   const applyTool = () => {
-    const p = pt();
-    const chan = ch().id;
-    const seed = toolSeed().trim() === '' ? undefined : Math.max(0, Math.floor(+toolSeed() || 0));
-    const id = toolId(), a = toolA(), b = toolB();
-    const verb: TransformVerb = id === 'humanize' ? { kind: 'humanize', timing: a, velocity: b }
-      : id === 'quantize' ? { kind: 'quantize', grid: a || 1, amount: Math.min(1, Math.max(0, b)), scaleAware: false }
-      : id === 'euclid' ? { kind: 'euclidFill', ch: chan, k: Math.max(1, Math.round(a)), n: Math.max(1, Math.round(b)), rotate: 0 }
-      : id === 'strum' ? { kind: 'strum', width: a, ramp: b }
-      : id === 'drums' ? { kind: 'euclidDrums', voices: [{ ch: chan, k: Math.max(1, Math.round(a)), n: Math.max(1, Math.round(b)) }], bars: Math.max(1, Math.round(p.len / 4)) }
-      : { kind: 'melody', ch: chan, bars: Math.max(1, Math.round(p.len / 4)), density: Math.min(1, Math.max(0.05, a)), repeat: Math.max(1, Math.round(b)) };
-    const op: { op: 'transformNotes'; pattern: number; verb: TransformVerb; seed?: number; select?: TransformSelect } = {
-      op: 'transformNotes', pattern: p.id, verb,
-      ...(seed !== undefined ? { seed } : {}),
-      // scope: the selection, else the channel the roll is showing — never the whole
-      // pattern (a pattern is multi-channel; humanize with Hat shown must not jitter
-      // the kick). Generators replace their whole channel whatever the selection
-      // (the engine ignores a select for them), so they stay unscoped.
-      ...(id !== 'humanize' && id !== 'quantize' && id !== 'strum'
-        ? {}
-        : sel().size > 0
-          ? { select: { kind: 'indices' as const, indices: [...sel()].sort((x, y) => x - y) } }
-          : { select: { kind: 'range' as const, from: 0, to: 1e9, ch: chan } }),
-    };
-    commit([op], t(TOOL_META[id].label));
+    const op = buildTransformOp(toolId(), vals(), toolSeed(), pt().id, pt().len, ch().id, sel());
+    commit([op], t(TOOL_META[toolId()].label));
     setSel(new Set<number>());
-    say(t('b.pr.toolApplied', { verb: t(TOOL_META[id].label) }));
+    say(t('b.pr.toolApplied', { verb: t(TOOL_META[toolId()].label) }));
   };
   const root = () => pk().root;
   const scaleIdx = () => pk().scale;
   const chansMap = createMemo(() => { arrVersion(); return new Map(unwrap(channels()).map(c => [c.id, c])); });
   const mask = () => scaleMask(scaleIdx());
-  const unit = (alt = false) => (alt ? 0 : rollSnap());
+  /** A tool field's name without its "(0..1)" range note: the slider shows the range. */
+  const shortLabel = (l: string) => l.replace(/\s*\(.*\)\s*$/, '');
+  const numText = (v: number, step: number) => v.toFixed(step >= 1 ? 0 : step >= 0.1 ? 1 : 2);
+  /** The grid in steps: the chosen one, or (auto) the finest that is still comfortably wide at this zoom. */
+  const snapNow = () => (rollSnap() < 0 ? autoRollSnap(geo().pps) : rollSnap());
+  /** A pitch class on the key badge's tiny keyboard: the root, a scale note, or outside the scale. */
+  const pcClass = (pc: number) => pc === root() ? 'root' : (mask() >> ((pc - root() + 12) % 12)) & 1 ? 'in' : 'out';
   /** After a pick in a toolbar list the keyboard goes back to the roll (arrows transpose, Delete deletes) instead of staying in the list. */
   const backToRoll = (el: HTMLElement) => el.closest<HTMLElement>('.win')?.focus({ preventScroll: true });
   /** Width of the note grid (px). */
@@ -175,7 +184,7 @@ function Roll(props: { z: number; docked?: boolean }) {
     return { pps: basePps() * view().zoom, sx: view().sx, sy: view().sy, rowH: Math.max(view().rowH, rowMin()), kw: KW, steps };
   };
   /** Steps the view scrolls over: the pattern plus room to draw on (the pattern grows to fit). */
-  const hTotal = () => Math.min(MAX_STEPS, stepsOf(pt()) + ROOM);
+  const hTotal = () => Math.min(MAX_STEP, stepsOf(pt()) + ROOM);
   const maxSxAt = (pps: number) => Math.max(0, hTotal() * pps - gridW());
   const maxSx = () => maxSxAt(geo().pps);
   /** Zoom-out limit: half the fitted width, or further when that is needed to see all the steps the view scrolls over (pattern + room). */
@@ -185,6 +194,7 @@ function Roll(props: { z: number; docked?: boolean }) {
   const hRange = (): ZRange => { const G = geo(); return { pos: G.sx / G.pps, len: gridW() / G.pps }; };
   const hLimits = () => ({ total: hTotal(), minLen: gridW() / (basePps() * Z_MAX), maxLen: gridW() / (basePps() * zMin()) });
   const applyH = (r: ZRange) => {
+    userScrolled(); // every user zoom of the time axis goes through here (scrollbar, PageUp/Down, presets, fit, zoom box)
     const zoom = clamp(gridW() / r.len / basePps(), zMin(), Z_MAX), pps = basePps() * zoom;
     setViewS(v => ({ ...v, zoom, sx: clamp(r.pos * pps, 0, maxSxAt(pps)) }));
   };
@@ -197,7 +207,7 @@ function Roll(props: { z: number; docked?: boolean }) {
     followHold = true; say(t('b.pr.followPaused'));
   };
   /** The time scrollbar (scrolls or zooms by hand). */
-  const setH = (r: ZRange) => { userScrolled(); applyH(r); };
+  const setH = (r: ZRange) => applyH(r);
   const vRange = (): ZRange => { const G = geo(), h = Math.max(1, size().h); return { pos: G.sy / G.rowH, len: h / G.rowH }; };
   const vLimits = () => { const h = Math.max(1, size().h); return { total: 128, minLen: h / ROW_MAX, maxLen: h / rowMin() }; };
   const setV = (r: ZRange) => {
@@ -233,7 +243,7 @@ function Roll(props: { z: number; docked?: boolean }) {
     const g = cv.getContext('2d')!, dpr = window.devicePixelRatio || 1;
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     const lit = typingHeld();
-    drawRoll(g, w, h, geo(), layer, { pt: unwrap(pt()), ch: unwrap(ch()), chans: chansMap(), sel: sel(), root: root(), mask: mask(), hoverKey: hoverKey(), lit, marquee: marq(), zoomBox: zbox() });
+    drawRoll(g, w, h, geo(), layer, { pt: unwrap(pt()), ch: unwrap(ch()), chans: chansMap(), sel: sel(), root: root(), mask: mask(), grid: snapNow(), hoverKey: hoverKey(), lit, marquee: marq(), zoomBox: zbox(), stampGhost: stampGhost() });
   };
   const drawVel = () => {
     const { w, h } = laneSize(); if (!w || !h) return;
@@ -241,15 +251,19 @@ function Roll(props: { z: number; docked?: boolean }) {
     const g = laneCv.getContext('2d')!, dpr = window.devicePixelRatio || 1;
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     const G = geo();
-    drawLane(g, w, h, { x0: KW, cw: G.pps, sx: G.sx, steps: G.steps, notes: chanNotes(), color: ch().color, sel: sel(), cells: false, muted: ch().mute });
+    drawRollLane(g, w, h, { x0: KW, pps: G.pps, sx: G.sx, steps: G.steps, notes: chanNotes().filter(x => !x.n.slide), sel: sel(), muted: ch().mute, mode: lane() }); // a slide note has no level or pan of its own
   };
   let rafMain = 0, rafVel = 0;
   createEffect(() => {
-    data(); sel(); hoverKey(); marq(); zbox(); root(); mask(); void fonts.epoch; size(); view(); typingHeld(); ch(); pt().len;
+    data(); sel(); laneMode(); hoverKey(); marq(); zbox(); root(); mask(); rollSnap(); void fonts.epoch; size(); view(); typingHeld(); ch(); pt().len; stampGhost();
+    if (U.mixView) return; // repainted on the way back from the Mix view
     if (!rafMain) rafMain = requestAnimationFrame(() => { rafMain = 0; untrack(drawMain); });
   });
+  // the ghost belongs to the stamp tool: gone the moment another tool is picked
+  createEffect(() => { if (rollTool() !== 'stamp') setStampGhost(null); });
   createEffect(() => {
     data(); sel(); laneSize(); view(); size(); ch(); pt().len;
+    if (U.mixView) return;
     if (!rafVel) rafVel = requestAnimationFrame(() => { rafVel = 0; untrack(drawVel); });
   });
   onCleanup(() => { cancelAnimationFrame(rafMain); cancelAnimationFrame(rafVel); });
@@ -288,8 +302,6 @@ function Roll(props: { z: number; docked?: boolean }) {
     setViewS({ ...v, sx, sy });
     return true;
   };
-  /** Edge auto-scroll for a drag: `replay` re-runs the drag with the last pointer event after each scroll. */
-  const autoScroll = (replay: (e: PointerEvent) => void, axes?: { x?: boolean; y?: boolean }) => edgeScroller(gridRect, scrollBy, replay, axes);
   /** Middle-button pan (both axes on the grid). */
   const pan = (e: PointerEvent, yToo = true) => panDrag(e, () => ({ x: view().sx, y: view().sy }), (x, y) => {
     const sx = clamp(x, 0, maxSx()), sy = yToo ? clamp(y, 0, maxSyAt(geo().rowH)) : view().sy;
@@ -314,7 +326,7 @@ function Roll(props: { z: number; docked?: boolean }) {
   const ruler: RulerHost = {
     beatAt: x => (x - rulerCv.getBoundingClientRect().left + geo().sx) / geo().pps / 4,
     bw: () => geo().pps * 4,
-    unit: alt => (alt ? 0 : rollSnap() / 4),
+    unit: alt => (alt ? 0 : snapNow() / 4),
     max: () => pt().len,
     loop: () => patLoopOf(pt().id),
     edit: () => ({ set: r => setPatLoop(pt().id, r), end: () => {} }),
@@ -390,154 +402,6 @@ function Roll(props: { z: number; docked?: boolean }) {
   const edgeHit = (i: number, x: number) => { const n = notesRaw()[i], G = geo(); const width = noteWidth(n, G.pps); return x >= rollX(G, n.step) + width - Math.min(6, width * 0.4); };
   const commitNotes = (notes: Note[], label: string) => commit([putNotes(pt(), notes)], label);
 
-  function eraseDrag(e: PointerEvent) {
-    const g = new Gesture(t('b.pe.gestDelNotes'));
-    let notes = notesRaw(), n0 = notes.length;
-    const del = (ev: PointerEvent | MouseEvent) => {
-      const q = pos(ev), i = noteAt(notes, ch().id, unwrap(ch()), q.step, q.key, geo().pps);
-      if (i < 0) return;
-      notes = notes.filter((_, k) => k !== i);
-      g.update([putNotes(pt(), notes)]);
-    };
-    setSel(new Set<number>());
-    del(e);
-    track(ev => del(ev), () => { g.end(); if (notes.length < n0) say(t('b.pe.deleted', { x: notesText(n0 - notes.length) })); }, 'not-allowed');
-  }
-  /** Drags notes `idx` (the last one leads). `clone`: Shift+drag — once the pointer really
-   * moves, copies of the notes are made and moved instead (originals stay), one undo step;
-   * released without moving, `clone` (the click) runs instead. */
-  function moveDrag(e: PointerEvent, idx: number[], mode: 'move' | 'resize', g?: Gesture, clone?: () => void) {
-    let orig = notesRaw().slice();
-    const p0 = pos(e), lead = orig[idx[idx.length - 1]] ?? orig[idx[0]];
-    let gest = clone ? null : g ?? new Gesture(mode === 'move' ? t('b.pe.gestMove') : t('b.pe.gestLen'));
-    let lastKey = keyOf(lead, ch()), moved = false;
-    // Axis lock (FL): Shift pressed after the drag started = time only, Ctrl = pitch only. Held
-    // at pointer-down they keep their meaning (clone / select) and lock nothing.
-    const shift0 = e.shiftKey, ctrl0 = e.ctrlKey || e.metaKey;
-    let mods = { shift: shift0, ctrl: ctrl0 }, lastEv: PointerEvent | null = null, lockSaid = '';
-    const run = (ev: PointerEvent) => {
-      lastEv = ev;
-      const q = pos(ev);
-      if (!moved && Math.hypot(q.x - p0.x, q.y - p0.y) < 3) return;
-      if (!moved && clone) {
-        const r = cloneNotes(orig, idx);
-        orig = r.notes; idx = r.idx;
-        gest = new Gesture(t('b.pe.gestClone'));
-        gest.update([putNotes(pt(), orig)]);
-        setSel(new Set(idx)); // after the copies exist: the selection drops indices that do not
-        say(t('b.pe.cloning', { x: notesText(idx.length) }));
-      }
-      moved = true;
-      if (!gest) return;
-      const lockPitch = mode === 'move' && mods.shift && !shift0, lockTime = mode === 'move' && mods.ctrl && !ctrl0;
-      const lock = lockTime ? 'time' : lockPitch ? 'pitch' : '';
-      if (lock && lock !== lockSaid) say(t(lockTime ? 'b.pr.lockTime' : 'b.pr.lockPitch'));
-      lockSaid = lock;
-      const dKey = lockPitch ? 0 : q.key - p0.key;
-      const notes = mode === 'move'
-        ? (lockTime ? transpose(orig, idx, dKey, unwrap(ch())) : moveNotes(orig, idx, q.step - p0.step, dKey, unit(ev.altKey), unwrap(ch())))
-        : resizeNotes(orig, idx, q.step - p0.step, unit(ev.altKey));
-      gest.update([putNotes(pt(), notes)]);
-      const ln = notes[idx[idx.length - 1]];
-      if (ln && !ln.trig) setLastLen(ln.len);
-      if (mode === 'move' && ln && keyOf(ln, ch()) !== lastKey) { lastKey = keyOf(ln, ch()); audition(ch().id, lastKey, ln.v ?? 1); }
-    };
-    const es = autoScroll(run, mode === 'resize' ? { x: true } : undefined);
-    // a modifier pressed or released without moving the mouse applies at once
-    const onMod = (ke: KeyboardEvent) => {
-      const m = { shift: ke.shiftKey, ctrl: ke.ctrlKey || ke.metaKey };
-      if (m.shift === mods.shift && m.ctrl === mods.ctrl) return;
-      mods = m;
-      if (lastEv) run(lastEv);
-    };
-    window.addEventListener('keydown', onMod, true); window.addEventListener('keyup', onMod, true);
-    trackFrame(ev => { mods = { shift: ev.shiftKey, ctrl: ev.ctrlKey || ev.metaKey }; run(ev); if (moved) es.move(ev); }, () => {
-      es.stop();
-      window.removeEventListener('keydown', onMod, true); window.removeEventListener('keyup', onMod, true);
-      gest?.end(); if (!moved) clone?.();
-    }, mode === 'move' ? 'grabbing' : 'ew-resize');
-  }
-  /** Pressing the keyboard plays that key on the channel for as long as it is held (always,
-   * whatever the "hear notes while editing" preference); dragging glides to other keys.
-   * Further right on a key (towards its tip) = harder. */
-  function keyboardDrag(e: PointerEvent) {
-    const id = ch().id;
-    const velAt = (x: number) => Math.round((0.35 + 0.65 * clamp(x / KW, 0, 1)) * 100) / 100;
-    const on = (key: number, vel: number) => be().typingNote({ ch: id, key, vel, on: true }).catch(err => say(t('b.pk.fail', { err: String(err) })));
-    const off = (key: number) => be().typingNote({ ch: id, key, on: false }).catch(() => {});
-    const p = pos(e);
-    let cur = p.key;
-    void on(cur, velAt(p.x)); setHoverKey(cur);
-    track(ev => {
-      const q = pos(ev);
-      if (q.key === cur) return;
-      void off(cur); cur = q.key; void on(cur, velAt(q.x)); setHoverKey(cur);
-    }, () => { void off(cur); setHoverKey(null); }, 'pointer');
-  }
-  function marqueeDrag(e: PointerEvent, add: boolean) {
-    const p0 = pos(e), base = add ? new Set(sel()) : new Set<number>();
-    // the box's anchor in content px: it stays on its notes while the view auto-scrolls
-    const G0 = geo(), ax = p0.x + G0.sx, ay = p0.y + G0.sy;
-    let moved = false;
-    setMarq({ x0: p0.x, y0: p0.y, x1: p0.x, y1: p0.y });
-    const run = (ev: PointerEvent) => {
-      const q = pos(ev), G = geo(), sx = ax - G.sx, sy = ay - G.sy;
-      if (Math.hypot(q.x - p0.x, q.y - p0.y) >= 3) moved = true;
-      setMarq({ x0: sx, y0: sy, x1: q.x, y1: q.y });
-      const [x0, x1] = [Math.min(sx, q.x), Math.max(sx, q.x)], [y0, y1] = [Math.min(sy, q.y), Math.max(sy, q.y)];
-      const s = new Set(base);
-      for (const { n, i } of chanNotes()) {
-        const nx = rollX(G, n.step), nw = noteWidth(n, G.pps), ny = rollY(G, keyOf(n, ch()));
-        if (nx < x1 && nx + nw > x0 && ny < y1 && ny + G.rowH > y0) s.add(i);
-      }
-      setSel(s);
-    };
-    const es = autoScroll(run);
-    trackFrame(ev => { run(ev); if (moved) es.move(ev); }, () => { es.stop(); setMarq(null); say(sel().size ? t('b.pe.selHint', { x: notesText(sel().size) }) : t('b.pe.noSel')); });
-  }
-  function paintDrag(e: PointerEvent, g: Gesture, startNotes: Note[]) {
-    let notes = startNotes;
-    const p0 = pos(e);
-    let lastCell = Math.floor(p0.step / (unit(e.altKey) || 1)), moved = false;
-    const run = (ev: PointerEvent) => {
-      const q = pos(ev), u = unit(ev.altKey) || 1, cell = Math.floor(q.step / u);
-      if (Math.hypot(q.x - p0.x, q.y - p0.y) >= 3) moved = true;
-      if (cell === lastCell || q.step < 0 || q.step + lastLen() > MAX_STEPS) return;
-      lastCell = cell;
-      const s = cell * u;
-      if (notes.some(n => n.ch === ch().id && Math.abs(n.step - s) < 1e-3)) return;
-      notes = [...notes, { ch: ch().id, step: s, len: lastLen(), trig: false, p: q.key, ...velProp() }];
-      g.update([putNotes(pt(), notes)]);
-    };
-    const es = autoScroll(run);
-    track(ev => { run(ev); if (moved) es.move(ev); }, () => { es.stop(); g.end(); }, 'copy');
-  }
-  /** Ctrl+right-drag: a box to zoom the view to (both axes); a Ctrl+right-click without a drag goes back to the previous view. */
-  function zoomBoxDrag(e: PointerEvent) {
-    const p0 = pos(e), G0 = geo(), ax = p0.x + G0.sx, ay = p0.y + G0.sy;
-    let q = p0;
-    track(ev => {
-      q = pos(ev);
-      const G = geo();
-      setZbox({ x0: ax - G.sx, y0: ay - G.sy, x1: Math.max(KW, q.x), y1: q.y });
-    }, () => {
-      setZbox(null);
-      if (Math.hypot(q.x - p0.x, q.y - p0.y) < 4) {
-        const v = viewBack.pop();
-        if (!v) return say(t('b.pr.zoomNoBack'));
-        setViewS(v); say(t('b.pr.zoomBack'));
-        return;
-      }
-      const G = geo();
-      // content units: steps across, rows (keys from the top) down
-      const s0 = (ax - KW) / G.pps, s1 = (Math.max(KW, q.x) + G.sx - KW) / G.pps;
-      const r0 = ay / G.rowH, r1 = (q.y + G.sy) / G.rowH;
-      pushView();
-      applyH(fitRange(Math.max(0, s0), Math.max(0, s1), hLimits()));
-      setV(fitRange(clamp(r0, 0, 128), clamp(r1, 0, 128), vLimits()));
-      say(t('b.pr.zoomBox'));
-    }, 'zoom-in');
-  }
   /** Views to go back to (Ctrl+right-click), newest last. */
   const viewBack: ReturnType<typeof view>[] = [];
   const pushView = () => { viewBack.push({ ...view() }); if (viewBack.length > 32) viewBack.shift(); };
@@ -549,105 +413,78 @@ function Roll(props: { z: number; docked?: boolean }) {
     const bars = hRange().len / 16;
     say(t('b.pr.zoomBars', { n: bars >= 10 ? Math.round(bars) : +bars.toFixed(bars < 1 ? 2 : 1) }));
   };
-  const down = (e: PointerEvent) => {
-    if (propsFor()) setPropsFor(null); // a click elsewhere cancels the properties popover
-    if (pan(e)) { dragging = true; return; }
-    if (e.button !== 0 && e.button !== 2) return;
-    e.preventDefault();
-    dragging = true;
-    const p = pos(e);
-    const m = e.ctrlKey || e.metaKey;
-    if (e.button === 2 && m && p.x >= KW) return zoomBoxDrag(e);
-    // a right-click anywhere in the roll (keyboard, ghost notes, empty grid) drops the selection
-    if (e.button === 2 && sel().size) setSel(new Set<number>());
-    if (p.x < KW) {
-      if (e.button !== 0) return;
-      // Ctrl+click on a key: every note of that pitch (Shift too = add to the selection)
-      if (m) {
-        const ks = notesOfKey(notesRaw(), ch().id, unwrap(ch()), p.key);
-        const s = e.shiftKey ? new Set([...sel(), ...ks]) : new Set(ks);
-        setSel(s);
-        say(ks.length ? t('b.pr.keySel', { key: noteName(p.key), x: notesText(s.size) }) : t('b.pr.keyNone', { key: noteName(p.key) }));
-        return;
-      }
-      keyboardDrag(e); return;
-    }
-    const tool = rollTool();
-    const i = hitNote(p.step, p.key);
-    // double-click a note: its properties (the selection's when it is selected). The first
-    // click's move-drag has not moved anything (it starts after 3 px), so nothing is nudged.
-    if (e.button === 0 && i >= 0 && !m && !e.shiftKey && tool !== 'erase' && dblCheck('rn' + i)) {
-      const idx = sel().has(i) ? [...sel()].filter(k => k !== i && notesRaw()[k]?.ch === ch().id).concat(i) : [i];
-      if (!sel().has(i)) setSel(new Set([i]));
-      setPropsFor(idx);
-      return;
-    }
-    // FL: Ctrl+drag selects with any tool; Ctrl+click toggles one note
-    if (e.button === 0 && (e.ctrlKey || e.metaKey)) {
-      if (i < 0) return marqueeDrag(e, e.shiftKey);
-      const s = new Set(sel()); if (s.has(i)) s.delete(i); else s.add(i); setSel(s);
-      say(s.size ? t('b.pe.selCopy', { x: notesText(s.size) }) : t('b.pe.noSel'));
-      return;
-    }
-    if (e.button === 2 && i < 0) {
-      // a ghost note of another channel under the pointer: double right-click edits that channel
-      const gi = ghostAt(p.step, p.key);
-      if (gi >= 0) {
-        if (dblCheck('ghost' + notesRaw()[gi].ch)) { const id = notesRaw()[gi].ch; selectChannel(id); say(t('b.pr.switched', { name: channels().find(c => c.id === id)?.name ?? '' })); }
-        return;
-      }
-    }
-    // Shift with any tool: drag on empty space adds a box to the selection; on a note, a click
-    // toggles it in the selection and a drag clones (FL): copies of the selection (or of that
-    // note alone when it is not selected) move, the originals stay
-    if (e.button === 0 && e.shiftKey) {
-      if (i < 0) return marqueeDrag(e, true);
-      const toggle = () => {
-        const s = new Set(sel()); if (s.has(i)) s.delete(i); else s.add(i); setSel(s);
-        say(s.size ? t('b.pe.selCopy', { x: notesText(s.size) }) : t('b.pe.noSel'));
-      };
-      if (tool === 'erase') return toggle();
-      const idx = sel().has(i) ? [...sel()].filter(k => k !== i && notesRaw()[k]?.ch === ch().id).concat(i) : [i];
-      setLastLen(notesRaw()[i].len); setLastVel(notesRaw()[i].v ?? 1);
-      return moveDrag(e, idx, 'move', undefined, toggle);
-    }
-    if (e.button === 2 || tool === 'erase') return eraseDrag(e);
-    if (tool === 'select') {
-      if (i < 0) return marqueeDrag(e, false);
-      const idx = sel().has(i) ? [...sel()] : [i];
-      if (!sel().has(i)) setSel(new Set([i]));
-      setLastLen(pt().notes[i].len); setLastVel(pt().notes[i].v ?? 1);
-      return moveDrag(e, idx.filter(k => k !== i).concat(i), 'move');
-    }
-    if (i >= 0) {
-      const n = pt().notes[i];
-      if (!n.trig) setLastLen(n.len);
-      setLastVel(n.v ?? 1);
-      const idx = sel().has(i) ? [...sel()].filter(k => k !== i).concat(i) : [i];
-      if (!sel().has(i)) setSel(new Set([i]));
-      if (edgeHit(i, p.x)) return moveDrag(e, idx, 'resize');
-      audition(ch().id, keyOf(n, ch()), n.v ?? 1);
-      return moveDrag(e, idx, 'move');
-    }
-    // a new note: grid start, last touched length, the row's key
-    const s = snapStep(p.step, unit(e.altKey), true);
-    if (s < 0 || s + lastLen() > MAX_STEPS) return;
-    const n: Note = { ch: ch().id, step: s, len: lastLen(), trig: false, p: p.key, ...velProp() };
-    const notes = [...notesRaw(), n];
-    const g = new Gesture(tool === 'paint' ? t('b.pe.gestPaint') : t('b.pe.gestNew'));
-    g.update([putNotes(pt(), notes)]);
-    setSel(new Set([notes.length - 1]));
-    audition(ch().id, p.key, 1);
-    if (tool === 'paint') return paintDrag(e, g, notes);
-    moveDrag(e, [notes.length - 1], 'move', g);
+  // ---- the pointer tools (roll/): everything below feeds the tool layer's view of this roll,
+  // then the canvas handlers become two thin calls. The tools and gestures themselves never
+  // touch a DOM event — roll/types.ts has the contract, roll/grid.ts the dispatch order.
+  const modsOf = (ev: PointerEvent | KeyboardEvent) => ({ alt: ev.altKey, shift: ev.shiftKey, ctrl: ev.ctrlKey || ev.metaKey });
+  // The note under the mouse, held (FL): a pad or a slow attack is heard for as long as the button is down.
+  // While recording, a held key would be written into the take, so it falls back to the short audition.
+  let held: { ch: Id; key: number } | null = null;
+  const holdNote = (key: number | null, vel = 1) => {
+    if (held) { const h = held; held = null; be().typingNote({ ch: h.ch, key: h.key, on: false }).catch(() => {}); }
+    if (key == null || !prefs().noteAudition) return;
+    if (S.transport.rec) { audition(ch().id, key, vel); return; }
+    held = { ch: ch().id, key };
+    const mine = held;
+    be().typingNote({ ch: ch().id, key, vel, on: true }).catch(err => { if (held === mine) held = null; console.warn(err); });
   };
-  const move = (e: PointerEvent) => {
+  // the button can be let go over another app (Alt+Tab mid-drag): no pointerup arrives here, so let go on blur
+  const dropHeld = () => holdNote(null);
+  window.addEventListener('blur', dropHeld);
+  onCleanup(() => { window.removeEventListener('blur', dropHeld); holdNote(null); });
+  const ctx: RollCtx = {
+    pt: () => pt(), ch: () => unwrap(ch()), notes: notesRaw, chanNotes: () => chanNotes(), chans: chansMap,
+    geo, snap: () => snapNow(),
+    hit: hitNote, edgeHit, ghostAt,
+    tool: () => rollTool(),
+    sel: () => sel(), setSel,
+    lastLen: () => lastLen(), lastTrig: () => lastTrig(), setLastLen,
+    lastVel: () => lastVel(), setLastVel,
+    slideMode: () => slideMode() && slidePlays(),
+    commitNotes,
+    notesOp: notes => putNotes(pt(), [...notes]),
+    gest: label => new Gesture(label),
+    audition: (key, vel) => audition(ch().id, key, vel),
+    hold: holdNote,
+    typingNote: (on, key, vel) => {
+      if (on) be().typingNote({ ch: ch().id, key, vel, on: true }).catch(err => say(t('b.pk.fail', { err: String(err) })));
+      else be().typingNote({ ch: ch().id, key, on: false }).catch(() => {});
+    },
+    say,
+    setMarq, setZoomBox: setZbox, setStampGhost, stampGhost: () => stampGhost(), setHoverChord, setHoverKey,
+    propsOpen: () => !!propsFor(), closeProps: () => setPropsFor(null), openProps: idx => setPropsFor(idx),
+    stamp: () => ({ type: stampType(), inv: stampInv() }),
+    keyScale: () => pk(),
+    switchChannel: id => { selectChannel(id); say(t('b.pr.switched', { name: channels().find(c => c.id === id)?.name ?? '' })); },
+    zoomTo: (s0, s1, r0, r1) => {
+      applyH(fitRange(Math.max(0, s0), Math.max(0, s1), hLimits()));
+      setV(fitRange(clamp(r0, 0, 128), clamp(r1, 0, 128), vLimits()));
+    },
+    pushView, popView: () => viewBack.pop(), applyView: v => { if (v.sx !== view().sx || v.zoom !== view().zoom) userScrolled(); setViewS(v); },
+    dbl: key => dblCheck(key),
+    pan: e => (e ? pan(e) : false),
+    setDragging: on => { dragging = on; },
+    beginDrag: (o, move, up) => (o.frame ? trackFrame : track)(ev => move({ ...modsOf(ev), p: pos(ev), raw: ev }), ev => up({ ...modsOf(ev), p: pos(ev), raw: ev }), o.cursor),
+    bindMods: cb => {
+      const h = (ke: KeyboardEvent) => cb(modsOf(ke));
+      window.addEventListener('keydown', h, true); window.addEventListener('keyup', h, true);
+      return () => { window.removeEventListener('keydown', h, true); window.removeEventListener('keyup', h, true); };
+    },
+    autoScroll: (replay, axes) => {
+      const es = edgeScroller(gridRect, scrollBy, ev => replay({ ...modsOf(ev), p: pos(ev), raw: ev }), axes);
+      return { move: m => { if (m.raw) es.move(m.raw); }, stop: () => es.stop() };
+    },
+  };
+  const ptrOf = (e: PointerEvent): RollPtr => ({ button: e.button as 0 | 1 | 2, ...modsOf(e), p: pos(e), raw: e });
+  /** Hover: the tool's cursor and its previews (roll/grid.ts), nothing while a drag is open.
+   * The cursor is only written when it changes: WebKitGTK can swallow the next click when the
+   * cursor style churns on every mousemove (the "dead first stamp click" report). */
+  const onMove = (e: PointerEvent) => {
     const p = pos(e);
     ptr = { x: p.x, y: p.y };
     if (e.buttons) return;
-    if (p.x < KW) { cv.style.cursor = 'pointer'; return; }
-    const i = hitNote(p.step, p.key), t = rollTool();
-    cv.style.cursor = e.ctrlKey || e.metaKey ? 'crosshair' : t === 'erase' ? 'not-allowed' : i >= 0 ? (t !== 'select' && edgeHit(i, p.x) ? 'ew-resize' : 'grab') : t === 'select' ? 'crosshair' : 'copy';
+    const cur = rollMove(ctx, { ...modsOf(e), p });
+    if (cv.style.cursor !== cur) cv.style.cursor = cur;
   };
   let velAcc = 0;
   /** Alt+wheel on note `i`: its velocity (the selection's when it is selected), 5 % a notch, 1 % with Ctrl; one undo step per wheel burst. */
@@ -669,6 +506,7 @@ function Roll(props: { z: number; docked?: boolean }) {
       if (i >= 0) return velWheel(e, i);
     }
     if (e.ctrlKey || e.metaKey) {
+      userScrolled(); // a zoom moves the view as much as a scroll would
       const p = pos(e), z = clamp(view().zoom * Math.pow(1.0015, -d), zMin(), Z_MAX);
       const pps = basePps() * z;
       setViewS(v => ({ ...v, zoom: z, sx: clamp(p.step * pps - (p.x - KW), 0, maxSxAt(pps)) }));
@@ -680,25 +518,47 @@ function Roll(props: { z: number; docked?: boolean }) {
       setViewS(v => ({ ...v, sx: clamp(v.sx + d, 0, maxSx()) }));
     } else { const rh = geo().rowH; setViewS(v => ({ ...v, sy: clamp(v.sy + d * 0.7, 0, maxSyAt(rh)) })); }
   };
+  // a note's own pan is played by sampler and Synkopa Keys channels; a synth or plugin channel has the lane on velocity only
+  const panPlays = () => ch().kind !== 'plugin';
+  /** Slide notes bend the built-in instruments; a plugin is never told (as in FL). */
+  const slidePlays = () => ch().kind !== 'plugin';
+  const toggleSlide = () => {
+    if (!slidePlays()) return say(t('b.pr.slideNoPlugin'));
+    const on = !slideMode(); setSlideMode(on);
+    say(t(on ? 'b.pr.slideOn' : 'b.pr.slideOff'));
+  };
+  const lane = () => (panPlays() ? laneMode() : 'vel');
   const laneDown = (e: PointerEvent) => {
     if (pan(e, false)) { dragging = true; return; } // middle-drag: scroll time, as on the grid
-    if (e.button === 2 && sel().size) setSel(new Set<number>());
-    if (e.button !== 0) return;
+    if (e.button !== 0 && e.button !== 2) return;
     e.preventDefault();
     const r = laneCv.getBoundingClientRect();
     const at = (ev: PointerEvent) => { const G = geo(); return { step: (ev.clientX - r.left - KW + G.sx) / G.pps, v: clamp(1 - (ev.clientY - r.top - 6) / (r.height - 9), 0, 1) }; };
-    const g = new Gesture('Velocity');
-    let notes = notesRaw();
+    const isPan = lane() === 'pan';
+    const g = new Gesture(isPan ? 'Pan' : 'Velocity');
+    // FL: the left button draws freehand (every note the stroke passes, also on a fast drag), the right
+    // one a straight ramp from where it went down. With a selection, only the selected notes.
+    const ramp = e.button === 2, orig = notesRaw(), p0 = at(e);
+    let notes = orig, prev = p0;
     const apply = (ev: PointerEvent) => {
-      const q = at(ev), G = geo(), tol = Math.max(0.5, 5 / G.pps);
-      // notes starting under the pointer (± a few px); with a selection, only selected ones
-      const s = sel();
-      notes = notes.map((n, i) => n.ch === ch().id && Math.abs(n.step - q.step) <= tol && (!s.size || s.has(i)) ? { ...n, v: Math.round(q.v * 100) / 100 } : n);
+      const q = at(ev), tol = Math.max(0.5, 5 / geo().pps);
+      notes = (isPan ? panLine : velocityLine)(ramp ? orig : notes, ch().id, sel(), ramp ? p0 : prev, q, tol);
+      prev = q;
       g.update([putNotes(pt(), notes)]);
-      say(ch().name + ' · velocity ' + Math.round(q.v * 100) + '%');
+      if (isPan) say(ch().name + ' · pan ' + (ramp ? panText(p0.v * 2 - 1) + ' → ' : '') + panText(Math.abs(q.v * 2 - 1) < 0.05 ? 0 : q.v * 2 - 1));
+      else say(ch().name + ' · velocity ' + (ramp ? Math.round(p0.v * 100) + '% → ' : '') + Math.round(q.v * 100) + '%');
     };
     apply(e);
-    track(apply, () => g.end(), 'ns-resize');
+    track(apply, () => g.end(), ramp ? 'crosshair' : 'ns-resize');
+  };
+  const laneHover = (e: PointerEvent) => {
+    if (e.buttons) return;
+    const r = laneCv.getBoundingClientRect(), G = geo(), step = (e.clientX - r.left - KW + G.sx) / G.pps, tol = Math.max(0.25, 5 / G.pps);
+    const at = chanNotes().filter(x => !x.n.slide && Math.abs(x.n.step - step) <= tol).sort((a, b) => keyOf(b.n, ch()) - keyOf(a.n, ch()));
+    if (!at.length) return;
+    const val = (n: Note) => (lane() === 'pan' ? panText(n.pan ?? 0) : Math.round(velOf(n) * 100) + '%');
+    say(at.slice(0, 6).map(x => noteName(keyOf(x.n, ch())) + ' ' + val(x.n)).join(' · ') + (at.length > 6 ? ' …' : '')
+      + (at.length > 1 ? ' — ' + t(sel().size ? 'b.pr.laneSelOnly' : 'b.pr.laneAll') : ''));
   };
   // ---- "Vocal reference": the melody (the selection, else the channel's notes) becomes the target of a vocal sung over it
   const vocals = createMemo(() => { void arrVersion(); return vocalsUnder(S.project, pt().id); });
@@ -725,6 +585,7 @@ function Roll(props: { z: number; docked?: boolean }) {
     const tl = TOOLS.find(x => x.key === k);
     const stop = () => { e.preventDefault(); e.stopPropagation(); };
     if (tl && !m && !e.altKey) { stop(); setRollTool(tl.id); say(t('b.pe.rollTool', { tool: t(tl.label) })); return; }
+    if (k === 's' && !m && !e.altKey && !e.shiftKey) { stop(); toggleSlide(); return; }
     if (m && k === 'a') { stop(); setSel(new Set(chanNotes().map(x => x.i))); say(t('b.pe.selected', { x: notesText(chanNotes().length) })); return; }
     // Shift+I: invert the selection within the channel
     if (e.shiftKey && !m && !e.altKey && e.code === 'KeyI') {
@@ -743,14 +604,16 @@ function Roll(props: { z: number; docked?: boolean }) {
       return;
     }
     const s = [...sel()].filter(i => notesRaw()[i]?.ch === ch().id);
+    /** FL: with nothing selected an edit key takes every note of the channel. */
+    const orAll = () => (s.length ? s : chanNotes().map(x => x.i));
     // Ctrl+Q quantize / Ctrl+L legato: the selection, or every note of the channel
     if (m && !e.shiftKey && !e.altKey && (k === 'q' || k === 'l')) {
       stop();
       const idx = s.length ? s : chanNotes().map(x => x.i);
       if (!idx.length) return;
       if (k === 'q') {
-        const grid = ROLL_SNAPS.find(x => x[1] === rollSnap())?.[0] ?? '1/16';
-        const r = quantizeStarts(notesRaw(), idx, rollSnap());
+        const grid = rollSnapName(snapNow()) ?? '1/16';
+        const r = quantizeStarts(notesRaw(), idx, snapNow());
         if (!r.moved) return say(t('b.pr.onGrid', { grid }));
         commitNotes(r.notes, t('b.pr.quantize'));
         say(t('b.pr.quantized', { x: notesText(r.moved), grid }));
@@ -762,47 +625,91 @@ function Roll(props: { z: number; docked?: boolean }) {
       }
       return;
     }
+    // FL: Ctrl+U quick chop (pieces one snap step long), Ctrl+G glue; Alt+U / Alt+A open the chop / arpeggiator tool
+    if (m && !e.shiftKey && !e.altKey && (k === 'u' || k === 'g')) {
+      stop();
+      if (!chanNotes().length) return;
+      const grid = rollSnapName(snapNow()) ?? '1/16';
+      const verb: TransformVerb = k === 'u' ? { kind: 'chop', len: Math.max(0.25, snapNow() || 1) } : { kind: 'glue' };
+      const before = chanNotes().length;
+      commit([{ op: 'transformNotes', pattern: pt().id, verb, select: s.length ? { kind: 'indices', indices: [...s].sort((a, b) => a - b) } : { kind: 'range', from: 0, to: 1e9, ch: ch().id } }],
+        t(k === 'u' ? 'b.pr.tool.chop' : 'b.pr.tool.glue'));
+      // the edit applies locally at once (the engine confirms it), so the count is already the new one
+      const after = chanNotes().length;
+      say(k === 'u' ? (after > before ? t('b.pr.chopped', { grid, x: notesText(after) }) : t('b.pr.chopNone', { grid }))
+        : (after < before ? t('b.pr.glued', { x: notesText(before - after) }) : t('b.pr.glueNone')));
+      setSel(new Set<number>());
+      return;
+    }
+    if (e.altKey && !m && !e.shiftKey && (k === 'u' || k === 'a')) {
+      stop();
+      const id: ToolId = k === 'u' ? 'chop' : 'arp';
+      setToolId(id); setVals(TOOL_META[id].fields.map(f => (id === 'chop' && f.kind === 'num' ? Math.max(0.25, snapNow() || 1) : f.def)));
+      setToolsOpen(true);
+      return;
+    }
     // Ctrl+Shift+X: cut the selection out to a new pattern, in place (the playlist keeps it)
     if (m && e.shiftKey && k === 'x') { stop(); if (s.length) moveSelToPattern(); else say(t('b.pe.noSel')); return; }
     if (m && (k === 'c' || k === 'x') && !e.shiftKey) {
-      stop(); if (!s.length) return;
-      setNoteClip(s.map(i => notesRaw()[i]));
-      if (k === 'x') { const del = new Set(s); commitNotes(notesRaw().filter((_, i) => !del.has(i)), t('b.pe.cutNotes')); setSel(new Set<number>()); }
-      say(t(k === 'x' ? 'b.pe.cutX' : 'b.pe.copiedX', { x: notesText(s.length) }));
+      // copy takes every note when nothing is selected (FL); cut only ever removes a selection
+      stop(); const w = k === 'x' ? s : orAll(); if (!w.length) { if (k === 'x') say(t('b.pe.noSel')); return; }
+      setNoteClip(w.map(i => notesRaw()[i]));
+      if (k === 'x') { const del = new Set(w); commitNotes(notesRaw().filter((_, i) => !del.has(i)), t('b.pe.cutNotes')); setSel(new Set<number>()); }
+      say(t(k === 'x' ? 'b.pe.cutX' : 'b.pe.copiedX', { x: notesText(w.length) }));
       return;
     }
     if (m && k === 'v' && !e.shiftKey) {
       stop(); const clip = noteClip.notes; if (!clip.length) return;
       const a = noteClip.from ?? Math.min(...clip.map(n => n.step)), b = Math.max(...clip.map(n => n.step + n.len));
-      const at = noteClip.at ?? a + Math.max(4, Math.ceil((b - a) / 4 - 1e-9) * 4); // first paste lands after the copied block, further ones chain on
+      // FL: copied notes keep their time, so a bar copied to another pattern or channel lands on the same
+      // bar (out of view: on the first bar shown) and arrives selected, to drag. Notes handed over by the
+      // pitch editor (`at` set) still start where it says and chain on.
+      let at = noteClip.at ?? pasteStart(a, hRange().pos, hRange().len);
+      // a paste exactly onto the notes it copied (Ctrl+C, Ctrl+V in place) would stack invisible doubles:
+      // it goes a whole bar on past the block instead, like FL's paste after its source
+      // the channel's notes by place, so each candidate bar costs O(copied), not O(copied × notes)
+      const key = (step: number, n: Note) => `${Math.round(step * 1e6)}|${Math.round(n.len * 1e6)}|${n.p ?? null}`;
+      const cid = ch().id, here = new Set(notesRaw().filter(o => o.ch === cid).map(o => key(o.step, o)));
+      const lands = (from: number) => clip.every(n => here.has(key(n.step - a + from, n)));
+      for (let guard = 0; guard < 64 && lands(at); guard++) at += Math.max(1, Math.ceil((b - a) / 16 - 1e-9)) * 16;
       const copies = clip.map(n => ({ ...n, ch: ch().id, step: n.step - a + at }));
       const base = notesRaw().length;
       commitNotes([...notesRaw(), ...copies], t('b.pe.pasteNotes')); setSel(new Set(copies.map((_, j) => base + j)));
       // the next paste chains on: right after the block, or a whole bar on when the block keeps its place in the bar
-      noteClip.at = at + (noteClip.from != null ? Math.max(1, Math.ceil((b - a) / 16 - 1e-9)) * 16 : b - a);
+      if (noteClip.at != null) noteClip.at = at + (noteClip.from != null ? Math.max(1, Math.ceil((b - a) / 16 - 1e-9)) * 16 : b - a);
       say(t('b.pe.pastedX', { x: notesText(copies.length) }));
       return;
     }
-    if (m && (k === 'b' || k === 'd')) {
-      stop(); if (!s.length) return;
-      const r = duplicateRight(notesRaw(), s);
+    // FL: Ctrl+D deselects (Ctrl+B duplicates)
+    if (m && k === 'd') { stop(); setSel(new Set<number>()); return; }
+    if (m && k === 'b') {
+      stop(); const w = orAll(); if (!w.length) return;
+      const r = duplicateRight(notesRaw(), w);
       commitNotes(r.notes, t('b.pe.dupNotes')); setSel(new Set(r.idx));
-      say(t('b.pe.dupX', { x: notesText(s.length) }));
+      say(t('b.pe.dupX', { x: notesText(w.length) }));
       return;
     }
-    if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && s.length && !e.shiftKey) {
-      stop();
+    // FL: Shift+↑↓ a semitone, Ctrl+↑↓ an octave, Shift+←→ one grid step; the selection, else every note.
+    // A bare arrow moves nothing: every drawn note is left selected, so a stray ↑ used to transpose it.
+    if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && e.shiftKey !== m && !e.altKey) {
+      stop(); const w = orAll(); if (!w.length) return;
       const d = (e.key === 'ArrowUp' ? 1 : -1) * (m ? 12 : 1);
-      const notes = transpose(notesRaw(), s, d, ch());
+      const notes = transpose(notesRaw(), w, d, ch());
       commitNotes(notes, t(m ? 'b.pe.octave' : 'b.pe.transpose'));
-      const lead = notes[s[s.length - 1]]; audition(ch().id, keyOf(lead, ch()), lead.v ?? 1);
+      const lead = notes[w[w.length - 1]]; audition(ch().id, keyOf(lead, ch()), lead.v ?? 1);
       return;
     }
-    if ((e.key === 'Delete' || e.key === 'Backspace') && s.length) {
-      stop();
-      const del = new Set(s);
+    if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && e.shiftKey && !m && !e.altKey) {
+      stop(); const w = orAll(); if (!w.length) return;
+      commitNotes(nudgeNotes(notesRaw(), w, (e.key === 'ArrowLeft' ? -1 : 1) * (snapNow() || 1 / 32)), t('b.pe.gestMove'));
+      return;
+    }
+    // Delete only ever removes a selection: F7 then Delete, meant for a clip in the Playlist, must not empty the channel
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      stop(); const w = s; if (!w.length) { say(t('b.pe.noSel')); return; }
+      const del = new Set(w);
       commitNotes(notesRaw().filter((_, i) => !del.has(i)), t('b.pe.gestDelNotes')); setSel(new Set<number>());
-      say(t('b.pe.deleted', { x: notesText(s.length) }));
+      say(t('b.pe.deleted', { x: notesText(w.length) }));
       return;
     }
     if (e.key === 'Escape' && sel().size) { stop(); setSel(new Set<number>()); }
@@ -810,12 +717,54 @@ function Roll(props: { z: number; docked?: boolean }) {
   /** The note properties popover, under the clicked note (above it near the bottom). */
   function PropsPop(pp: { idx: number[] }) {
     let box!: HTMLDivElement, first!: HTMLInputElement;
+    // FL's note properties: knobs act at once (one undo step per turn), Reset puts back what the notes
+    // were when the box opened, Accept (Enter) applies the typed fields and closes, Esc closes as it was
+    const orig = notesRaw().slice();
     const init = readProps(notesRaw(), pp.idx, unwrap(ch()));
-    const shown = { vel: init.vel == null ? '' : String(init.vel), start: fmtStart(init.start), len: init.len == null ? '' : fmtLen(init.len), key: noteName(init.key) };
+    const shown = { start: fmtStart(init.start), len: init.len == null ? '' : fmtLen(init.len), key: noteName(init.key) };
     const [err, setErr] = createSignal('');
-    const W = 236, H = (pp.idx.length > 1 ? 196 : 176) + (pp.idx.some(i => notesRaw()[i]?.trig) ? 27 : 0);
+    const picked = () => pp.idx.map(i => notesRaw()[i]).filter(Boolean);
+    /** The double-clicked note: the knobs show its values and set every picked note to them (FL). */
+    const lead = () => notesRaw()[pp.idx[pp.idx.length - 1]] ?? orig[pp.idx[pp.idx.length - 1]];
+    const slides = () => picked().filter(n => n.slide).length;
+    const allSlide = () => slides() === picked().length;
+    // a slide note makes no sound of its own: it has no level or pan
+    const levels = () => !allSlide(), pans = () => panPlays() && !allSlide();
+    const differ = (f: (n: Note) => number) => new Set(picked().filter(n => !n.slide).map(f)).size > 1;
+    let g: Gesture | null = null;
+    const setAll = (f: (n: Note) => Note, label: string) => {
+      const ids = new Set(pp.idx);
+      const notes = notesRaw().map((n, i) => (ids.has(i) && !n.slide ? f(n) : n));
+      if (g) g.update([putNotes(pt(), notes)]); else commitNotes(notes, label);
+    };
+    const withVel = (n: Note, v: number): Note => { const { v: _v, ...rest } = n; return v < 0.995 ? { ...rest, v: Math.round(v * 1000) / 1000 } : rest; };
+    const withPan = (n: Note, p: number): Note => { const { pan: _p, ...rest } = n; return Math.abs(p) > 0.005 ? { ...rest, pan: Math.round(p * 100) / 100 } : rest; };
+    const knob = (k: 'vel' | 'pan') => {
+      const isVel = k === 'vel', label = t(isVel ? 'b.pr.pVel' : 'b.pr.pPan');
+      const val = () => (isVel ? velOf(lead()) : (lead().pan ?? 0));
+      const set = (x: number) => setAll(n => (isVel ? withVel(n, x) : withPan(n, x * 2 - 1)), label);
+      return (
+        <Knob key={'np' + k} size="md" label={isVel ? 'VEL' : 'PAN'} title={label + (pp.idx.length > 1 ? ' — ' + t('b.pr.propsAll') : '')}
+          t={() => (isVel ? val() : (val() + 1) / 2)} zero={isVel ? undefined : () => 0.5}
+          text={() => (differ(n => Math.round((isVel ? velOf(n) : (n.pan ?? 0)) * 100)) ? t('b.pr.pMixed') : isVel ? Math.round(val() * 100) + '%' : panText(val()))}
+          color={isVel ? undefined : 'var(--pan)'}
+          onStart={() => { g = new Gesture(label); }} onChange={set} onEnd={() => { g?.end(); g = null; }}
+          onReset={() => set(isVel ? 1 : 0.5)} onWheel={set} />
+      );
+    };
+    const setSlide = (on: boolean) => {
+      const ids = new Set(pp.idx);
+      // a slide note is held for its length (it sets the glide time): a step trigger becomes a held note
+      commitNotes(notesRaw().map((n, i) => {
+        if (!ids.has(i)) return n;
+        const { slide: _s, ...rest } = n;
+        return on ? { ...rest, slide: true, ...(n.trig ? { trig: false } : {}) } : rest;
+      }), t(on ? 'b.pr.toSlide' : 'b.pr.toNormal'));
+      say(t(on ? 'b.pr.slideSet' : 'b.pr.slideCleared', { x: notesText(pp.idx.length) }));
+    };
+    const W = 252, H = 26 + (pp.idx.length > 1 ? 18 : 0) + 72 + 3 * 27 + (pp.idx.some(i => notesRaw()[i]?.trig) ? 27 : 0) + 36 + 18;
     const place = () => {
-      const n = notesRaw()[pp.idx[pp.idx.length - 1]], G = geo(), { w, h } = size();
+      const n = lead(), G = geo(), { w, h } = size();
       if (!n) return { left: 0, top: 0 };
       const x = rollX(G, n.step), y = rollY(G, keyOf(n, ch()));
       const below = y + G.rowH + 4;
@@ -823,26 +772,29 @@ function Roll(props: { z: number; docked?: boolean }) {
     };
     // the window takes the keyboard back (found before the popover leaves the DOM)
     const close = () => { const w = box.closest<HTMLElement>('.win'); setPropsFor(null); w?.focus({ preventScroll: true }); };
-    const apply = () => {
-      const val = (name: string) => (box.querySelector(`[name=${name}]`) as HTMLInputElement).value.trim();
-      const ch0: { vel?: number; len?: number; start?: number; key?: number } = {};
+    const changed = () => notesRaw().length !== orig.length || notesRaw().some((n, i) => n !== orig[i]);
+    const reset = () => { if (changed()) { commitNotes(orig.slice(), t('b.pr.pReset')); say(t('b.pr.pResetDone')); } setErr(''); };
+    const cancel = () => { reset(); close(); };
+    const accept = () => {
+      const val = (name: string) => (box.querySelector(`[name=${name}]`) as HTMLInputElement | null)?.value.trim() ?? '';
+      const ch0: { len?: number; start?: number; key?: number } = {};
       const bad = (msg: string, name: string) => { setErr(msg); say(msg); (box.querySelector(`[name=${name}]`) as HTMLInputElement).select(); };
       // a field left as shown (or empty when the notes differ) changes nothing
-      const v = val('vel'), s = val('start'), l = val('len'), k = val('key');
-      if (v && v !== shown.vel) { const x = parseVel(v); if (x == null) return bad(t('b.pr.pBadVel'), 'vel'); ch0.vel = x; }
+      const s = val('start'), l = val('len'), k = val('key');
       if (s && s !== shown.start) { const x = parseStart(s); if (x == null) return bad(t('b.pr.pBadStart'), 'start'); ch0.start = x; }
       if (l && l !== shown.len) { const x = parseLen(l); if (x == null) return bad(t('b.pr.pBadLen'), 'len'); ch0.len = x; }
       if (k && k !== shown.key) { const x = parseKey(k); if (x == null) return bad(t('b.pr.pBadKey'), 'key'); ch0.key = x; }
-      if (!Object.keys(ch0).length) return close();
-      const notes = applyProps(notesRaw(), pp.idx, unwrap(ch()), ch0);
-      if (!notes) { setErr(t('b.pr.pRange')); say(t('b.pr.pRange')); return; }
-      commitNotes(notes, t('b.pr.props'));
-      if (ch0.len != null) setLastLen(ch0.len);
-      say(t('b.pr.pDone', { x: notesText(pp.idx.length) }));
+      if (Object.keys(ch0).length) {
+        const notes = applyProps(notesRaw(), pp.idx, unwrap(ch()), ch0);
+        if (!notes) { setErr(t('b.pr.pRange')); say(t('b.pr.pRange')); return; }
+        commitNotes(notes, t('b.pr.props'));
+        if (ch0.len != null) setLastLen(ch0.len);
+      }
+      if (Object.keys(ch0).length || changed()) say(t('b.pr.pDone', { x: notesText(pp.idx.length) }));
       close();
     };
     onMount(() => setTimeout(() => { first.focus(); first.select(); }, 0));
-    const field = (name: 'vel' | 'start' | 'len' | 'key', label: string, tip: string | undefined, ref?: (el: HTMLInputElement) => void) => (
+    const field = (name: 'start' | 'len' | 'key', label: string, tip: string, ref?: (el: HTMLInputElement) => void) => (
       <label class="rpf" title={tip}>
         <span>{label}</span>
         <input ref={ref} name={name} value={shown[name]} placeholder={shown[name] ? '' : t(name === 'len' && pp.idx.every(i => notesRaw()[i]?.trig) ? 'b.pr.trigger' : 'b.pr.pMixed')} spellcheck={false} autocomplete="off" onInput={() => setErr('')} />
@@ -853,13 +805,26 @@ function Roll(props: { z: number; docked?: boolean }) {
         onPointerDown={e => e.stopPropagation()} onWheel={e => e.stopPropagation()}
         onKeyDown={e => {
           e.stopPropagation(); // typed text never reaches the roll's shortcuts or the playlist
-          if (e.key === 'Enter') { e.preventDefault(); apply(); }
-          if (e.key === 'Escape') { e.preventDefault(); close(); }
+          if (e.key === 'Enter') { e.preventDefault(); accept(); }
+          if (e.key === 'Escape') { e.preventDefault(); cancel(); }
         }}>
-        <div class="mt">{pp.idx.length > 1 ? t('b.pr.props') + ' · ' + notesText(pp.idx.length) : t('b.pr.props')}</div>
+        <div class="mt rphead">
+          <span>{t('b.pr.props')}</span>
+          <span class="rpwhat">{pp.idx.length > 1 ? notesText(pp.idx.length) : noteName(keyOf(lead(), ch()))}</span>
+          <button class="rpx" type="button" title={t('b.pr.pCancelTip')} onClick={cancel}>×</button>
+        </div>
         <Show when={pp.idx.length > 1}><div class="rpnote">{t('b.pr.propsN', { x: notesText(pp.idx.length) })}</div></Show>
-        {field('vel', t('b.pr.pVel'), undefined, el => (first = el))}
-        {field('start', t('b.pr.pStart'), t('b.pr.pStartTip'))}
+        <div class="rpknobs">
+          <Show when={pans()}>{knob('pan')}</Show>
+          <Show when={levels()}>{knob('vel')}</Show>
+          <Show when={!levels()}><span class="rpsilent">{t('b.pr.pSlideSilent')}</span></Show>
+          <div style={{ flex: 1 }} />
+          <Show when={slidePlays()}>
+            <button type="button" class="rpled" classList={{ on: allSlide(), part: slides() > 0 && !allSlide() }} aria-pressed={allSlide()} title={t('b.pr.pSlideTip')}
+              onClick={() => setSlide(!allSlide())}><i />{t('b.pr.pSlide')}</button>
+          </Show>
+        </div>
+        {field('start', t('b.pr.pStart'), t('b.pr.pStartTip'), el => (first = el))}
         {field('len', t('b.pr.pLen'), t('b.pr.pLenTip'))}
         <Show when={pp.idx.some(i => notesRaw()[i]?.trig)}>
           <button class="smallbtn" type="button" title={t('b.pr.triggerTip')} onClick={() => {
@@ -869,52 +834,69 @@ function Roll(props: { z: number; docked?: boolean }) {
           }}>{t('b.pr.toHeld')}</button>
         </Show>
         {field('key', t('b.pr.pKey'), t('b.pr.pKeyTip'))}
+        <div class="rpbtns">
+          <button class="smallbtn" type="button" title={t('b.pr.pResetTip')} disabled={!changed()} onClick={reset}>{t('b.pr.pReset')}</button>
+          <button class="smallbtn primary" type="button" title={t('b.pr.pAcceptTip')} onClick={accept}>{t('b.pr.pAccept')}</button>
+        </div>
         <div class="rpfoot" classList={{ err: !!err() }}>{err() || t('b.pr.pFoot')}</div>
       </div>
     );
   }
   return (
-    <PatFrame win={U.rollWin!} key="rollWin" z={props.z} class="rollwin" minW={560} minH={300} compactH={380} docked={props.docked} front={rollFront} onKey={onKey} onHeadDbl={toggleRollMax}
+    <PanelFrame {...patGeom('rollWin')} z={props.z} class="rollwin" minW={560} minH={300} compactH={380} docked={props.docked} dockId="roll" front={rollFront} onKey={onKey} onHeadDbl={toggleRollMax}
+      controls={<WinControls dock={paneDock('roll')} max={props.docked ? undefined : { on: U.rollMax, toggle: toggleRollMax }}
+        close={{ tip: t(props.docked ? 'b.dk.closeRoll' : 'b.pe.close'), act: closeRoll }} />}
       head={<>
         <span class="tile" style={{ width: '20px', height: '20px', background: ch().color + '2e', color: ch().color }}><Icon d={ROLL_ICON} size={12} /></span>
         <span class="wintitle">Piano roll</span>
         <select class="sel chsel" title={t('b.pr.chTitle')} value={String(ch().id)} style={{ color: ch().color }} onChange={e => { selectChannel(+e.currentTarget.value); backToRoll(e.currentTarget); }}>
           <For each={channels()}>{c => <option value={String(c.id)}>{c.name}</option>}</For>
         </select>
-        <button class="patname" title={t('b.rk.patTitle')} onClick={e => { const r = (e.currentTarget as HTMLElement).getBoundingClientRect(); patternMenu(r.left, r.bottom + 4); }}>
-          <span class="sw" style={{ background: pt().color }} /><span class="ell">{pt().name}</span>
-          <svg width="8" height="8" viewBox="0 0 8 8"><path d="M1 2.5l3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.3" /></svg>
-        </button>
-        <div style={{ flex: 1 }} />
-        <DockBtn which="roll" />
-        <button class="closebtn" title={t(props.docked ? 'b.dk.closeRoll' : 'b.pe.close')} onClick={closeRoll}>×</button>
+        <PatternChip pat={pt()} />
       </>}>
     <div class="roll">
       <div class="ptools">
+        <ToolSeg label={t('a.pl.toolsLabel')} value={rollTool()} onPick={(id, el) => { setRollTool(id); backToRoll(el); }}
+          tools={TOOLS.map(tl => ({ id: tl.id, icon: tl.icon, title: t(tl.label) + ' (' + tl.key.toUpperCase() + ') — ' + t(tl.tip) }))} />
         <div class="seg tools">
-          <For each={TOOLS}>{tl => (
-            <button classList={{ on: rollTool() === tl.id }} title={t(tl.label) + ' (' + tl.key.toUpperCase() + ') — ' + t(tl.tip)} onClick={() => setRollTool(tl.id)}>
-              <Icon d={tl.icon} size={14} />
-            </button>
-          )}</For>
+          <button class="slidetog" aria-pressed={slideMode() && slidePlays()} classList={{ on: slideMode() && slidePlays() }} disabled={!slidePlays()}
+            title={slidePlays() ? t('b.pr.slideTip') : t('b.pr.slideNoPlugin')} onClick={e => { toggleSlide(); backToRoll(e.currentTarget); }}>
+            <Icon d={SLIDE_ICON} size={14} />
+          </button>
         </div>
-        <span class="toolname">{t(TOOLS.find(x => x.id === rollTool())!.label)}</span>
         <div class="vsep" />
-        <label class="plab">{t('b.pe.lblGrid')}
-          <select class="sel" title={t('b.pe.snapTitle')} value={String(rollSnap())} onChange={e => { setRollSnap(+e.currentTarget.value); backToRoll(e.currentTarget); }}>
-            <For each={ROLL_SNAPS}>{([l, v]) => <option value={String(v)}>{l}</option>}</For>
-          </select>
-        </label>
-        <label class="plab">{t('b.pe.lblKey')}
-          <span class="row" style={{ gap: '4px' }}>
-            <select class="sel" title={S.project.key == null ? t('b.pe.keyAuto') : t('b.pe.keyScale')} value={String(root())} onChange={e => { commit([setKeyOp(+e.currentTarget.value, scaleIdx())], t('b.pr.keySet')); backToRoll(e.currentTarget); }}>
-              <For each={NOTE_NAMES}>{(n, i) => <option value={String(i())}>{n}</option>}</For>
-            </select>
-            <select class="sel" value={String(scaleIdx())} onChange={e => { commit([setKeyOp(root(), +e.currentTarget.value)], t('b.pr.keySet')); backToRoll(e.currentTarget); }}>
-              <For each={SCALES}>{([l, id]) => <option value={String(id)}>{t(l)}</option>}</For>
-            </select>
-          </span>
-        </label>
+        <ChipSelect label="Snap" title={rollSnap() < 0 ? t('a.tb.snapTipAuto', { unit: rollSnapName(snapNow()) ?? '' }) : t('b.pe.snapTitle')} value={String(rollSnap())}
+          options={[['auto', '-1'], ...ROLL_SNAPS.map(([l, v]): ChipOption => [l, String(v)])]} group={{ label: t('b.pe.snapTriplets'), options: ROLL_SNAPS_TRIPLET.map(([l, v]) => [l, String(v)]) }}
+          onChange={(v, el) => { setRollSnap(+v); backToRoll(el); }} />
+        {/* the song's key, always in view: a tiny keyboard marks the scale's notes (root brightest), the name beside it;
+            a click opens the root and scale pickers. One key for the whole project. */}
+        <div class="toolmenu" ref={keyMenu}>
+          <button class="keybadge" classList={{ on: pop() === 'key' }} aria-expanded={pop() === 'key'} title={S.project.key == null ? t('b.pe.keyAuto') : t('b.pr.songKeyTip')} onClick={() => setPop(v => v === 'key' ? null : 'key')}>
+            <svg class="minikeys" width="43" height="16" viewBox="0 0 43 16">
+              <For each={[0, 2, 4, 5, 7, 9, 11]}>{(pc, i) => <rect x={i() * 6 + 0.5} y="0.5" width="5" height="15" rx="1" class={pcClass(pc)} />}</For>
+              <For each={[[1, 0], [3, 1], [6, 3], [8, 4], [10, 5]]}>{([pc, i]) => <rect x={i * 6 + 4} y="0" width="4" height="9" rx="1" class={'bk ' + pcClass(pc)} />}</For>
+            </svg>
+            <span class="kname">{NOTE_NAMES[root()]} {t(SCALES.find(x => x[1] === scaleIdx())![0]).toLowerCase()}</span>
+            <Show when={S.project.key == null}><span class="kauto">auto</span></Show>
+            <svg width="8" height="8" viewBox="0 0 8 8"><path d="M1 2.5l3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.3" /></svg>
+          </button>
+          <Show when={pop() === 'key'}>
+            <div class="toolpop keypop" onKeyDown={e => { if (e.key === 'Escape') { e.stopPropagation(); setPop(null); } }}>
+              <div class="tphd">{t('b.pr.songKey')}</div>
+              <div class="rootgrid" role="radiogroup">
+                <For each={NOTE_NAMES}>{(n, i) => (
+                  <button role="radio" aria-checked={root() === i()} classList={{ on: root() === i(), bk: n.length > 1 }} onClick={() => commit([setKeyOp(i(), scaleIdx())], t('b.pr.keySet'))}>{n}</button>
+                )}</For>
+              </div>
+              <div class="scalelist" role="radiogroup">
+                <For each={SCALES}>{([l, id]) => (
+                  <button role="radio" aria-checked={scaleIdx() === id} classList={{ on: scaleIdx() === id }} onClick={() => commit([setKeyOp(root(), id)], t('b.pr.keySet'))}>{t(l)}</button>
+                )}</For>
+              </div>
+              <div class="tpnote">{t('b.pr.songKeyNote')}</div>
+            </div>
+          </Show>
+        </div>
         <div style={{ flex: 1 }} />
         <Show when={vocals().length > 0 && chanNotes().length > 0}>
           <button class="smallbtn" style={{ 'align-self': 'center' }} title={t('b.pr.vocalTip')} onClick={vocalRef}>♪ {t('b.pr.vocal')}{vocals().length > 1 ? ' …' : ''}</button>
@@ -922,18 +904,55 @@ function Roll(props: { z: number; docked?: boolean }) {
         <Show when={sel().size > 0}>
           <button class="smallbtn" style={{ 'align-self': 'center' }} title={t('b.pe.toNewPatTip')} onClick={e => { moveSelToPattern(); backToRoll(e.currentTarget); }}>{t('b.pe.toNewPat')}</button>
         </Show>
-        <label class="plab" title={t('b.pr.toolsTip')}>
-          {t('b.pr.tools')}
-          <span class="row" style={{ gap: '4px', 'align-items': 'center' }}>
-            <select class="sel" value={toolId()} onChange={e => { setToolId(e.currentTarget.value as ToolId); const m = TOOL_META[e.currentTarget.value as ToolId]; setToolA(m.defA); setToolB(m.defB); backToRoll(e.currentTarget); }}>
-              <For each={Object.keys(TOOL_META) as ToolId[]}>{v => <option value={v}>{t(TOOL_META[v].label)}</option>}</For>
-            </select>
-            <input class="textin" style={{ width: '52px' }} title={t(TOOL_META[toolId()].labelA)} type="number" step="0.1" value={toolA()} onInput={e => setToolA(+e.currentTarget.value)} onKeyDown={e => e.stopPropagation()} />
-            <input class="textin" style={{ width: '52px' }} title={t(TOOL_META[toolId()].labelB)} type="number" step="0.1" value={toolB()} onInput={e => setToolB(+e.currentTarget.value)} onKeyDown={e => e.stopPropagation()} />
-            <input class="textin" style={{ width: '64px' }} title={t('b.pr.seedTip')} placeholder={t('b.pr.seed')} type="number" step="1" value={toolSeed()} onInput={e => setToolSeed(e.currentTarget.value)} onKeyDown={e => e.stopPropagation()} />
-            <button class="smallbtn" style={{ 'align-self': 'center' }} title={t('b.pr.applyTip')} onClick={e => { applyTool(); backToRoll(e.currentTarget); }}>{t('b.pr.apply')}</button>
-          </span>
-        </label>
+        <div class="toolmenu" ref={toolMenu}>
+          <button class="chip" classList={{ on: toolsOpen() }} aria-expanded={toolsOpen()} title={t('b.pr.toolsTip')} onClick={() => setToolsOpen(v => !v)}>
+            {t('b.pr.tools')}<svg width="8" height="8" viewBox="0 0 8 8"><path d="M1 2.5l3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.3" /></svg>
+          </button>
+          <Show when={toolsOpen()}>
+            <div class="toolpop" onKeyDown={e => { if (e.key === 'Escape') { e.stopPropagation(); setToolsOpen(false); } }}>
+              <div class="toolgrid" role="radiogroup">
+                <For each={Object.keys(TOOL_META) as ToolId[]}>{v => (
+                  <button role="radio" aria-checked={toolId() === v} classList={{ on: toolId() === v }} onClick={() => { setToolId(v); setVals(TOOL_META[v].fields.map(f => f.def)); }}>
+                    <Icon d={TOOL_META[v].icon} size={15} sw={1.8} /><span>{t(TOOL_META[v].label)}</span>
+                  </button>
+                )}</For>
+              </div>
+              <For each={TOOL_META[toolId()].fields}>{(f, i) => f.kind === 'num' ? (
+                // a number is a slider over its useful range, the value beside its name
+                <label class="tpslide" title={t(f.label)}>
+                  <span>{shortLabel(t(f.label))}</span><b>{numText(typeof vals()[i()] === 'number' ? (vals()[i()] as number) : f.def, f.step)}</b>
+                  <input type="range" min={f.min} max={f.max} step={f.step} value={typeof vals()[i()] === 'number' ? (vals()[i()] as number) : f.def}
+                    style={{ '--p': (((typeof vals()[i()] === 'number' ? (vals()[i()] as number) : f.def) - f.min) / (f.max - f.min)) * 100 + '%' }}
+                    onInput={e => setField(i(), +e.currentTarget.value)} onDblClick={() => setField(i(), f.def)} />
+                </label>
+              ) : (
+                <label class="tprow"><span>{t(f.label)}</span>{f.kind === 'select' ? (
+                  <select class="sel" value={String(vals()[i()] ?? f.def)} onChange={e => setField(i(), e.currentTarget.value)}>
+                    <For each={f.options}>{o => <option value={o.v}>{t(o.l)}</option>}</For>
+                  </select>
+                ) : (
+                  <input type="checkbox" checked={vals()[i()] !== false} onInput={e => setField(i(), e.currentTarget.checked)} />
+                )}</label>
+              )}</For>
+              <label class="tprow" title={t('b.pr.seedTip')}><span>{t('b.pr.seed')}</span>
+                <input class="textin" type="number" step="1" value={toolSeed()} onInput={e => setToolSeed(e.currentTarget.value)} onKeyDown={e => { if (e.key !== 'Escape') e.stopPropagation(); }} />
+              </label>
+              <button class="smallbtn primary" title={t('b.pr.applyTip')} onClick={e => { applyTool(); backToRoll(e.currentTarget); }}>{t('b.pr.apply')}</button>
+            </div>
+          </Show>
+        </div>
+        <Show when={rollTool() === 'stamp'}>
+          <label class="plab">{t('b.pr.stamp.type')}
+            <span class="row" style={{ gap: '4px' }}>
+              <select class="sel" title={t('b.pr.stamp.typeTitle')} value={stampType()} onChange={e => { setStampType(e.currentTarget.value); backToRoll(e.currentTarget); }}>
+                <For each={STAMP_TYPES}>{o => <option value={o.v}>{t(o.l)}</option>}</For>
+              </select>
+              <select class="sel" title={t('b.pr.stamp.invTitle')} value={String(stampInv())} onChange={e => { setStampInv(+e.currentTarget.value); backToRoll(e.currentTarget); }}>
+                <For each={STAMP_INVS}>{o => <option value={String(o.v)}>{t(o.l)}</option>}</For>
+              </select>
+            </span>
+          </label>
+        </Show>
         <span class="note mono" style={{ 'align-self': 'center', 'font-size': '10px', color: 'var(--fg5)' }}>{sel().size ? t('b.pe.nSel', { n: sel().size }) : notesText(chanNotes().length)}{t('b.pe.newNote', { len: lastLenText() })}</span>
       </div>
       <div class="rollgrid">
@@ -951,30 +970,37 @@ function Roll(props: { z: number; docked?: boolean }) {
         </div>
         <div ref={wrap} class="parea">
           <canvas ref={cv} style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', 'touch-action': 'none' }}
-            onPointerDown={down} onPointerMove={move} onPointerLeave={() => { ptr = null; }} onWheel={wheel} onContextMenu={e => e.preventDefault()} />
+            onPointerDown={e => rollDown(ctx, ptrOf(e))} onPointerMove={onMove} onPointerLeave={() => { ptr = null; setStampGhost(null); setHoverChord(''); }} onWheel={wheel} onContextMenu={e => e.preventDefault()} />
           <div ref={phead} class="pphead" />
           <Show when={propsFor()} keyed>{idx => <PropsPop idx={idx} />}</Show>
         </div>
         <ZoomScrollbar orient="v" range={vRange} limits={vLimits} onChange={setV} title={t('b.pr.vbarTip')} />
       </div>
-      <div class="lanerow" style={{ height: LANE_H + 'px' }}>
+      <div class="lanerow" style={{ height: LANE_H + 'px', display: laneOn() ? undefined : 'none' }}>
         <div ref={laneWrap} class="lanecv">
           <canvas ref={laneCv} style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', 'touch-action': 'none', cursor: 'ns-resize' }}
-            onPointerDown={laneDown} onContextMenu={e => e.preventDefault()} />
-          <span class="lanetag tag9">VEL</span>
+            onPointerDown={laneDown} onPointerMove={laneHover} onContextMenu={e => e.preventDefault()} />
+<LaneSwitch label={t('b.pr.laneTarget')} value={lane()} onPick={(id, el) => { setLaneMode(id); backToRoll(el); }} items={[
+            { id: 'vel', cls: 'vel', label: t('b.pr.laneVel'), icon: LANE_ICONS.vel, tip: t('b.pr.laneVelTip') },
+            { id: 'pan', cls: 'pan', label: t('b.pr.lanePan'), icon: LANE_ICONS.pan, tip: t(panPlays() ? 'b.pr.lanePanTip' : 'b.pr.lanePanOff'), disabled: !panPlays() },
+          ]} />
         </div>
       </div>
       <div class="pstatus mono">
         <span>{ch().name} · {chanKindLabel(ch())}</span>
         <span>{t(TOOLS.find(x => x.id === rollTool())!.tip)}</span>
-        <span class="rollhint" title={t('b.pr.keysTip')}>{t('b.pe.rollHint')}</span>
+        <Show when={hoverChord()}>
+          <span title={t('b.pr.chordTitle')} style={{ color: 'var(--acc2)' }}>{hoverChord()}</span>
+        </Show>
+        <button class="hintlink" title={t('b.pr.keysTip')} onClick={() => setU('help', true)}>{t('a.mn.shortcuts')}</button>
       </div>
     </div>
-    </PatFrame>
+    </PanelFrame>
   );
 }
 
 function lastLenText() {
+  if (lastTrig()) return t('b.pe.newStep');
   const l = lastLen();
-  return l >= 4 && l % 4 === 0 ? t(l === 4 ? 'b.pe.beat1' : 'b.pe.beatN', { n: l / 4 }) : l === 1 ? '1/16' : l === 2 ? '1/8' : l === 0.5 ? '1/32' : t('b.pe.stepsN', { n: l });
+  return l >= 4 && l % 4 === 0 ? t(l === 4 ? 'b.pe.beat1' : 'b.pe.beatN', { n: l / 4 }) : rollSnapName(l) ?? t('b.pe.stepsN', { n: +l.toFixed(2) });
 }

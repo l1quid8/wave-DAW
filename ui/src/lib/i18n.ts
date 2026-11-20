@@ -2,7 +2,7 @@ import { createSignal } from 'solid-js';
 import { en } from '../i18n/en';
 import { pl } from '../i18n/pl';
 import { names as fxNames } from '../i18n/names-fx';
-import { names as synthNames } from '../i18n/names-synth';
+import { names as synthNames, plNames } from '../i18n/names-synth';
 import { shortcuts } from './platform';
 
 export type Lang = 'en' | 'pl';
@@ -39,5 +39,7 @@ export function t(key: TranslationKey, vars: Record<string, string | number> = {
 const names: Record<string, string> = { ...fxNames, ...synthNames };
 
 export function tName(name: string): string {
-  return lang() === 'en' && Object.prototype.hasOwnProperty.call(names, name) ? names[name] : name;
+  const own = (m: Record<string, string>) => Object.prototype.hasOwnProperty.call(m, name);
+  if (lang() === 'en') return own(names) ? names[name] : name;
+  return own(plNames) ? plNames[name] : name;
 }

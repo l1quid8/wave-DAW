@@ -1,4 +1,4 @@
-//! Automation of Channel Rack channels, synth and WAVE Keys parameters, and audio clips.
+//! Automation of Channel Rack channels, synth and Synkopa Keys parameters, and audio clips.
 
 use std::sync::Arc;
 
@@ -35,6 +35,8 @@ fn auto_clip(id: Id, source: Id, track: u32, len: f64) -> Clip {
         stretch: 1.0,
         resample: false,
         pitch: 0.0,
+        insert: None,
+        root: 60,
     }
 }
 
@@ -105,7 +107,7 @@ fn a_clips_gain_automation_glides_without_steps() {
     let mut p = Project::empty();
     p.inserts[0].fx.clear();
     let e = Engine::new(p, Arc::new(NoPlugins));
-    let (_, clips) = e.import_audio(std::slice::from_ref(&wav), Some((0, 0.0))).unwrap();
+    let (_, clips, _) = e.import_audio(std::slice::from_ref(&wav), Some((0, 0.0))).unwrap();
     // gain ramps from +12 dB (v = 1) down to −24 dB (v = 0) over 4 beats
     let a = Automation {
         id: 9200,
@@ -176,6 +178,8 @@ fn synth_parameter_automation_closes_the_filter() {
         stretch: 1.0,
         resample: false,
         pitch: 0.0,
+        insert: None,
+        root: 60,
     }];
     p.automations.push(step_down(9400, AutoTarget::Synth { chan_id: ch, param: cutoff }, 1.0, 0.0));
     p.clips.push(auto_clip(9401, 9400, 1, 8.0));
@@ -220,7 +224,7 @@ fn an_edit_during_playback_keeps_the_automated_value() {
         m.fx.clear();
     }
     let e = Engine::new(p, Arc::new(NoPlugins));
-    let (_, clips) = e.import_audio(std::slice::from_ref(&wav), Some((0, 0.0))).unwrap();
+    let (_, clips, _) = e.import_audio(std::slice::from_ref(&wav), Some((0, 0.0))).unwrap();
     let a = Automation {
         id: 9500,
         name: "g".into(),
@@ -280,4 +284,82 @@ fn shaped_segments_play_their_shape_and_old_points_stay_straight() {
     assert!(b.value_at(2.0).unwrap() < 0.05, "a bent curve rises late");
     let json = serde_json::to_string(&b.points[1]).unwrap();
     assert!(json.contains(r#""tension":1.0"#) && !json.contains("shape"), "{json}");
+}
+
+/// An automation clip `len` beats long at `start` holding `v` for its whole length.
+fn held(id: Id, target: AutoTarget, v: f32, start: f64, len: f64, track: u32) -> (Automation, Clip) {
+    let a =
+        Automation { id, name: "a".into(), color: "#e0a44a".into(), target, points: vec![AutoPoint::at(0.0, v), AutoPoint::at(len, v)] };
+    let mut c = auto_clip(id + 1, id, track, len);
+    c.start = start;
+    (a, c)
+}
+
+#[test]
+fn before_the_first_automation_clip_the_target_holds_the_clips_first_value() {
+    // the only automation clip starts in the middle of the song at 0: the channels must be at 0
+    // from the song start too, not at their static (full) volume until the clip is reached
+    let mut p = drums_only();
+    let ids: Vec<Id> = p.channels.iter().map(|c| c.id).collect();
+    for (k, id) in ids.iter().enumerate() {
+        let (a, c) = held(9600 + k as Id * 2, AutoTarget::ChanVol { id: *id }, 0.0, 4.0, 4.0, 7);
+        p.automations.push(a);
+        p.clips.push(c);
+    }
+    let out = Engine::new(p, Arc::new(NoPlugins)).render(0.0, 8.0, 0.0, SR).unwrap();
+    assert!(rms(&out[at(0.0)..at(3.9)]) < 1e-4, "full volume before the automation clip (rms {})", rms(&out[at(0.0)..at(3.9)]));
+    assert!(rms(&out[at(4.1)..at(8.0)]) < 1e-4, "the automation clip itself holds the channels at 0");
+}
+
+#[test]
+fn between_and_after_automation_clips_the_target_holds_the_last_clips_end_value() {
+    // 0 over beats 2..4, then full over 8..10: the gap holds 0 (where the first clip ended),
+    // the start holds 0 (where the first clip begins), the end holds full
+    let mut p = drums_only();
+    let ids: Vec<Id> = p.channels.iter().map(|c| c.id).collect();
+    for (k, id) in ids.iter().enumerate() {
+        let (a, c) = held(9700 + k as Id * 4, AutoTarget::ChanVol { id: *id }, 0.0, 2.0, 2.0, 7);
+        p.automations.push(a);
+        p.clips.push(c);
+        let (a, c) = held(9702 + k as Id * 4, AutoTarget::ChanVol { id: *id }, VOL_UNITY, 8.0, 2.0, 7);
+        p.automations.push(a);
+        p.clips.push(c);
+    }
+    let out = Engine::new(p, Arc::new(NoPlugins)).render(0.0, 12.0, 0.0, SR).unwrap();
+    assert!(rms(&out[at(0.0)..at(1.9)]) < 1e-4, "before the first clip: not its first value");
+    assert!(rms(&out[at(4.1)..at(7.9)]) < 1e-4, "between the clips: not the first clip's end value");
+    assert!(rms(&out[at(10.1)..at(12.0)]) > 0.01, "after the last clip: not its end value");
+}
+
+#[test]
+fn live_playback_before_the_automation_clip_follows_it_on_every_pass() {
+    // live playback, twice from the start: the channels are automated to 0 from beat 4 on, so
+    // they must be silent from the very first block of each pass, whatever the previous pass left
+    const BLOCK: usize = 256;
+    let mut p = drums_only();
+    let ids: Vec<Id> = p.channels.iter().map(|c| c.id).collect();
+    for (k, id) in ids.iter().enumerate() {
+        let (a, c) = held(9800 + k as Id * 2, AutoTarget::ChanVol { id: *id }, 0.0, 4.0, 4.0, 7);
+        p.automations.push(a);
+        p.clips.push(c);
+    }
+    let e = Engine::new(p, Arc::new(NoPlugins));
+    let mut rt = e.create_rt(SR as f32, BLOCK);
+    let run = |rt: &mut Rt, blocks: usize| {
+        let (mut l, mut r) = (vec![0f32; BLOCK], vec![0f32; BLOCK]);
+        let mut peak = 0f32;
+        for _ in 0..blocks {
+            rt.process(&mut l, &mut r, None);
+            peak = l.iter().chain(r.iter()).fold(peak, |m, v| m.max(v.abs()));
+        }
+        peak
+    };
+    let first_beats = (3.5 * 60.0 / 128.0 * SR as f64) as usize / BLOCK;
+    for pass in 0..2 {
+        e.play(0.0);
+        let p = run(&mut rt, first_beats);
+        assert!(p < 1e-4, "pass {pass}: the channels played before the automation clip (peak {p})");
+        let _ = e.stop();
+        run(&mut rt, 4);
+    }
 }

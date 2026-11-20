@@ -46,6 +46,8 @@ fn clip(id: Id, track: u32, start: f64, len: f64, pat: Id) -> Clip {
         stretch: 1.0,
         resample: false,
         pitch: 0.0,
+        insert: None,
+        root: 60,
     }
 }
 
@@ -73,7 +75,7 @@ fn new_projects_start_with_the_starter_kit_as_samplers() {
     assert_eq!(p.channels.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["Kick", "Clap", "Hat", "Snare"]);
     for (c, (file, _)) in p.channels.iter().zip(STARTER_KIT) {
         // every channel is a plain sampler of a standard-library file the project lists
-        let ChannelSrc::Sample { source, sampler } = c.src else { panic!("{} is not a sampler", c.name) };
+        let ChannelSrc::Sample { source, sampler, .. } = c.src else { panic!("{} is not a sampler", c.name) };
         assert_eq!(sampler, SamplerState::default());
         let src = p.sources.iter().find(|s| s.id == source).unwrap();
         assert_eq!(src.path, format!("lib:Standard/{file}"));
@@ -144,8 +146,8 @@ fn files_with_the_old_synthesised_instruments_open_as_samplers() {
     let notes: Vec<&Note> = p.patterns.iter().flat_map(|pt| &pt.notes).collect();
     assert_eq!(notes.len(), 23);
     assert!(notes.iter().all(|n| p.channel(n.ch).is_some()));
-    // the bass held its notes: it is the one gated sampler
-    let gated: Vec<bool> = p.channels.iter().map(|c| matches!(c.src, ChannelSrc::Sample { sampler, .. } if sampler.gate)).collect();
+    // the bass held its notes: it is the one sampler with its envelope on
+    let gated: Vec<bool> = p.channels.iter().map(|c| matches!(c.src, ChannelSrc::Sample { sampler, .. } if sampler.env)).collect();
     assert_eq!(gated.iter().filter(|g| **g).count(), 1);
     assert!(rms(&e.render(0.0, 32.0, 0.0, SR).unwrap()) > 0.01);
     // a file with `"kind":"inst"` channels (after channels, before the standard library)
@@ -206,20 +208,21 @@ fn sampler_channel_plays_its_sample_at_the_note_pitch() {
     let wav = dir.join("a440.wav");
     sine_wav(&wav, 440.0);
     let e = Engine::new(Project::routed(), Arc::new(NoPlugins));
-    let (srcs, _) = e.import_audio(&[wav], None).unwrap();
+    let (srcs, ..) = e.import_audio(&[wav], None).unwrap();
     let p = e.project();
     let id = p.next_id;
     let ch = Channel {
         id,
         name: "A440".into(),
         color: "#47b8a8".into(),
-        src: ChannelSrc::Sample { source: srcs[0], sampler: SamplerState::default() },
+        src: ChannelSrc::Sample { source: srcs[0], sampler: SamplerState::default(), slices: vec![] },
         vol: VOL_UNITY,
         pan: 0.0,
         mute: false,
         solo: false,
         insert: None,
         root: SAMPLE_ROOT,
+        group: None,
     };
     // no master limiter: a clean measurement
     let lim = p.inserts[0].fx.iter().map(|f| Op::RemoveFx { fx_id: f.id });
@@ -335,7 +338,7 @@ fn step_edits_undo_and_redo() {
     pat.notes.retain(|n| n.step != 0.0);
     e.apply(&[Op::PutPattern { pattern: pat.clone() }], false, None).unwrap();
     // a velocity drag: many transient edits, one undo step
-    e.begin_gesture();
+    e.begin_gesture(None);
     for v in [0.9, 0.7, 0.5] {
         pat.notes[0].v = v;
         e.apply(&[Op::PutPattern { pattern: pat.clone() }], true, None).unwrap();
@@ -387,6 +390,25 @@ fn channels_mute_solo_route_and_remove() {
     let out = e.render(0.0, 4.0, 0.0, SR).unwrap();
     let r: Vec<f32> = out.as_chunks::<2>().0.iter().map(|f| f[1]).collect();
     assert!(rms(&left(&out)) > 0.01 && rms(&r) < 1e-9);
+    // a note's own pan is added to its channel's: hard-right notes on a hard-left channel sit in the middle
+    let mut pt = e.project().patterns[0].clone();
+    for n in pt.notes.iter_mut().filter(|n| n.ch == k) {
+        n.pan = 1.0;
+    }
+    e.apply(&[Op::PutPattern { pattern: pt.clone() }], false, None).unwrap();
+    let out = e.render(0.0, 4.0, 0.0, SR).unwrap();
+    let r: Vec<f32> = out.as_chunks::<2>().0.iter().map(|f| f[1]).collect();
+    assert!(rms(&left(&out)) > 0.01 && (rms(&r) / rms(&left(&out)) - 1.0).abs() < 1e-3);
+    // on a centred channel they play on the right only
+    let mut kc = e.project().channel(k).unwrap().clone();
+    kc.pan = 0.0;
+    e.apply(&[Op::PutChannel { channel: kc, index: None }], false, None).unwrap();
+    let out = e.render(0.0, 4.0, 0.0, SR).unwrap();
+    let r: Vec<f32> = out.as_chunks::<2>().0.iter().map(|f| f[1]).collect();
+    assert!(rms(&r) > 0.01 && rms(&left(&out)) < 1e-9);
+    // a pan outside -1..1 is refused
+    pt.notes[0].pan = 1.5;
+    assert!(e.apply(&[Op::PutPattern { pattern: pt }], false, None).is_err());
     // removing a channel removes its notes everywhere
     e.apply(&[Op::RemoveChannel { id: k }], false, None).unwrap();
     assert!(e.project().patterns[0].notes.iter().all(|n| n.ch != k));
@@ -403,20 +425,21 @@ fn save_and_open_round_trip() {
     let wav = dir.join("tone.wav");
     sine_wav(&wav, 330.0);
     let e = Engine::new(Project::sketch(), Arc::new(NoPlugins));
-    let (srcs, _) = e.import_audio(&[wav], None).unwrap();
+    let (srcs, ..) = e.import_audio(&[wav], None).unwrap();
     let p = e.project();
     let id = p.next_id;
     let ch = Channel {
         id,
         name: "Tone".into(),
         color: "#47b8a8".into(),
-        src: ChannelSrc::Sample { source: srcs[0], sampler: SamplerState::default() },
+        src: ChannelSrc::Sample { source: srcs[0], sampler: SamplerState::default(), slices: vec![] },
         vol: 0.6,
         pan: 0.25,
         mute: false,
         solo: true,
         insert: Some(4),
         root: 57,
+        group: None,
     };
     let mut pat = p.patterns[0].clone();
     pat.swing = 0.4;
@@ -506,4 +529,126 @@ fn pattern_loop_starts_where_asked_and_stays_in_its_range() {
     e.pattern_play(None, 0.0, None).unwrap();
     run_rt(&mut rt, 256);
     assert_eq!(sh.pat_beat(), -1.0);
+}
+
+#[test]
+fn the_metronome_counts_the_pattern_loop() {
+    // an empty 2-beat pattern looped on its own: with the metronome on, a click on every beat
+    // of it (each loop pass too); off, silence
+    let clicks = |metro: bool| {
+        let p = one_pattern(vec![], 2.0, 0.0);
+        let spb = 60.0 / p.bpm;
+        let e = Engine::new(p, Arc::new(NoPlugins));
+        let mut rt = e.create_rt(SR as f32, 256);
+        e.set_transport(Some(metro), None, None, None);
+        e.pattern_play(Some(1), 0.0, None).unwrap();
+        let n = (4.5 * spb * SR as f64) as usize / 256;
+        let (mut l, mut r) = ([0.0; 256], [0.0; 256]);
+        let out: Vec<f32> = (0..n)
+            .flat_map(|_| {
+                rt.process(&mut l, &mut r, None);
+                l
+            })
+            .collect();
+        (out, (spb * SR as f64) as usize)
+    };
+    let (quiet, _) = clicks(false);
+    assert!(rms(&quiet) < 1e-9, "the metronome is off");
+    let (out, beat) = clicks(true);
+    for b in 0..4 {
+        let at = b * beat;
+        let win = &out[at..at + beat / 2];
+        let first = win.iter().position(|v| v.abs() > 1e-4);
+        assert!(first.is_some_and(|i| i < 64), "no click on beat {b} of the pattern loop");
+    }
+}
+
+/// PAT mode plays the pattern itself: the insert of the playlist track its clip is on (its
+/// effects, fader, mute) belongs to the song, so the loop goes past it; a channel's own insert
+/// still applies.
+#[test]
+fn pattern_loop_skips_the_playlist_tracks_insert() {
+    let mut p = one_pattern(vec![], 4.0, 0.0);
+    let k = chan(&p, "Kick");
+    p.channels.iter_mut().find(|c| c.id == k).unwrap().insert = None;
+    p.patterns[0].notes = vec![Note::new(k, 0.0, 1.0, None)];
+    let track_ins = p.tracks[0].insert;
+    assert_ne!(track_ins, 0, "the clip's track plays into an insert of its own");
+    p.inserts.iter_mut().find(|m| m.id == track_ins).unwrap().muted = true;
+    let other = p.inserts.iter().find(|m| m.id != 0 && m.id != track_ins).unwrap().id;
+    let e = Engine::new(p.clone(), Arc::new(NoPlugins));
+    assert!(e.render(0.0, 4.0, 0.0, SR).unwrap().iter().all(|x| x.abs() < 1e-6), "the song goes through the muted insert");
+    let mut rt = e.create_rt(SR as f32, 256);
+    e.pattern_play(Some(1), 0.0, None).unwrap();
+    assert!(run_rt(&mut rt, SR as usize / 2) > 0.05, "the loop must not go through the track's insert");
+    // a key played over the loop sounds like the loop
+    e.pattern_play(Some(1), 0.0, Some((2.0, 3.0))).unwrap();
+    run_rt(&mut rt, SR as usize);
+    e.note_audition(k, None, 0.8, Some(1)).unwrap();
+    assert!(run_rt(&mut rt, SR as usize / 4) > 0.05, "an audition over the loop goes where the loop goes");
+    e.pattern_play(None, 0.0, None).unwrap();
+    run_rt(&mut rt, SR as usize);
+
+    // the channel's own insert is its sound in every mode
+    p.inserts.iter_mut().find(|m| m.id == track_ins).unwrap().muted = false;
+    p.inserts.iter_mut().find(|m| m.id == other).unwrap().muted = true;
+    p.channels.iter_mut().find(|c| c.id == k).unwrap().insert = Some(other);
+    let e = Engine::new(p, Arc::new(NoPlugins));
+    let mut rt = e.create_rt(SR as f32, 256);
+    e.pattern_play(Some(1), 0.0, None).unwrap();
+    assert!(run_rt(&mut rt, SR as usize / 2) < 1e-6, "a channel's own (muted) insert still applies");
+}
+
+/// Issue #125: a new project's Kick, Clap, Hat and Snare play into inserts 1-4, named after them
+/// (FL Studio's default template), so a fader there acts on the drum at once.
+#[test]
+fn the_starter_kit_plays_into_its_own_named_inserts() {
+    let p = Project::empty();
+    for (i, name) in ["Kick", "Clap", "Hat", "Snare"].into_iter().enumerate() {
+        let ch = p.channels.iter().find(|c| c.name == name).unwrap();
+        assert_eq!(ch.insert, Some(i as Id + 1), "{name}");
+        assert_eq!(p.inserts.iter().find(|m| m.id == i as Id + 1).unwrap().name, name);
+    }
+    assert!(p.tracks.iter().all(|t| t.insert == 0), "playlist tracks stay plain lanes");
+    // a loaded project keeps its own routing (the starter kit is not rerouted on load)
+    let mut q = p.clone();
+    q.channels[0].insert = None;
+    q.migrate();
+    assert_eq!(q.channels[0].insert, None);
+}
+
+/// Issue #125: PAT mode's export renders the current pattern alone, with an empty Playlist, through
+/// the channels' own inserts, and leaves the project as it was. The song of an empty Playlist is silence.
+#[test]
+fn a_pattern_exports_with_an_empty_playlist() {
+    let mut p = Project::empty();
+    p.inserts[0].fx.clear();
+    let kick = chan(&p, "Kick");
+    p.patterns[0].notes = vec![Note::trigger(kick, 0.0, None)];
+    p.patterns[0].fit_len();
+    assert!(p.clips.is_empty());
+    let e = Engine::new(p, Arc::new(NoPlugins));
+    let before = e.state();
+    let (from, to) = Engine::export_range(&before.project, false);
+    let song = e.render(from, to, 0.0, SR).unwrap();
+    assert!(rms(&song) < 1e-6, "the song of an empty Playlist is silence");
+    let pid = before.project.patterns[0].id;
+    assert_eq!(Engine::pattern_range(&before.project, pid), Some((0.0, 4.0)));
+    let no = std::sync::atomic::AtomicBool::new(false);
+    let pat = e.render_bounce(None, Some(pid), 0.0, 4.0, RenderTail::Seconds(0.0), SR, &no, &mut |_| {}).unwrap();
+    assert!(rms(&pat) > 1e-3, "the pattern sounds: {}", rms(&pat));
+    assert_eq!(pat.len(), 2 * (4.0 * 60.0 / 128.0 * SR as f64) as usize);
+    let after = e.state();
+    assert_eq!(after.revision, before.revision);
+    assert!(after.project.clips.is_empty(), "the export does not touch the arrangement");
+    // the kick's own insert is in the path: its fader down silences the export
+    let mut ins = after.project.inserts.iter().find(|m| m.id == 1).unwrap().clone();
+    ins.vol = 0.0;
+    e.apply(&[Op::PutInsert { insert: ins }], false, None).unwrap();
+    let quiet = e.render_bounce(None, Some(pid), 0.0, 4.0, RenderTail::Seconds(0.0), SR, &no, &mut |_| {}).unwrap();
+    assert!(rms(&quiet) < 1e-6, "Insert 1 carries the kick: {}", rms(&quiet));
+    // a stem of the pattern: only the insert it plays into has sound
+    let stems = Engine::stem_inserts(&pattern_project(e.project(), pid));
+    assert!(stems.iter().any(|(id, name)| *id == 1 && name == "Kick"), "{stems:?}");
+    assert!(e.render_bounce(None, Some(999_999), 0.0, 4.0, RenderTail::Seconds(0.0), SR, &no, &mut |_| {}).is_err());
 }

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { samplerDefault, type Channel, type Note, type Project } from '../api/types';
 import { applyAll } from './applyOps';
 import { copyChannelNotes, gridW, pasteChannelNotes } from './pattern';
-import { fitOnScreen, moveIndex, RACK_FIT_STEPS, rackDockFitWidth, rackFitWidth, rackMoveIndex, rackSampleDrop } from './rack';
+import { fitOnScreen, moveIndex, RACK_DOCK_FIT_STEPS, RACK_FIT_STEPS, rackDockFitWidth, rackFitWidth, rackMoveIndex, rackSampleDrop } from './rack';
 
 const geo = { left: 212, cw: 22, pad: 8, min: 480, room: 5000 };
 const ch = (id: number, name: string): Channel => ({ id, name, color: '#4f8ef7', kind: 'sample', source: 1, sampler: samplerDefault(), vol: 0.7937, pan: 0, mute: false, solo: false, insert: null, root: 60 });
@@ -115,7 +115,11 @@ describe('rackDockFitWidth', () => {
   });
   it('grows with the pattern, never below the minimum, and is bounded', () => {
     expect(rackDockFitWidth(1, g)).toBe(480);
-    expect(rackDockFitWidth(32, g)).toBeGreaterThan(rackDockFitWidth(16, g));
-    expect(rackDockFitWidth(100000, g)).toBe(rackDockFitWidth(RACK_FIT_STEPS, g));
+    expect(rackDockFitWidth(12, g)).toBeGreaterThanOrEqual(rackDockFitWidth(8, g));
+    expect(rackDockFitWidth(100000, g)).toBe(rackDockFitWidth(RACK_DOCK_FIT_STEPS, g));
+  });
+  it('stops at one bar, so a long pattern scrolls instead of squeezing the Playlist', () => {
+    expect(rackDockFitWidth(64, g)).toBe(rackDockFitWidth(RACK_DOCK_FIT_STEPS, g));
+    expect(rackDockFitWidth(64, g)).toBeLessThan(rackFitWidth(64, { ...g, room: 5000 }));
   });
 });

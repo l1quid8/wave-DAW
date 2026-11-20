@@ -2,7 +2,17 @@
 // Only edges (play/stop, preview on/off) are written into the reactive UI store.
 import { be } from '../api/backend';
 import { TelemetryDecoder, type FxFrame } from '../api/telemetry';
+import { noteMasterPeak } from './masterClip';
+import { noteUnderruns } from './underruns';
 import { setU, U } from './ui';
+
+/** A frame can be older than the last play/stop/pattern command the UI sent (it was produced
+ *  before the audio thread took the command): for this long after one, frames do not overwrite
+ *  the play state the command set, so a quick PAT/SONG switch never flips back. */
+const SETTLE_MS = 250;
+let cmdAt = -Infinity;
+/** Call when sending a command that changes what plays (song play/stop, pattern loop on/off). */
+export function markPlayCmd() { cmdAt = performance.now(); }
 
 export const tele = new TelemetryDecoder();
 /** Bumped on every decoded frame. */
@@ -31,9 +41,13 @@ function onFrame() {
     const ls = fxListeners.get(id), a = tele.fx.get(id);
     if (ls && a) for (const cb of ls) { try { cb(a, teleClock.lastAt); } catch (e) { console.error(e); } }
   }
-  if (f.playing !== U.playing) setU('playing', f.playing);
+  const master = f.ins.get(0);
+  if (master) noteMasterPeak(master.l, master.r, f.beat, f.patBeat);
+  noteUnderruns(f.underruns);
+  const settled = teleClock.lastAt - cmdAt > SETTLE_MS;
+  if (settled && f.playing !== U.playing) setU('playing', f.playing);
   if (f.previewing !== U.previewing) setU('previewing', f.previewing);
-  if ((f.patBeat >= 0) !== U.patPlaying) setU('patPlaying', f.patBeat >= 0);
+  if (settled && (f.patBeat >= 0) !== U.patPlaying) setU('patPlaying', f.patBeat >= 0);
   const r = f.rec;
   if (r) {
     if (!recState.active || r.clipStart !== recState.clipStart || r.track !== recState.track) {

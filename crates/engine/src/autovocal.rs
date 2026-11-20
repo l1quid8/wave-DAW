@@ -1103,8 +1103,15 @@ mod tests {
         for (i, c) in curve.iter_mut().enumerate().take(300) {
             *c = [61.0, 63.0, 66.0, 68.0, 70.0][i % 5]; // only black keys: none is in C major
         }
-        let pa =
-            PitchAnalysis { rate: 200.0, curve, levels: vec![0.1; 400], confidence: vec![0.9; 400], notes: vec![], backend: "yin".into() };
+        let pa = PitchAnalysis {
+            rate: 200.0,
+            curve,
+            levels: vec![0.1; 400],
+            confidence: vec![0.9; 400],
+            notes: vec![],
+            backend: "yin".into(),
+            onsets: vec![],
+        };
         let key =
             crate::music::KeyEstimate { root: 0, minor: false, confidence: 0.5, candidates: vec![], chroma: [0.0; 12], tuning_cents: 0.0 };
         let p = plan(&PlanInput { vocal: &x, sr: SR, style: Style::Natural, key: Some(key), pitch: Some(&pa), beat: None });

@@ -1,4 +1,4 @@
-//! Audio devices for WAVE.
+//! Audio devices for Synkopa.
 //!
 //! One thread owns the cpal streams (they are not `Send` on every platform);
 //! the app talks to it through [`AudioIo`]. The output callback owns the
@@ -139,7 +139,7 @@ fn pick_host(want: &str) -> (cpal::Host, Option<String>) {
             }
         }
         let note = if want == "asio" && !asio_compiled() {
-            "This WAVE build has no ASIO host. Using the system audio instead — install a release build with ASIO.".to_string()
+            "This Synkopa build has no ASIO host. Using the system audio instead — install a release build with ASIO.".to_string()
         } else {
             format!("Audio host \"{want}\" is not available here; using {}.", cpal::default_host().id().name())
         };
@@ -210,7 +210,7 @@ fn focusrite_unavailable(cfg: &AudioConfig) -> AudioStatus {
 fn finish_interrupted_audio(engine: &Engine) {
     // Save the part of the take already captured and prevent a subsequent
     // switch from silently routing recording or monitoring to another mic.
-    engine.stop();
+    let _ = engine.stop();
     engine.set_transport(None, None, Some(false), Some(false));
 }
 
@@ -325,12 +325,16 @@ impl AudioIo {
                                 lost = None;
                                 let reason = why.as_deref().unwrap_or("the device was unavailable");
                                 status = AudioStatus { note: Some(format!("Audio restarted by itself: {reason}.")), restarts, ..st };
-                            } else if st.unavailable_output.is_some() {
+                            } else if st.unavailable_output.is_some() && cfg_now.host == "asio" {
+                                // an ASIO driver whose device is gone is not probed again:
+                                // the user switches to WASAPI or retries
                                 lost = None;
-                                if cfg_now.host == "asio" {
-                                    finish_interrupted_audio(&engine);
-                                    want_input = false;
-                                }
+                                finish_interrupted_audio(&engine);
+                                want_input = false;
+                                status = st;
+                            } else if st.unavailable_output.is_some() {
+                                // any other named output comes back when it is plugged in again
+                                lost = Some((Instant::now() + retry_delay(tries), tries + 1));
                                 status = st;
                             } else {
                                 lost = Some((Instant::now() + retry_delay(tries), tries + 1));
@@ -902,6 +906,11 @@ const INPUT_ERR: &str = "input: ";
 
 /// Whether the output stream is dead, and why: a crash in its callback, or a stream error that
 /// is not the input's.
+/// A buffer under- or overrun the driver reported: the stream goes on (cpal recovers it).
+fn is_xrun(e: &cpal::Error) -> bool {
+    e.kind() == cpal::ErrorKind::Xrun
+}
+
 fn output_failure(crashed: bool, error: Option<&str>) -> Option<String> {
     if crashed {
         return Some("the audio engine crashed in the output callback".into());
@@ -953,6 +962,7 @@ fn build_output(
     let mut ir = vec![0f32; MAX_CALLBACK];
     let shared_clock = w.shared_clock;
     let crashed = w.crashed.clone();
+    let xruns = w.shared.clone();
     let mut render = move |frames: usize, out_lat: u32, now_ns: f64, write: &mut dyn FnMut(usize, f32, f32)| {
         while let Ok(next) = w.swap.pop() {
             if let Some(old) = std::mem::replace(&mut input, next) {
@@ -1017,6 +1027,12 @@ fn build_output(
         }
     };
     let on_err = move |e: cpal::Error| {
+        // An xrun is a glitch, not a lost stream: cpal keeps it running (and may report it
+        // from the audio thread), so it is only counted, lock-free, for the underrun meter.
+        if is_xrun(&e) {
+            xruns.add_underrun();
+            return;
+        }
         if let Ok(mut g) = err.lock() {
             *g = Some(e.to_string());
         }
@@ -1057,7 +1073,9 @@ fn build_output(
         };
     }
     let s = match fmt {
-        cpal::SampleFormat::F32 => stream!(f32, |x: f32| x),
+        // Clipped at full scale like every fixed-point export: a float device would pass overs on to
+        // the OS mixer, whose own limiter (WASAPI shared mode) hides distortion the bounce has.
+        cpal::SampleFormat::F32 => stream!(f32, |x: f32| x.clamp(-1.0, 1.0)),
         cpal::SampleFormat::I16 => stream!(i16, |x: f32| (x.clamp(-1.0, 1.0) * 32767.0) as i16),
         cpal::SampleFormat::I32 => stream!(i32, |x: f32| (x.clamp(-1.0, 1.0) as f64 * 2147483647.0) as i32),
         cpal::SampleFormat::U16 => stream!(u16, |x: f32| ((x.clamp(-1.0, 1.0) * 32767.0) as i32 + 32768) as u16),
@@ -1080,6 +1098,10 @@ fn build_input(
     let rate = sc.sample_rate;
     let mut pushed = 0u64;
     let on_err = move |e: cpal::Error| {
+        // an input xrun is a gap the jitter buffer already fades over and counts
+        if is_xrun(&e) {
+            return;
+        }
         if let Ok(mut g) = err.lock() {
             *g = Some(format!("{INPUT_ERR}{e}"));
         }
@@ -1473,6 +1495,14 @@ mod tests {
         );
         assert!(output_failure(true, None).unwrap().contains("crashed"));
         assert!(output_failure(true, Some("input: x")).is_some());
+    }
+
+    #[test]
+    fn an_xrun_is_counted_not_a_lost_stream() {
+        // the driver's xrun goes to the underrun meter; it must not reopen the device
+        assert!(is_xrun(&cpal::Error::from(cpal::ErrorKind::Xrun)));
+        assert!(!is_xrun(&cpal::Error::from(cpal::ErrorKind::DeviceNotAvailable)));
+        assert!(!is_xrun(&cpal::Error::from(cpal::ErrorKind::BackendError)));
     }
 
     #[test]

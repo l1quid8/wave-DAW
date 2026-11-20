@@ -233,7 +233,7 @@ describe('Tune to Reference', () => {
     const ok = put({ ...p, source: 7002 });
     expect(ok.clips.find(c => c.id === 7003)!.tune!.reference!.source).toBe(7002);
     const gone = applyAll(ok, [{ op: 'removeSource', id: 7002 }]);
-    expect(gone.clips.find(c => c.id === 7003)!.tune!.reference).toBeNull();
+    expect(gone.clips.find(c => c.id === 7003)!.tune!.reference).toBeUndefined(); // the engine omits the reference, it does not write null
   });
 });
 
@@ -296,13 +296,13 @@ describe('automation', () => {
     expect(a.points).toEqual([{ t: 0, v: p.inserts.find(m => m.id === 3)!.vol }, { t: 16, v: p.inserts.find(m => m.id === 3)!.vol }]);
     const q2 = applyAll(q, [{ op: 'putAutomation', automation: { ...a, points: [{ t: 0, v: 0 }, { t: 16, v: 1 }] } }]);
     expect(automatedValue(q2, target, 16)).toBeCloseTo(0.5, 9);
-    expect(automatedValue(q2, target, 7.9)).toBeNull();
+    expect(automatedValue(q2, target, 7.9)).toBe(0); // before the clip: where it begins
     const q3 = applyAll(q2, [{ op: 'removeAutomation', id: r.autoId }]);
     expect(q3.clips.some(c => c.kind === 'auto')).toBe(false);
   });
-  it('adds a track when none is empty', () => {
+  it('adds a track when none is free over the clip span', () => {
     const p = sketchProject(cat);
-    p.clips.push(...p.tracks.map((_, i) => ({ id: 5000 + i, track: i, start: 100, len: 4, offset: 0, kind: 'pat' as const, ref: 1, muted: false, gain: 0, fadeIn: 0, fadeOut: 0, pan: 0, norm: false, rev: false })));
+    p.clips.push(...p.tracks.map((_, i) => ({ id: 5000 + i, track: i, start: 8, len: 4, offset: 0, kind: 'pat' as const, ref: 1, muted: false, gain: 0, fadeIn: 0, fadeOut: 0, pan: 0, norm: false, rev: false })));
     let next = 9000;
     const r = createAutomationOps(p, cat, { kind: 'mix', fxId: 903 }, 'Mix', '#fff', 0, 16, () => next++);
     expect(r.track).toBe(p.tracks.length);

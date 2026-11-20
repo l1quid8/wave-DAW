@@ -1,4 +1,4 @@
-//! `wave --project FILE …`: the CLI's actions run in this process on a project file, with
+//! `synkopa --project FILE …`: the CLI's actions run in this process on a project file, with
 //! no window, no audio device, no MIDI and no session socket. The same [`actions`] the
 //! running app uses, against an engine of its own.
 
@@ -30,7 +30,8 @@ impl wave_cli::Files for Files {
         let p = match template {
             "empty" => Project::empty(),
             "sketch" => Project::sketch(),
-            t => return Err(format!("unknown template `{t}` (empty, sketch)")),
+            "demo" => Project::demo(),
+            t => return Err(format!("unknown template `{t}` (empty, sketch, demo)")),
         };
         Ok(Box::new(Headless::new(p)))
     }
@@ -48,10 +49,12 @@ pub struct Headless {
 }
 
 impl Headless {
-    fn new(project: Project) -> Self {
+    pub(crate) fn new(project: Project) -> Self {
         let plugins = Plugins::new();
+        crate::plugins::register_bundled(None);
         let engine = Engine::new(Project::empty(), plugins.factory());
-        engine.new_project(project);
+        // a fresh engine has no recording take: this cannot fail
+        let _ = engine.new_project(project);
         Self { engine, plugins, model: OnceLock::new(), keys: OnceLock::new(), rt: Mutex::new(None) }
     }
 
@@ -100,11 +103,8 @@ impl Host for Headless {
         }
         self.keys
             .get_or_init(|| {
-                let d = crate::keys::find_dir(bundled_keys()).ok_or(
-                    "KEYS_MISSING: the project plays WAVE Keys, but the piano recordings are not on this computer \
-                     (download the kit in the app: Library → WAVE Keys); the bounce would be silent",
-                )?;
-                let bank = KeysBank::load(&d).map_err(|e| format!("KEYS_ERROR: WAVE Keys: {e}"))?;
+                let d = crate::keys::find_dir(bundled_keys()).ok_or_else(crate::keys::missing_msg)?;
+                let bank = KeysBank::load(&d).map_err(|e| crate::keys::error_msg(&e))?;
                 self.engine.set_keys_bank(Some(Arc::new(bank)));
                 Ok(())
             })
@@ -126,7 +126,7 @@ impl Host for Headless {
 
 impl wave_cli::Doc for Headless {
     fn call(&self, command: &str, args: &Value, if_revision: Option<u64>) -> Result<Value, String> {
-        let r = actions::control(self, command, args, if_revision);
+        let r = actions::control(self, command, args, if_revision, None);
         self.pump();
         r
     }
@@ -177,6 +177,39 @@ mod tests {
         let st = doc.call("status", &json!({}), None).unwrap();
         assert_eq!(st["mode"], "file");
         assert!(st["path"].as_str().unwrap().ends_with("song.wave"));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn route_and_unroute_wire_the_mixer_and_survive_a_save() {
+        let d = tmp("route");
+        let path = d.join("routed.wave");
+        let doc = Files.create("sketch").unwrap();
+        let ins = |doc: &dyn wave_cli::Doc, id: u64| {
+            let ctx = doc.call("context", &json!({}), None).unwrap();
+            ctx["inserts"].as_array().unwrap().iter().find(|m| m["id"] == id).unwrap().clone()
+        };
+        // 2 → 1 only, at -6 dB-ish
+        doc.call("route", &json!({"from": 2, "to": 1, "gain": 0.5, "only": true}), None).unwrap();
+        let m = ins(&*doc, 2);
+        assert_eq!(m["toMaster"], false);
+        assert_eq!(m["sends"], json!([{"to": 1, "gain": 0.5}]));
+        // the way back would loop
+        let err = doc.call("route", &json!({"from": 1, "to": 2}), None).unwrap_err();
+        assert!(err.contains("loop"), "{err}");
+        // a second send, then the master again
+        doc.call("route", &json!({"from": 2, "to": 3}), None).unwrap();
+        doc.call("route", &json!({"from": 2, "to": 0}), None).unwrap();
+        assert_eq!(ins(&*doc, 2)["toMaster"], true);
+        doc.save(&path).unwrap();
+        let (doc, warnings) = Files.open(&path).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(ins(&*doc, 2)["sends"].as_array().unwrap().len(), 2);
+        doc.call("unroute", &json!({"from": 2, "to": 1}), None).unwrap();
+        doc.call("unroute", &json!({"from": 2, "to": 3}), None).unwrap();
+        let m = ins(&*doc, 2);
+        assert!(m["sends"].as_array().unwrap().is_empty() && m["toMaster"] == true);
+        assert!(doc.call("unroute", &json!({"from": 2, "to": 0}), None).unwrap_err().contains("silent"));
         std::fs::remove_dir_all(&d).ok();
     }
 
@@ -304,9 +337,27 @@ mod tests {
         let p = d.join("x.wave");
         std::fs::write(&p, "not json").unwrap();
         let e = Files.open(&p).err().unwrap();
-        assert!(e.contains("not a WAVE project"), "{e}");
+        assert!(e.contains("not a Synkopa project"), "{e}");
         assert!(Files.open(&d.join("missing.wave")).is_err());
         assert!(Files.create("nope").is_err());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn demo_template_saves_reopens_and_renders_without_warnings() {
+        let d = tmp("demo-template");
+        let path = d.join("demo.wave");
+        let doc = Files.create("demo").unwrap();
+        assert!(!doc.dirty());
+        doc.save(&path).unwrap();
+        let (reopened, warnings) = Files.open(&path).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let ctx = reopened.call("context", &json!({}), None).unwrap();
+        assert_eq!(ctx["bpm"], 136.0);
+        let out = d.join("preview.wav");
+        let r = reopened.call("render", &json!({"out": out.display().to_string(), "from": 16.0, "to": 24.0, "tail": 0.0}), None).unwrap();
+        assert_eq!(r["stats"]["silent"], false, "{r}");
+        assert_eq!(r["stats"]["clippedSamples"], 0, "{r}");
         std::fs::remove_dir_all(&d).ok();
     }
 }

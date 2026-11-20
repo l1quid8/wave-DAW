@@ -92,6 +92,8 @@ fn comp_clip(start: f64) -> Clip {
         stretch: 1.0,
         resample: false,
         pitch: 0.0,
+        insert: None,
+        root: 60,
     }
 }
 
@@ -128,7 +130,7 @@ fn five_loop_passes_make_five_takes_and_the_newest_plays() {
         rt.process(&mut l[..n], &mut r[..n], Some((&inp, &inp)));
         done += n;
     }
-    e.stop();
+    let _ = e.stop();
     let p = e.project();
     assert_eq!(p.comps.len(), 1, "one take group");
     let comp = &p.comps[0];
@@ -186,7 +188,7 @@ fn recording_over_a_take_adds_a_take_instead_of_overwriting() {
         for _ in 0..(SR as usize / 256) {
             rt.process(&mut l, &mut r, Some((&tone, &tone)));
         }
-        e.stop();
+        let _ = e.stop();
     }
     let p = e.project();
     assert_eq!(p.clips.iter().filter(|c| c.kind == ClipKind::Audio).count(), 0, "the first take became part of the comp");
@@ -329,6 +331,45 @@ fn flatten_renders_the_comp_to_one_audio_clip() {
 }
 
 #[test]
+fn flatten_refuses_when_the_comp_changed_while_it_rendered() {
+    let dir = tmp("flatrace");
+    let mut p = dry_project();
+    p.bpm = 40.0; // 8 beats = 12 s of audio: the render and the wav write outlast the edit below
+    let e = Arc::new(Engine::new(p, Arc::new(NoPlugins)));
+    let srcs = three_takes(&e, &dir);
+    let comp = comp_with(&srcs, vec![r(9001, 0.0, 8.0)]);
+    e.apply(&[Op::PutComp { comp: comp.clone() }, Op::PutClips { clips: vec![comp_clip(0.0)] }], false, None).unwrap();
+    e.save(&dir.join("song.synkopa")).unwrap();
+    let mut comp2 = comp.clone();
+    comp2.name = "Renamed".into();
+    let (e2, comp2) = (e.clone(), comp2);
+    let edit = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        e2.apply(&[Op::PutComp { comp: comp2 }], false, None).unwrap();
+    });
+    let srcs_before = e.project().sources.len();
+    let r = e.flatten_comp(9100);
+    edit.join().unwrap();
+    let Err(msg) = r else {
+        panic!("the flatten must refuse: the comp changed while it rendered");
+    };
+    assert!(msg.to_string().contains("changed while it was flattened"), "{msg}");
+    let p = e.project();
+    assert_eq!(p.comps.len(), 1);
+    assert_eq!(p.comps[0].name, "Renamed", "the rename stands");
+    assert_eq!(p.sources.len(), srcs_before, "no flattened source was added");
+    assert_eq!(p.clips.iter().find(|c| c.id == 9100).unwrap().kind, ClipKind::Comp);
+    let strays: Vec<String> = std::fs::read_dir(dir.join("song Audio"))
+        .unwrap()
+        .filter_map(|x| x.ok())
+        .map(|x| x.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(" flat "))
+        .collect();
+    assert!(strays.is_empty(), "the refused flatten left files behind: {strays:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn audition_plays_one_take_live_only() {
     let dir = tmp("aud");
     let e = Engine::new(dry_project(), Arc::new(NoPlugins));
@@ -352,6 +393,6 @@ fn audition_plays_one_take_live_only() {
     }
     assert!((l[100] - 0.2).abs() < 1e-3, "back to the comp, got {}", l[100]);
     assert!(e.audition(9000, Some(1)).is_err());
-    e.stop();
+    let _ = e.stop();
     let _ = std::fs::remove_dir_all(dir);
 }

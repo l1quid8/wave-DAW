@@ -42,7 +42,7 @@ fn undo_redo_and_gestures() {
     assert!(e.revision() > r0);
     // a fader drag: many transient ops, one undo step
     let mut t = e.project().tracks[0].clone();
-    e.begin_gesture();
+    e.begin_gesture(None);
     for k in 0..10 {
         t.vol = 0.5 + k as f32 * 0.01;
         e.apply(&[Op::PutTrack { track: t.clone() }], true, None).unwrap();
@@ -96,7 +96,7 @@ fn audio_clips_play_at_their_position() {
     let mut p = Project::routed();
     p.inserts[0].fx.clear(); // no limiter, so levels are exact
     let e = Engine::new(p, Arc::new(NoPlugins));
-    let (_, clips) = e.import_audio(std::slice::from_ref(&wav), Some((0, 4.0))).unwrap();
+    let (_, clips, _) = e.import_audio(std::slice::from_ref(&wav), Some((0, 4.0))).unwrap();
     assert_eq!(clips.len(), 1);
     let out = e.render(0.0, 8.0, 0.0, 48000).unwrap();
     let spb = 60.0 / 128.0;
@@ -194,7 +194,7 @@ fn live_rt_follows_edits_and_transport() {
     }
     rt.process(&mut l, &mut r, None);
     assert!(rms(&l) < 1e-6);
-    e.stop();
+    let _ = e.stop();
     assert!(!e.state().transport.playing);
 }
 
@@ -216,7 +216,7 @@ fn recording_lands_as_a_clip_on_the_armed_track() {
         rt.process(&mut l, &mut r, Some((&tone, &tone)));
         std::thread::sleep(std::time::Duration::from_micros(200)); // let housekeeping drain the ring
     }
-    e.stop();
+    let _ = e.stop();
     let p = e.project();
     let take = p.clips.iter().find(|c| c.kind == ClipKind::Audio).expect("no take clip");
     assert_eq!(take.track, 4);
@@ -262,7 +262,7 @@ fn opening_a_project_while_recording_keeps_the_take_in_its_project() {
     assert_eq!(error.to_string(), "recording: stop it first");
     assert!(e.state().transport.playing);
     assert!(e.state().path.is_none());
-    e.stop();
+    let _ = e.stop();
     assert_eq!(takes(&e).len(), 1);
     e.open(&path).unwrap();
     assert!(takes(&e).is_empty());
@@ -283,13 +283,13 @@ fn disarming_mid_take_keeps_it_and_keeps_playing() {
     assert!(e.state().transport.playing, "punch-out stopped the transport");
     // nothing more is captured after the punch-out
     feed(&mut rt, 0.5);
-    e.stop();
+    let _ = e.stop();
     assert_eq!(takes(&e).len(), 1);
     // and the next armed run records again
     e.set_transport(None, None, Some(true), None);
     e.play(0.0);
     feed(&mut rt, 0.5);
-    e.stop();
+    let _ = e.stop();
     // (recording over the first take turns both into takes of one comp)
     let p = e.project();
     assert_eq!(p.comps.len(), 1, "could not record after the punch-out");
@@ -314,7 +314,7 @@ fn restarting_the_audio_stream_mid_take_keeps_it() {
     e.play(0.0);
     assert!(e.state().transport.playing, "transport is stuck after the restart");
     feed(&mut rt, 0.5);
-    e.stop();
+    let _ = e.stop();
     assert_eq!(takes(&e).len(), 2);
 }
 
@@ -394,6 +394,8 @@ fn automation_moves_volume_and_effect_params() {
         stretch: 1.0,
         resample: false,
         pitch: 0.0,
+        insert: None,
+        root: 60,
     });
     let e = Engine::new(p, Arc::new(NoPlugins));
     let out = e.render(0.0, 4.0, 0.0, 48000).unwrap();
@@ -531,8 +533,8 @@ fn music_analysis_excludes_vocal_insert_and_caches() {
     let tune = new_fx(9500, FxKind::Tune, p.bpm);
     p.inserts[2].fx.push(tune);
     let e = Engine::new(p, Arc::new(NoPlugins));
-    let (_, c1) = e.import_audio(&[c_wav], Some((0, 0.0))).unwrap();
-    let (_, c2) = e.import_audio(&[fs_wav], Some((1, 0.0))).unwrap();
+    let (_, c1, _) = e.import_audio(&[c_wav], Some((0, 0.0))).unwrap();
+    let (_, c2, _) = e.import_audio(&[fs_wav], Some((1, 0.0))).unwrap();
     let a1 = e.music_analysis(Some(c1[0]), None).unwrap();
     assert_eq!(a1.key.unwrap().root, 0);
     let a2 = e.music_analysis(Some(c2[0]), None).unwrap();
@@ -590,7 +592,9 @@ fn saving_keeps_the_previous_save_as_a_backup() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("Song.wave");
     let backup = engine::backup_path(&path);
-    assert_eq!(backup, dir.join("Song (backup).wave"));
+    assert_eq!(backup, dir.join("Song (backup).wave"), "a project from before the rename keeps its extension");
+    assert_eq!(engine::backup_path(&dir.join("Song.synkopa")), dir.join("Song (backup).synkopa"));
+    assert_eq!(engine::backup_path(&dir.join("Song")), dir.join("Song (backup).synkopa"));
     let e = Engine::new(Project::sketch(), Arc::new(NoPlugins));
     e.apply(&[Op::SetBpm { bpm: 100.0 }], false, None).unwrap();
     e.save(&path).unwrap();
@@ -655,6 +659,8 @@ fn an_arrangement_can_run_past_the_old_128_bar_limit() {
         stretch: 1.0,
         resample: false,
         pitch: 0.0,
+        insert: None,
+        root: 60,
     });
     let e = Engine::new(p, Arc::new(NoPlugins));
     let (from, to) = Engine::export_range(&e.project(), false);
@@ -696,6 +702,8 @@ fn a_loop_does_not_play_the_downbeat_after_its_end() {
         stretch: 1.0,
         resample: false,
         pitch: 0.0,
+        insert: None,
+        root: 60,
     }];
     // at 44.1 kHz 4 beats are not a whole number of samples: the block that reaches the loop
     // end runs past it by a fraction of a sample
@@ -746,6 +754,8 @@ fn wrapped_mix_and_stem_keep_exactly_one_pass_with_the_echo_at_its_start() {
         stretch: 1.0,
         resample: false,
         pitch: 0.0,
+        insert: None,
+        root: 60,
     }];
     for mixer in &mut p.inserts {
         mixer.fx.clear();
@@ -864,4 +874,256 @@ fn an_offline_render_reports_its_progress_block_by_block() {
     });
     assert!(matches!(r, Err(EngineError::Cancelled)));
     assert_eq!(calls, 10);
+}
+
+#[test]
+fn song_end_ignores_a_tiny_overshoot_into_the_next_bar() {
+    let mut p = Project::sketch();
+    let base = p.clips[0].clone();
+    p.clips = vec![Clip { start: 0.0, len: 16.05, ..base.clone() }];
+    assert_eq!(p.song_end(), 16.0, "a file a hair longer than 4 bars must not add a bar");
+    p.clips[0].len = 16.5;
+    assert_eq!(p.song_end(), 20.0);
+    p.clips = vec![Clip { start: 0.0, len: 16.0, ..base.clone() }, Clip { id: base.id + 1, start: 16.0, len: 0.1, ..base }];
+    assert_eq!(p.song_end(), 20.0, "a clip starting in a bar keeps that bar");
+}
+
+/// One imported audio clip at beat 0, on a track of `Project::routed` (track n → insert n).
+fn lone_audio_clip() -> (Arc<Engine>, Clip) {
+    let dir = std::env::temp_dir().join(format!("wave-route-{}-{:?}", std::process::id(), std::thread::current().id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let wav = dir.join("tone.wav");
+    let tone: Vec<f32> = (0..24000).flat_map(|i| [(i as f32 * 0.0626).sin() * 0.5; 2]).collect();
+    wave_engine::sources::write_wav(&wav, &tone, 48000).unwrap();
+    let e = Engine::new(Project::routed(), Arc::new(NoPlugins));
+    let (_, clips, _) = e.import_audio(std::slice::from_ref(&wav), Some((1, 0.0))).unwrap();
+    let c = e.project().clips.iter().find(|c| c.id == clips[0]).unwrap().clone();
+    (e, c)
+}
+
+#[test]
+fn an_audio_clip_plays_into_its_own_insert_past_its_track() {
+    let (e, c) = lone_audio_clip();
+    let p = e.project();
+    let track_ins = p.tracks[c.track as usize].insert;
+    let other = p.inserts.iter().find(|m| m.id != 0 && m.id != track_ins).expect("a second insert").clone();
+    let heard = rms(&e.render(0.0, c.len, 0.0, 48000).unwrap());
+    assert!(heard > 1e-3, "the clip must sound ({heard})");
+    // routed to a muted insert: the clip is gone, though its track's insert is untouched
+    e.apply(&[Op::PutInsert { insert: Insert { muted: true, ..other.clone() } }], false, None).unwrap();
+    e.apply(&[Op::PutClips { clips: vec![Clip { insert: Some(other.id), ..c.clone() }] }], false, None).unwrap();
+    let routed = rms(&e.render(0.0, c.len, 0.0, 48000).unwrap());
+    assert!(routed < heard * 1e-3, "the clip still played through its track's insert ({routed} vs {heard})");
+    // the track's mute still applies to a routed clip
+    e.apply(&[Op::PutInsert { insert: Insert { muted: false, ..other.clone() } }], false, None).unwrap();
+    assert!(rms(&e.render(0.0, c.len, 0.0, 48000).unwrap()) > 1e-3);
+    let t = e.project().tracks[c.track as usize].clone();
+    e.apply(&[Op::PutTrack { track: Track { muted: true, ..t } }], false, None).unwrap();
+    assert!(rms(&e.render(0.0, c.len, 0.0, 48000).unwrap()) < 1e-6, "a muted track silences its routed clip");
+    assert_eq!(e.project().clip_insert(&e.project().clips[0]), other.id);
+}
+
+#[test]
+fn a_clip_insert_must_exist_and_goes_back_to_the_track_when_removed() {
+    let (e, c) = lone_audio_clip();
+    assert!(e.apply(&[Op::PutClips { clips: vec![Clip { insert: Some(987_654), ..c.clone() }] }], false, None).is_err());
+    let other = e.project().inserts.iter().find(|m| m.id != 0).unwrap().id;
+    e.apply(&[Op::PutClips { clips: vec![Clip { insert: Some(other), ..c.clone() }] }], false, None).unwrap();
+    e.apply(&[Op::RemoveInsert { id: other }], false, None).unwrap();
+    assert_eq!(e.project().clips[0].insert, None);
+}
+
+#[test]
+fn an_effect_moves_to_another_insert_in_one_undo_step() {
+    let e = Engine::new(Project::sketch(), Arc::new(NoPlugins));
+    let p = e.project();
+    let from = p.inserts.iter().find(|m| m.id != 0 && !m.fx.is_empty()).expect("an insert with effects").clone();
+    let to = p.inserts.iter().find(|m| m.id != 0 && m.id != from.id).unwrap().id;
+    let fx = from.fx[0].clone();
+    e.apply(&[Op::RemoveFx { fx_id: fx.id }, Op::PutFx { insert_id: to, fx: fx.clone(), index: None }], false, None).unwrap();
+    let p = e.project();
+    assert!(p.insert(from.id).unwrap().fx.iter().all(|f| f.id != fx.id));
+    assert_eq!(p.insert(to).unwrap().fx.last().map(|f| f.id), Some(fx.id));
+    assert!(rms(&e.render(0.0, 4.0, 0.0, 48000).unwrap()) > 1e-3, "the project still plays");
+    assert!(e.undo());
+    assert!(e.project().insert(from.id).unwrap().fx.iter().any(|f| f.id == fx.id));
+}
+
+#[test]
+fn export_in_place_renders_the_selection_onto_a_new_track() {
+    let (e, c) = lone_audio_clip();
+    let never = std::sync::atomic::AtomicBool::new(false);
+    let tracks = e.project().tracks.len();
+    let r = e.export_in_place(&[c.id], 48000, &never, &mut |_| {}).unwrap();
+    let p = e.project();
+    assert_eq!(p.tracks.len(), tracks + 1);
+    assert_eq!(r.track, c.track + 1, "the new track goes right below the selection");
+    assert_eq!(p.tracks[r.track as usize].insert, 0, "it plays into the master");
+    let made = p.clips.iter().find(|x| x.id == r.clip_id).unwrap();
+    assert_eq!((made.start, made.len), (c.start, c.len));
+    assert!(p.clips.iter().find(|x| x.id == c.id).unwrap().muted, "the original is muted");
+    // what plays now is the rendered copy: about as loud as the original was
+    let heard = rms(&e.render(c.start, c.start + c.len, 0.0, 48000).unwrap());
+    assert!(heard > 1e-2, "the rendered clip must sound ({heard})");
+    assert!(std::path::Path::new(&p.sources.iter().find(|s| s.id == r.source_id).unwrap().path).exists(), "the audio is saved");
+    // one undo step takes it all back
+    assert!(e.undo());
+    let p = e.project();
+    assert_eq!(p.tracks.len(), tracks);
+    assert!(!p.clips.iter().find(|x| x.id == c.id).unwrap().muted);
+}
+
+/// A one-bar tone clip whose track's insert runs only one `kind` effect (its params set by `set`).
+fn one_bar_through(kind: FxKind, set: &[(&str, f64)]) -> (Arc<Engine>, Clip) {
+    let dir = std::env::temp_dir().join(format!("wave-inplace-{kind:?}-{}-{:?}", std::process::id(), std::thread::current().id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut p = Project::routed();
+    for m in p.inserts.iter_mut() {
+        m.fx.clear();
+    }
+    let bar = (4.0 * 60.0 / p.bpm * 48000.0) as usize;
+    let wav = dir.join("bar.wav");
+    let tone: Vec<f32> = (0..bar).flat_map(|i| [(i as f32 * 0.0626).sin() * 0.5; 2]).collect();
+    wave_engine::sources::write_wav(&wav, &tone, 48000).unwrap();
+    let e = Engine::new(p, Arc::new(NoPlugins));
+    let (_, clips, _) = e.import_audio(std::slice::from_ref(&wav), Some((1, 0.0))).unwrap();
+    let c = e.project().clips.iter().find(|c| c.id == clips[0]).unwrap().clone();
+    let ins = e.project().tracks[c.track as usize].insert;
+    let mut fx = new_fx(90_001, kind, e.project().bpm);
+    for (k, v) in set {
+        fx.params.insert((*k).into(), *v);
+    }
+    e.apply(&[Op::PutFx { insert_id: ins, fx, index: None }], false, None).unwrap();
+    (e, c)
+}
+
+/// Exports `c` in place and checks the new clip carries the effect's tail past the span.
+fn assert_in_place_keeps_tail(e: &Engine, c: &Clip) {
+    let never = AtomicBool::new(false);
+    let others: Vec<Clip> = e.project().clips.iter().filter(|x| x.id != c.id).cloned().collect();
+    let r = e.export_in_place(&[c.id], 48000, &never, &mut |_| {}).unwrap();
+    let p = e.project();
+    let made = p.clips.iter().find(|x| x.id == r.clip_id).unwrap().clone();
+    assert_eq!(made.start, c.start);
+    assert!(made.len > c.len + 0.25, "the tail extends the clip past the selection ({} vs {})", made.len, c.len);
+    let max_beats = c.len + IN_PLACE_MAX_TAIL_S * p.bpm / 60.0;
+    assert!(made.len < max_beats, "the silent end of the tail is trimmed ({} beats)", made.len);
+    let src = p.sources.iter().find(|s| s.id == r.source_id).unwrap();
+    assert!((src.dur * p.bpm / 60.0 - made.len).abs() < 1e-6, "the clip shows the whole rendered file");
+    // the new track holds only the new clip; nothing else moved or doubled
+    assert!(p.clips.iter().filter(|x| x.track == r.track).all(|x| x.id == r.clip_id));
+    for o in &others {
+        let now = p.clips.iter().find(|x| x.id == o.id).unwrap();
+        assert_eq!((now.start, now.len, now.muted), (o.start, o.len, o.muted), "other arrangement content is untouched");
+    }
+    assert!(p.clips.iter().find(|x| x.id == c.id).unwrap().muted, "the original is muted, so it does not play twice");
+    // what plays past the span now is the rendered tail (the original and its effects are silent)
+    let after = e.render(c.start + c.len + 0.05, made.start + made.len, 0.0, 48000).unwrap();
+    assert!(rms(&after) > 1e-4, "the tail sounds after the span ({})", rms(&after));
+    let span = e.render(c.start, c.start + c.len, 0.0, 48000).unwrap();
+    assert!(rms(&span) > 1e-2, "the span itself still sounds");
+}
+
+#[test]
+fn export_in_place_keeps_a_long_reverb_tail() {
+    let (e, c) = one_bar_through(FxKind::Reverb, &[("size", 6.0), ("mix", 60.0)]);
+    assert_in_place_keeps_tail(&e, &c);
+}
+
+#[test]
+fn export_in_place_keeps_delay_echoes() {
+    // an echo a beat later, fed back: several repeats ring after the bar
+    let (e, c) = one_bar_through(FxKind::Delay, &[("beats", 1.0), ("fb", 50.0)]);
+    assert_in_place_keeps_tail(&e, &c);
+}
+
+#[test]
+fn export_in_place_refuses_an_empty_or_silent_selection() {
+    let (e, c) = lone_audio_clip();
+    let never = std::sync::atomic::AtomicBool::new(false);
+    assert!(e.export_in_place(&[], 48000, &never, &mut |_| {}).is_err());
+    let t = e.project().tracks[c.track as usize].clone();
+    let ins = e.project().insert(t.insert).unwrap().clone();
+    e.apply(&[Op::PutInsert { insert: Insert { muted: true, ..ins } }], false, None).unwrap();
+    let rev = e.revision();
+    assert!(e.export_in_place(&[c.id], 48000, &never, &mut |_| {}).is_err(), "a muted insert renders silent");
+    assert_eq!(e.revision(), rev, "nothing changed");
+    let cancel = std::sync::atomic::AtomicBool::new(true);
+    assert!(matches!(e.export_in_place(&[c.id], 48000, &cancel, &mut |_| {}), Err(EngineError::Cancelled)));
+}
+
+#[test]
+fn lane_heights_are_view_state_not_undo_steps() {
+    let e = Engine::new(Project::sketch(), Arc::new(NoPlugins));
+    let p0 = e.project();
+    let h0 = p0.tracks[0].h;
+    // an edit, then a vertical zoom (every lane taller), then a single lane resized in a gesture
+    let t1 = p0.tracks[1].clone();
+    e.apply(&[Op::PutTrack { track: Track { muted: !t1.muted, ..t1.clone() } }], false, None).unwrap();
+    let taller: Vec<Op> = e.project().tracks.iter().map(|t| Op::PutTrack { track: Track { h: t.h + 12.0, ..t.clone() } }).collect();
+    e.apply(&taller, false, None).unwrap();
+    e.begin_gesture(None);
+    let t0 = e.project().tracks[0].clone();
+    e.apply(&[Op::PutTrack { track: Track { h: 140.0, ..t0 } }], true, None).unwrap();
+    e.end_gesture();
+    assert_eq!(e.project().tracks[0].h, 140.0);
+    assert_eq!(e.project().tracks[2].h, p0.tracks[2].h + 12.0);
+    // one undo takes back the edit, not the zoom, and the lanes stay as they are now
+    assert!(e.undo());
+    let p = e.project();
+    assert_eq!(p.tracks[1].muted, t1.muted);
+    assert_eq!(p.tracks[0].h, 140.0);
+    assert_eq!(p.tracks[2].h, p0.tracks[2].h + 12.0);
+    assert!(!e.undo(), "the height changes added no undo steps");
+    // redo brings the edit back, still with the current heights
+    assert!(e.redo());
+    assert_eq!(e.project().tracks[1].muted, !t1.muted);
+    assert_eq!(e.project().tracks[0].h, 140.0);
+    // a height change together with anything else is an ordinary edit
+    let t0 = e.project().tracks[0].clone();
+    e.apply(&[Op::PutTrack { track: Track { h: h0, name: "Renamed".into(), ..t0 } }], false, None).unwrap();
+    assert!(e.undo());
+    assert_eq!(e.project().tracks[0].h, 140.0);
+}
+
+/// Lanes swapped (Move up / down keeps ids with their slots and swaps what they hold), then one
+/// resized: undoing the swap must not hand that height to the other track.
+#[test]
+fn a_lane_resized_after_a_move_keeps_its_height_with_its_track_on_undo() {
+    let e = Engine::new(Project::sketch(), Arc::new(NoPlugins));
+    let p0 = e.project();
+    let (a, b) = (p0.tracks[0].clone(), p0.tracks[1].clone());
+    assert_ne!(a.name, b.name);
+    e.apply(
+        &[Op::PutTrack { track: Track { id: a.id, ..b.clone() } }, Op::PutTrack { track: Track { id: b.id, ..a.clone() } }],
+        false,
+        None,
+    )
+    .unwrap();
+    // the moved track (now in slot 1) is resized
+    let moved = e.project().tracks[1].clone();
+    assert_eq!(moved.name, a.name);
+    e.apply(&[Op::PutTrack { track: Track { h: 200.0, ..moved } }], false, None).unwrap();
+    assert!(e.undo(), "the move is undone (the resize was no step)");
+    let p = e.project();
+    assert_eq!(p.tracks[0].name, a.name);
+    assert_eq!(p.tracks[1].name, b.name);
+    assert_eq!(p.tracks[1].h, b.h, "the other track does not take the resized height");
+}
+
+/// A track renamed (an undo step), then resized (no step): undoing the rename keeps the new
+/// height, because the lane still holds the same track.
+#[test]
+fn a_lane_resized_after_a_rename_keeps_its_height_when_the_rename_is_undone() {
+    let e = Engine::new(Project::sketch(), Arc::new(NoPlugins));
+    let t = e.project().tracks[0].clone();
+    e.apply(&[Op::PutTrack { track: Track { name: "Vox".into(), ..t.clone() } }], false, None).unwrap();
+    let vox = e.project().tracks[0].clone();
+    e.apply(&[Op::PutTrack { track: Track { h: 200.0, ..vox } }], false, None).unwrap();
+    assert!(e.undo(), "the rename is undone (the resize was no step)");
+    let p = e.project();
+    assert_eq!(p.tracks[0].name, t.name);
+    assert_eq!(p.tracks[0].h, 200.0);
+    assert!(e.redo());
+    assert_eq!(e.project().tracks[0].h, 200.0);
 }

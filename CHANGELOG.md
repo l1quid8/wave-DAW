@@ -1,17 +1,694 @@
 # Changelog
 
-What changed in each release of WAVE. The newest version comes first; its section is
+What changed in each release of Synkopa (called WAVE up to 0.9.21). The newest version comes first; its section is
 shown in the app after an update and is published as the release notes (see
 `docs/releasing.md`). Write for musicians: what you can do now, not how it works inside.
 
 ## Unreleased
 
 ### Added
-- **WAVE runs on Macs with Apple Silicon.** Build it from source (see the README) and it runs
-  natively, with the Mac's own window buttons and ⌘ shortcuts. VST3 effects in the usual plug-in
-  folders load and open their own editor windows, and `.wave` projects open with a double-click
-  in Finder. Recording and MIDI keyboards have not been tested on a Mac yet, and a source build
-  does not update itself.
+- **VST3 plugins on macOS.** Synkopa for Mac now finds VST3 instruments and effects in
+  `/Library/Audio/Plug-Ins/VST3` and `~/Library/Audio/Plug-Ins/VST3`, loads them and opens their own
+  windows. Plugins built for Apple Silicon or as universal binaries work; an Intel-only plugin says
+  so instead of loading. Projects open from Finder (double-click, Open With, a drop on the Dock
+  icon), the window has the Mac's traffic lights, and shortcut hints read ⌘ ⌥ ⇧.
+- **Recording on macOS asks for the microphone**, so recordings capture sound instead of silence.
+- **Channel groups in the Channel Rack, as FL's filter groups.** Right-click a channel → Group to
+  put it in Drums, Bass or a new group; the filter at the rack's top shows every channel, one group or
+  the unsorted ones (hidden channels keep playing). Channels added while a group is shown join it, and
+  a group can be renamed or ungrouped from the filter. `synkopa channels --ch Kick --group Drums`
+  does the same from the command line.
+- **Pan and shift per step in the Channel Rack's graph editor**, as in FL Studio. Next to
+  Velocity and Key, Pan places each step left or right, and Shift starts a step a little later
+  inside its cell, for pushed hats, flams and hand-made swing. Alt+click puts a step back.
+- **Drag a track header to reorder Playlist tracks.** Grab a track's header and drag it up or down;
+  a line shows where it lands and the view scrolls at its edges. The track takes its clips, name,
+  colour, volume, routing and takes along, in one undo step; Esc puts it back.
+- **File → Open recent.** The last ten projects you opened or saved, newest first, one click away.
+  Two projects with the same name show their folders. A project that was moved or deleted is
+  shown as missing, and "Remove missing projects" and "Clear list" tidy the list. Opening one
+  asks about unsaved changes first, like Open.
+- **Chop, glue and arpeggiate in the Piano roll, as in FL Studio.** Ctrl+U chops the selected
+  notes (or every note of the channel) into pieces one snap step long, for rolls, stutters and
+  hi-hat or 808 rhythms; Ctrl+G glues touching notes of the same key back into one. The
+  arpeggiator (Alt+A, or Tools → Arpeggiate) turns chords into a run of their notes up, down,
+  up and down or at random, with the step, note length and octave range you choose; Alt+U opens
+  the chop tool with a piece length of your choice. Each is one undo step, and the same tools
+  work from the command line (`synkopa notes chop|glue|arp`).
+- **Slide notes, as in FL Studio.** Turn on Slide in the Piano roll (the glide button next to the
+  tools, or S) and the notes you draw become slide notes: they make no sound of their own, they
+  bend the notes already playing to their key, and their length is the glide time. An 808 can now
+  jump an octave and back in one held note. A slide note is drawn darker, with a triangle at its start; double-click
+  a note to switch Slide on or off. Works on samplers, Synkopa Keys and the Synth; plugin
+  instruments ignore slide notes, so the button is greyed out for them.
+
+### Changed
+- **A plugin's window and Synkopa's stay in step.** Turning a knob in a VST3 plugin's own window
+  updates its parameter list in Synkopa right away, and closing the plugin's window with its own
+  close button turns the button back to "Open plugin GUI" at once.
+- **The clip menu says what Rename and the colours change.** "Rename pattern…" (sample, automation) and
+  "Colour of the pattern · 3 clips" make clear that every clip of it follows; the tooltip points to
+  Make unique for changing one copy only.
+- **One click plays a sample in every Browser tab.** In the AUDIO tab a press now plays the file
+  from the top, like the library and FL Studio's browser (it used to take a double-click). Esc
+  stops a preview wherever the keyboard is.
+
+## 0.9.30 — 2026-11-19
+
+### Added
+- **Drag several patterns at once.** In the Browser's pattern list, Ctrl+click adds a pattern to
+  the selection and Shift+click selects a range; drag them onto the Playlist and each lands on its
+  own track, from the one you drop on down, all at the same time.
+- **A new project has 30 Playlist tracks**, so there is room to arrange from the start.
+- **Full screen.** F11 (or View → Full screen) fills the whole screen with Synkopa, no taskbar and
+  no window frame; F11 again, or the button in the top-right corner, goes back. Settings → Look →
+  "Start in full screen" opens the app that way every time.
+
+### Changed
+- **Drop-down lists match the app.** Snap, Edges, the audio and MIDI settings, the Piano roll and
+  pitch editor lists and every other drop-down open a dark list in the app's own style instead of
+  the system's white one, with the current choice ticked. Keyboard works as before: arrows, Enter,
+  Esc (closes only the list, not the dialog behind it) and typing the first letters.
+- **Docking shows one arrow per side.** Dragging a window's title bar shows just three arrows, left,
+  right and bottom, instead of a cluster of them in the middle of the screen. A window docks next to
+  the Playlist: the Piano roll dropped on the bottom arrow goes above the docked Mixer, which stays
+  where it is.
+
+### Fixed
+- Clicking a sample in the Browser to hear it no longer hides the floating Channel rack.
+- **Synth sounds are named in your language.** In English, a channel made from a factory synth
+  sound (and its insert and split patterns) no longer carries a Polish name like "Arp Cyfrowy";
+  projects saved before are renamed when opened, and names you gave yourself are kept.
+
+## 0.9.29 — 2026-11-19
+
+### Added
+- **Synkopa runs on a Mac.** A `.dmg` for Apple Silicon (M1 or later, macOS 13.4 or newer) is part
+  of every release from now on, and it updates itself like the Windows and Linux versions. The app
+  is not notarized by Apple yet: the first time, open System Settings → Privacy & Security and
+  click **Open Anyway**. VST3 plugins are not hosted on macOS yet; the built-in instruments and
+  effects are all there.
+
+## 0.9.28 — 2026-11-19
+
+### Changed
+- **The Mixer hides like the Channel rack and the Piano roll.** Closed, it is gone: no more title
+  bar left at the bottom of the window that opened it on a stray click, and dragging its edge down
+  only resizes it instead of folding it away. F9, the Mixer button or View → Mixer bring it back
+  where it was.
+- **The top bar fits any window.** As room runs out, the least needed parts step aside one at a
+  time (the panel buttons' names first, then the count-in and monitor, the metronome, a shorter
+  pattern name, the song position while the tempo stays), so nothing overlaps or gets cut off any
+  more, with long pattern names and in every language too.
+- **The docked Channel rack is one bar wide by default**, so it no longer pushes the Playlist to
+  its narrowest; longer patterns scroll. A width you set yourself is kept.
+
+### Fixed
+- Double-clicking a track's **Ins** button shows that insert in the Mixer again (a single click
+  still opens the routing menu).
+
+## 0.9.27 — 2026-11-19
+
+### Added
+- **A new synth sound bank and a more Serum-like synth.** 50 new factory presets (808s, Reese,
+  growl, FM and sync basses, acid, future and progressive plucks, supersaw and creamy mono leads,
+  evolving pads, choir, FM keys and bells, organ, strings, flute, arps, lo-fi, risers and impacts).
+  Six new wavetables you scan with Position (Basic, Formant, Harmonics, Sync, Growl, Comb), a Warp
+  per oscillator (Sync, Bend, Asym, FM from the other oscillator), four Macros named after what they
+  drive (nearly every preset puts its main moves on them), eight modulation slots and a Rise per LFO for
+  delayed vibrato. The oscillator picture now shows the real wave. Old projects keep their sound;
+  the old preset names are gone from the list.
+- **Find a command (Ctrl+K).** Type what you want to do; every menu command is there with its
+  shortcut, what you have selected comes first, and a question that is not a command goes to Ask AI.
+- **Pan per note.** The Piano roll's lower lane switches between Velocity and Pan; drag to pan
+  notes left and right, or type it in a note's properties. Plays on sampler, Synth and Synkopa Keys
+  channels (not on plugins).
+- **Stereo.** Width (0 % mono … 200 %), Spread to widen even a mono synth or vocal without any
+  loss when the song is summed to mono, Bass mono to keep everything under 120 Hz (or your
+  frequency) in the centre for clubs and phones, gain and balance; polarity and L/R swap under
+  Advanced. Its window shows the stereo field as a vectorscope with the correlation, the balance,
+  and whether your bass is mono.
+- **Multiband (OTT).** Upward and downward compression in three bands at once: Depth, Time,
+  Upward and Downward are all you need. Each band's level and how far it is lifted or pulled down
+  is drawn live; drag the threshold lines and the crossovers right in the display. Quiet room
+  noise is not pulled up into hiss, and Depth blends without the phasey dip a plain dry/wet has.
+- **Analyzer.** A meter for the master: short-term, integrated and momentary loudness (LUFS, to
+  the EBU R128 standard), loudness range, true peak, the loudness of the last 30 s against a
+  target, a spectrum whose bass is sharp enough to tell a 41 Hz kick from a 49 Hz 808 (hover it
+  to read the frequency and note), a vectorscope and the correlation. It tells you how much
+  streaming would turn the song down instead of telling you to hit a number.
+- **Slice mode for the sampler (chop a sample).** A new Slice page in the sampler's window cuts the
+  sample at its hits (Transients, with a Sensitivity knob that answers instantly) or into 4, 8, 16
+  or 32 equal parts (MPC chop). Click a slice to hear it, drag a marker to move it, double-click to
+  add or remove one. Each key from the root plays one slice at the sample's own pitch, and a new
+  slice cuts the one sounding. Dump to pattern writes one note per slice in the original timing,
+  so the pattern plays the sample back as it was at any tempo: move the notes to rechop it.
+- **Ten new Reverb presets:** rap vocal (short room), R&B hall, bright pop plate, snare plate,
+  warm keys hall, EDM lead hall, ambient pad haze, lo-fi dark room, an 18-second "cosmos", and a
+  100 % wet plate for a send. The old presets keep their places.
+
+### Changed
+- **Updates download by themselves.** A new version is fetched in the background while you work;
+  when it is ready, "Restart to update" appears under the menus and one click restarts into it
+  (after asking about unsaved changes). Turn it off in Settings → General → Updates.
+- **A roomier What's new.** After an update that skipped versions, the notes of each one open in
+  a larger window with the versions listed beside them; the text is bigger and Added, Changed and
+  Fixed are coloured.
+- **A calmer look.** Panels, mixer channels, windows and menus are told apart by their tone and a
+  soft shadow instead of outlines; floating windows stand a step off the app behind them. Buttons
+  and fields are filled blocks, so what can be clicked reads at a glance.
+- **Piano roll bar, rebuilt.** Tools as one switch, Snap as a chip (with Auto), the song's key shown
+  as a badge with its scale on a small keyboard, and Humanize and the other note tools behind
+  "Tools" with icons and sliders. The Playlist bar is built from the same pieces.
+- **Playlist.** Track names are shown in full (the mixer insert sits beside the volume). Automation
+  clips read as curves. Audio clips show stretch, pitch and gain only when selected; a small dot
+  marks a clip that has any. A muted track's M stays lit while the rest of the track fades.
+- **Mixer.** A dB scale on the faders, the Master set apart, a grip on effect rows, and a "Route
+  selected here" button when Channel rack channels are selected.
+- **The effect picker opens in the middle of the app** instead of beside the pointer.
+- **Dim labels are easier to read** in the dark theme.
+- **Effect windows are tidier.** Each group of controls sits in its own frame, packed closer, and
+  the how-to line that took the bottom of every window now sits behind a ? in the title bar.
+- **A clearer Reverb window.** The picture now shows what you hear: how long each frequency rings
+  (bass, middle and treble decay as one curve), with the tail's own spectrum live behind it and
+  the low and high cut shaded where the tail is filtered away. Drag the three dots up and down
+  and the cut lines sideways; below, the tail in time with the pre-delay to drag and the output
+  after the last hit.
+
+### Fixed
+- **Undo says what it undoes.** Edit → Undo and Redo name the step ("Undo: Move clips", "Trim
+  clip", "Record take", …) instead of a bare Undo.
+- **No freeze while trimming or flattening.** Trimming a clip or flattening a comp writes its audio
+  in the background; the rest of the app keeps answering.
+- **Long sessions stay light on memory.** Audio that no undo step can bring back any more is let
+  go, and a recording take stops at 30 minutes (it lands as a clip; playback keeps going).
+- **Importing a folder with one bad file** imports the rest and names the file that failed.
+- **Settings survive a crash.** The settings file is written safely, so a crash mid-save can no
+  longer lose your audio device.
+
+## 0.9.26 — 2026-11-19
+
+### Added
+- **Extract stems from an audio clip.** Click the clip's menu → Extract stems…, tick drums, bass,
+  vocals and/or the rest, and each stem lands on a new track right below the clip, in the same
+  place and with the same length, stretch, pitch, fades and gain; the clip is muted, and one Ctrl+Z
+  takes it all back. It runs in the background (about 25 s per minute of audio on a 6-core CPU) with
+  progress and Cancel, so you can keep working. The separation model (HTDemucs, 90 MB, MIT licence)
+  is downloaded the first time. Also `synkopa stems --clip ID`.
+- **An underrun counter and a CPU meter.** Settings → Audio counts, next to Buffer, every time
+  the output ran dry — a buffer rendered too late, or a dropout the driver reports — since a larger
+  buffer is the cure; Reset starts a fresh count. Turn on "CPU meter in toolbar" there for FL
+  Studio's CPU meter: how much of each audio buffer the mix takes to render (near 100 % the output
+  crackles); it flashes red on an underrun and keeps the count until you click it.
+- **Ducking on the Delay.** A Ducking knob (0–12 dB, as on the Reverb) pulls the echoes under the
+  dry sound and lets them bloom back in the gaps; the delay window shows how much it is ducking.
+- **AIFF samples.** `.aif` and `.aiff` files load, preview and show in the Library.
+
+### Changed
+- **Reverb decay reaches 20 s** (was 6 s). Saved reverbs keep their decay.
+- **Export in place keeps effect tails.** The rendered clip runs on until the reverb or echo has
+  died away (up to 30 s) and lands on its own new track, so the tail is not cut at the selection's end.
+- **Dock guide previews show exactly where the panel lands.** The blue preview now covers the
+  area the dropped Channel Rack, Piano roll or Mixer will really take, at its docked size.
+- **Dragging a clip keeps its offset from the grid.** Moving or Shift-copying a clip placed between
+  grid lines snaps the distance moved, as in FL, instead of jumping the clip onto a line.
+- **Unnamed lanes show their clips' icon.** A playlist lane with no icon and a name that says
+  nothing ("Track 7") shows the most common icon of its clips; a pattern that plays one channel
+  shows that channel's icon.
+
+### Fixed
+- A single dropout reported by the audio driver no longer restarts the audio device; it is counted
+  as an underrun instead.
+- Samples with "Trap" or "Chord" in their name no longer get the vocal icon; Standard library
+  samples take the icon of their library group.
+- Zooming the Playlist with Ctrl+wheel no longer jumps sideways and back on Linux.
+- Mixer effect rows no longer flicker at one exact mixer height.
+- A waveform that failed to load is retried instead of staying empty.
+
+## 0.9.25 — 2026-11-18
+
+### Added
+- **Trap hats, snares and claps in the Standard library.** Nine closed hats and three open hats
+  (Trap Hat Crisp, Tight, Metal…, Trap Open Hat Smooth…), fourteen snares (Trap Snare Punch, Hard,
+  Rage, Low, Clap…) and twelve claps (Trap Clap Thick, Warm, Gritty, Click…), chosen to sit with
+  the trap kicks and 808s. The library also takes 2 MB less space, with the same sound.
+- **A clip light for the Master.** A meter next to Main volume in the toolbar, and a cap above the
+  Master strip's meter in the Mixer, turn solid red when the output goes over 0 dBFS and show the
+  highest over (CLIP +5.0) until you click them. The tooltip says where it first clipped.
+- **Fixed velocity for the MIDI keyboard.** Settings → MIDI → Velocity: "Fixed" plays and
+  records every key at one velocity (100 by default, any 1–127) however hard it is pressed —
+  for keyboards without velocity or when you do not want it. "From keyboard" is the default.
+
+### Changed
+- **What you hear clips where the export does.** A mix over 0 dBFS used to sound clean in the app
+  (Windows hid the overs) and distort in the exported MP3. Playback now clips at full scale too,
+  so you hear the problem before you export.
+- **The splitter between two docked bottom panels trades their sizes.** With the Playlist already
+  as small as it goes, dragging the splitter between the docked Channel rack and Piano roll now
+  shrinks the panels in between, nearest first, as in FL. A short Piano roll hides its velocity
+  lane so the notes keep the room.
+
+## 0.9.24 — 2026-11-18
+
+### Added
+- **Trap kicks and an 808 section in the Standard library.** Fourteen new trap kicks (Brick, Clean,
+  Clip, Dark, Hard, Heavy, Knock, Phonk, Punch, Rack, Stomp, Tight, Top…) and fifteen new 808s
+  (Zay Warm, Opium Growl, Drill Glide, Sub Pure, Plugg Short…) in a Browser section of their own
+  between Percussion and Tonal. Every 808 is pitched at its measured root key, so they swap and layer
+  on the same notes.
+- **Double-click an empty mixer box to give a channel its own insert** (as in FL). On a channel
+  with no insert ("—") it routes the channel to the first unused mixer insert, else a new one,
+  named and coloured after the channel, in one undo step. An insert you muted, renamed, set up or
+  automate is never taken. The channel and sample windows' MIXER list has the same as
+  *+ Free insert*.
+- **The Playlist's vertical scrollbar zooms the lanes**, as in FL: drag the thumb to scroll, drag
+  either end to make every lane taller or shorter, Ctrl+wheel over it to zoom.
+- **Play says why there is no sound.** When the audio output failed to open (a headset driver
+  error, an unplugged interface), pressing Play or playing a pattern shows a notice with the
+  reason, **Try again** (reopens the device) and **Audio settings**, instead of silently not
+  starting.
+- **Auto vocal from the command line.** `synkopa auto-vocal --clip N` measures a vocal take and puts
+  the tuned chain on its mixer insert in one call — the same chain the app's Auto vocal button
+  builds (pitch correction, vocal rider rendered into the audio, compressors, de-esser, reverb,
+  limiter), with `--style hard` for rap tuning, `--beat-clip` to take key and level from the
+  beat, and `--plan` to only print the proposal. It works without the app open
+  (`synkopa -p song.synkopa …`), so scripts and agents can tune vocals too. `synkopa f0-model --install`
+  downloads the RMVPE pitch model (after printing its licence note) and switches the pitch
+  detector to it.
+- **Add a playlist sound to the Channel Rack from its clip.** Dragging a sample into the Playlist
+  plays it there directly (as before, without a rack entry); the audio clip's menu now offers
+  "Add as sampler channel" to put the same sound on the rack and the keyboard in one click. The
+  item is disabled when the rack already has a channel playing that sample.
+
+### Changed
+- **Lighter dock guides.** Moving a floating Channel Rack, Piano roll or Mixer no longer covers
+  the workspace with full-size guides: every dock slot shows a small, faint arrow, and the one
+  under the pointer lights up with the area the panel would take. A drop anywhere else keeps it
+  floating. The dock button, the title-bar right-click menu and View → Window layout dock as before.
+- **Less CPU while nothing plays.** Silent tracks and mixer inserts no longer cost anything in
+  each audio block: a stopped project uses almost no CPU, and big songs play with more headroom
+  (fewer crackles at small buffer sizes).
+- **The loading screen shows the Synkopa logo** above the progress bar.
+
+### Fixed
+- **Type in value works on pan and EQ Q.** A centred pan (shown "C") and an EQ band's Q accept a
+  typed value instead of greying the item out.
+- **A sample dropped on the Channel Rack is undone with its channel.** One Ctrl+Z removes both,
+  and the file no longer stays in the project's audio list. A file loaded during a knob drag no
+  longer makes Ctrl+Z stop half-way through the drag.
+- **Lane heights stay with their track.** Undoing a Move up / down no longer hands a resized
+  lane's height to the other track, and undoing a rename keeps the height you gave the lane.
+- **Plugin parameter sliders reset on Alt+click**, as their menu says.
+- **Paint:** a fast diagonal sweep paints every lane it crosses instead of filling the last one.
+- **A folder removed from the Browser** forgets that it was open and is not read again.
+- **Zooming no longer fights the playhead.** With Follow on and the song playing, every zoom
+  step (Ctrl+wheel, Page Up/Down, the presets, a zoom box, the scrollbar) now pauses following
+  instead of letting the view get yanked between the zoom's anchor and the playhead — the
+  left-and-right stutter while zooming is gone, in the Playlist and the Piano roll.
+- **Closing the pitch editor returns to the sampler.** The pitch editor of an audio clip used to
+  close the clip's editor window when it opened, so closing the pitch editor left nothing. The
+  editor now stays open underneath, and Esc closes the pitch editor first, then the editor —
+  also stopping a solo preview the pitch editor left ringing.
+
+## 0.9.23 — 2026-11-18
+
+### Added
+- **Export a pattern on its own, as in FL Studio.** The Export dialog has a Pattern range next to
+  Song and Loop: it renders the current pattern the way PAT mode plays it, with an empty
+  Playlist too, and leaves the project as it is. It is the default in PAT mode and while the
+  Playlist is empty. Choosing Song with an empty Playlist now warns that the file would be
+  silence and offers to export the pattern instead (it used to write a silent file). Mix and
+  stems both work; the command line has `render --pattern`.
+- **Controls work like FL.** Ctrl+drag adjusts finely, Alt+click resets, and a control's
+  right-click menu has *Type in value*. Grabbing a knob or fader again right after a drag no
+  longer resets it.
+- **Mixer: select several tracks** with Ctrl+Shift+click; their faders and mutes move together.
+  A right-click (or Ctrl/Alt+click) on a mute switch solos, in the Mixer and on Playlist tracks.
+- **Playlist:** a slice dragged up or down cuts every clip it crosses; the paint tool paints
+  wherever the pointer goes, also leftwards and on other tracks; tracks can be moved up and down
+  (their clips and automation follow).
+- **Piano roll:** Shift+Up/Down moves notes a semitone, Ctrl+Up/Down an octave, Shift+Left/Right
+  a grid step; Ctrl+V pastes where the notes were copied; with nothing selected, Ctrl+B / Ctrl+C
+  and the arrows take every note; a note sounds as long as you hold it, at its velocity;
+  right-drag in the velocity lane draws a ramp.
+- **FL's shortcuts:** Ctrl+D deselects, Ctrl+M switches the metronome, Alt+M mutes the selected
+  clips, Ctrl+N saves a new version beside the project (Beat → Beat_2). New project is
+  Ctrl+Shift+N. Export in place is in the File menu (Ctrl+Alt+E).
+- **Synkopa remembers where you were:** a saved project reopens on its pattern, channel and start
+  marker, and the Browser keeps its open folders and scroll position.
+
+### Changed
+- **The autosave never writes over your project.** It used to save a saved project into its own
+  file every few minutes, so the version you saved yourself could be lost. Now it keeps a
+  recovery copy of the unsaved changes instead. If Synkopa closes unexpectedly, the next start
+  offers them back as that project, unsaved: save to keep them, or close without saving to keep
+  the file as you left it.
+- **A new project's Kick, Clap, Hat and Snare play into mixer inserts 1–4**, named after them,
+  like FL Studio's template, so a fader or effect there works on the drum straight away.
+- **The keyboard goes where you work.** A click in the Playlist takes the keyboard back from the
+  Browser's search box, so Space plays. Delete, Ctrl+X/C/V and the arrows edit clips only while
+  you work in the Playlist, never behind the Mixer or an editor.
+- **PAT mode plays the pattern through its channels' own inserts**, not through the effects of
+  the Playlist track its clip sits on. A press on the Playlist grid switches to SONG.
+- **Clicks follow FL:** the Channel Rack's left button lights steps and the right one clears
+  them; Up/Down pick the channel; two clicks on a channel name open and close its window. A
+  library sample plays on the press, from the top each time. Clicking the Browser or a docked
+  panel sends floating windows behind the workspace (F5 brings them back), one at a time.
+- **Ruler:** a click sets the start position, a drag draws the loop, Ctrl+drag moves the start
+  position.
+- **Lane heights are not undo steps** any more, and a right-click on empty Playlist space only
+  drops the selection.
+- **A new logo:** six staggered bars.
+
+### Fixed
+- Clicking the Mixer no longer hides open effect windows or the floating Mixer.
+- Piano roll: dragging an off-grid note up or down keeps its timing; changing the grid keeps the
+  note length; Delete and Ctrl+X only remove a selection; a click on empty grid deselects; a fast
+  velocity drag no longer skips notes. Notes drawn after a Channel Rack step stay steps, and
+  triplet hats stay steps in the rack.
+- Trimming a clip shorter than the grid no longer makes it longer.
+- Dropping samples on the Channel Rack is one undo step.
+- A click on the Playlist while playing no longer stops the view from following the playhead;
+  zooming no longer makes the view stutter between the zoom point and the playhead.
+- The sample editor stays open under its pitch editor; an audio clip's menu can add its sample
+  as a sampler channel.
+- Touching the sampler's envelope knobs no longer switches the envelope on by itself.
+
+## 0.9.22 — 2026-11-17
+
+### Added
+- **One sample editor with a keyboard, as in FL Studio.** The editor of an audio clip and of a
+  Channel Rack sampler now look and work the same: both end in a piano keyboard. Click a key
+  to hear the sample at that note; right-click a key to make it the root note (the note at
+  which the sample plays at its own pitch). The root key is lit and named, and the root shows
+  above the keyboard. An audio clip's root belongs to its sample (every clip of it shares it),
+  is saved with the project, and a sampler channel made from that sample starts on it. The
+  keyboards of Synkopa Keys and plugin channels set their root the same way.
+- **A sampler's volume envelope, as in FL Studio.** A sampler's editor has two pages: Sample
+  (the waveform, its part, pitch, level and the sample's own fades) and Envelope, the FL
+  Channel settings ▸ Volume page. Switch the envelope on and every note gets delay, attack,
+  hold, decay, sustain and release, drawn as a graph: drag a point sideways to change its time,
+  the sustain point up and down for the level, and the dot in a curve up or down to bend the
+  attack, decay or release. The same values are on knobs, and each drag is one undo step.
+  Dragging a point or turning a knob switches the envelope on. With it on, a note fades over
+  the release from its note-off: a key let go or the end of a Piano Roll note. Off, the sample
+  plays as recorded. A Channel Rack step still has no note-off and holds the sustain.
+- **The first start offers the demo project.** A fresh install asks once whether to open
+  OBSIDIAN 2093 or start empty. It does not ask after an update, or when Synkopa was started by
+  opening a project file.
+
+### Changed
+- **WAVE is now called Synkopa**, with a new logo. Nothing of yours moves: settings, the library,
+  recordings and presets stay where they are, and the update replaces the WAVE install (its
+  shortcuts become Synkopa shortcuts).
+- **Projects are saved as `.synkopa`.** Every `.wave` project still opens, by double-click too, and
+  keeps its name until you save it under a new one.
+- **The command line is `synkopa`.** The old `wave` command keeps working, so existing scripts
+  need no change.
+- **The sampler's One-shot / Gate switch is now the Envelope switch.** Envelope off plays the
+  sample as recorded, as One-shot did, and no longer applies attack, decay and sustain: those
+  belong to the envelope. Envelope on works like Gate, and a sized Piano Roll note now fades over
+  the release from its end instead of stopping there. Projects keep their sound: a sampler that
+  was in Gate mode or had an attack or a sustain below 100 % opens with its envelope on.
+- **The demo song OBSIDIAN 2093 has a reworked arrangement and mix**: extra vocal and pad
+  layers, an 808 cymbal, a new 808 turnaround, a Warp move on the dark vocal and tighter filter
+  and reverb transitions.
+
+## 0.9.21 — 2026-11-17
+
+### Added
+- **A new demo song: OBSIDIAN 2093**, a 40-bar modern trap track (136 BPM, D# minor) with a
+  punchy kick, a warm 808, melodic hooks and filter sweeps automated on a bus. Open it from
+  File → Open demo project, or pick it in Settings → General. Six new free (CC0) sounds come
+  with it in the standard library: an 808 spin, a crisp trap clap and snare, and three loops.
+
+### Fixed
+- **Linux: WAVE starts on Ubuntu 22.04 and Debian 12.** The packages and the AppImage needed a
+  newer system library than those systems have and quit at once; they now run on any
+  distribution from Ubuntu 22.04 on.
+- **The Playlist no longer goes blank after a scroll.** Scrolling, or dragging a clip past the
+  edge so the view scrolls with it, could leave the Playlist empty but for a strip at its edge
+  (only fades showed) until something else made it redraw. It now always shows every clip and
+  the grid.
+
+## 0.9.20 — 2026-11-17
+
+### Added
+- **Mixer routing, as in FL Studio.** A mixer insert can send its sound to other inserts: group
+  drums into a bus, or send the vocal and the keys to one shared reverb. In the maximized mixer,
+  cables under the strips show every send with its level: drag the dot under a strip onto
+  another strip to add one, drag (or scroll) a cable's level to change it, double-click for
+  100 %, right-click to remove it. The **M** under a strip switches its output into the Master;
+  off, it goes only where it sends. Docked, right-click a strip for *Send to* and *Output to
+  Master*. A send that would loop back is refused (the strip turns red). Solo follows the
+  routing: soloing a bus keeps what feeds it. Plugin delay compensation lines up every path,
+  and stems include what is routed into a bus. In the CLI: `wave route` and `wave unroute`.
+- **Effects in the mixer strips.** When the mixer is taller, each strip lists its effects
+  above the knobs (icon, name, on/bypass dot; click to open), as many as fit; the strip
+  itself keeps its size. In the maximized mixer there is always room for five effects, and the faders take the rest of the height.
+- **Arrange the windows the way you work.** The Channel rack, the Piano roll and the Mixer can
+  each dock to the left, the right or the bottom of the main window, or float. Drag a window's
+  title bar and dock guides appear (as in Visual Studio): drop it on an edge, beside the
+  Playlist, or on another docked panel's guide to put the two side by side or one above the
+  other. Drag a docked panel's title bar to pull it off. Right-click a title bar, or use
+  View → Window layout, to dock it without dragging. Every splitter resizes, the Playlist always
+  keeps room, and the layout is remembered. View → Window layout → Reset puts it back.
+- **Three new themes**: *Dim*, a mid-grey dark theme, and *Fog* (cool) and *Sand* (warm), two
+  mid-grey light themes for when white is too bright.
+- **Pin a plugin's window on top.** A plugin editor's header has a pin next to the gear: click
+  it and the window stays in front of WAVE's, so an instrument you are playing stays in sight
+  while you click in the arrangement. The choice is remembered per plugin, and the pin lights
+  up while it holds.
+- **When WAVE died, the suspects are named.** If the last session ended without exiting (a
+  plugin crashed it, or the machine did), the next start lists the plugins that were loaded
+  and offers, per plugin, to keep it out of future scans. A normal exit clears the list on its
+  own.
+- **A plugin that crashes no longer takes WAVE down when you load it.** The first time you use a
+  plugin, WAVE tries it in a separate, throw-away process: it creates it, plays sound (or notes)
+  through it, saves and restores its settings and closes it. If that test process crashes or
+  hangs, the plugin is not loaded into WAVE: its slot says why, and **Load anyway** loads it if
+  you want to take the risk. Plugins that pass load straight away from then on (an updated
+  plugin is tried again).
+- **Zoom much further into the Playlist**, down to single 16ths spread across the screen, for
+  detailed drum and edit work. The automatic snap follows down to 1/16 of a beat, and the snap
+  menu has 1/8 and 1/16 beat.
+
+### Fixed
+- **Linux: plugin windows stay in front of WAVE.** Under Wayland, clicking anywhere in WAVE sent
+  plugin windows (Vitalium, Surge XT, …) behind it. WAVE now runs through XWayland there, as
+  other Linux DAWs do, so plugin windows stay above it (`WAVE_WAYLAND=1` keeps native Wayland).
+- **Linux: LV2 plugins built with JUCE show their own window** (Surge XT, Dexed and others
+  needed the `instance-access` feature; they showed only WAVE's parameter list).
+- **Mono VST3 effects load.** Effects with a mono input or output (most ZAM plugins, several
+  DISTRHO ones) were refused as "not a stereo effect"; they now take the sum of both sides and
+  play on both.
+- **A plugin that outputs garbage cannot ruin the mix.** An effect that produces invalid samples
+  (NaN or infinity, as ZamEQ2 does) is silenced instead of breaking every effect after it and the
+  master.
+
+### Changed
+- **The Library's sections collapse.** Standard library, Kits to download and Folders each get
+  a chevron: click the heading to fold it away and leave your own folders in sight. A search
+  still looks everywhere, and what you folded stays folded after a restart.
+
+- **Redesigned Settings.** A bigger window with an icon sidebar (General, Look, Audio, MIDI and
+  a new Updates tab), settings grouped into cards, and each option's explanation shown under its
+  name instead of hidden in a tooltip. Themes are shown as small previews of the app, grouped
+  into dark and light.
+- **New channels get their own colour.** Each channel you add takes the next colour from a
+  wider palette (blue, amber, green, pink, violet …), so its steps and piano-roll notes stand
+  apart from the other channels' instead of all being the same purple. The colour menu offers
+  the new colours too.
+
+## 0.9.19 — 2026-11-16
+
+### Added
+- **Triplet grids in the Piano roll.** The Grid list has 1/6, 1/12, 1/24 and 1/48 (quarter,
+  eighth, 16th and 32nd triplets) next to the straight values, which now run from a whole bar
+  down to 1/64. Drawing, moving, resizing and Ctrl+Q quantize follow it, and the roll draws its
+  lines. Picking a grid also sets the next drawn note to one grid step (at most a beat).
+- **The Mixer shows what each strip carries.** A docked strip shows its effect count (● 3), and an
+  insert you have not named shows, quietly after its number, what is routed to it ("2 Hats").
+
+### Changed
+- **The browser has three tabs: Patterns, Audio and Library.** Audio lists your own sounds
+  (imports, recordings, audio with clips in the Playlist); the starter kit samples the Channel
+  Rack plays stay in the rack, so a new project's Audio tab is empty.
+- **Channel Rack steps keep their width.** Resizing the window shows more or fewer steps (the
+  grid scrolls) instead of stretching or squeezing them.
+- **"Automate on the playlist" uses a track that is free where the clip goes**, not only a track
+  empty along the whole song; a new track is added at the bottom only when every track is busy
+  there. The Playlist scrolls to the new clip.
+- **Clip edges and automation points are easier to grab.** A clip's edge trims from a little
+  inside it and from just outside it; automation points are bigger, and the first and last
+  point sit whole inside the clip instead of half cut off by its border.
+- **A right-click on empty Playlist space drops the selection** (the menu still opens).
+- **The Channel Rack and the Piano roll share one window frame.** Each title bar ends with the
+  same buttons in the same order: dock or float, maximize (Piano roll), close. The Piano roll's
+  maximize was only a double-click on its title bar; it now has a button too.
+- **Esc closes the window in front**, whichever kind it is. Before, the sample editor and the
+  channel settings closed first even behind a Channel Rack or Piano roll you were working in.
+- **F5 (or a click on the Playlist) tucks away every floating window**, the sample editor, the
+  channel settings and the pitch editor included; F5 again brings them all back.
+- **The Mixer is a window like the Channel Rack and the Piano roll.** It has the same title bar:
+  float it as a window or dock it back at the bottom, maximize it over the whole workspace
+  (or double-click its title bar), and × hides it. **F9 shows and hides the Mixer**, as in FL
+  Studio; floating behind other windows, F9 brings it to the front first. Esc hides it when it
+  is the window in front. The View menu has *Dock Mixer at the bottom* and *Maximize mixer*.
+  The separate Mix view with its Back button is gone: maximize does the same.
+
+### Fixed
+- A channel's window opened from the Channel Rack (a click on its name) appeared behind the
+  rack, as did the Piano roll opened by a double-click. Every window now comes to the front
+  before what was clicked inside it opens another.
+
+## 0.9.18 — 2026-11-16
+
+### Added
+- **Chord tools in the Piano roll.** New **Chord stamp** tool (C): pick a chord type (18, from
+  major and minor through 9ths to power chords) and an inversion, then click the grid — the
+  chord is written with the clicked key as its root; clicking the same spot again replaces it,
+  and right-click removes the whole chord. The roll ghosts the chord under the pointer and its
+  status bar names it. In the **Tools** strip, *Chord* harmonizes selected single notes into
+  chords (diatonic in the project key, or a named type spelled by interval), and *Progression*
+  generates one chord per bar from templates like Pop, the minor loop, Trap, Andalusian and an
+  8-bar canon — or a seeded *Chance* walk — with optional **Voice-lead** that picks inversions
+  so the chords move as little as possible. The same verbs work headless: `wave notes stamp`,
+  `wave notes chord` and `wave notes progression` (with `--degrees "0:5:2:6"` for arbitrary
+  chord sequences).
+- **Plugin windows open straight away, with WAVE's header on top.** Click a plugin instrument
+  in the Channel Rack or a plugin effect in the mixer and its own interface opens at once, like
+  in FL Studio: a slim WAVE bar on top shows the name, a gear opens WAVE's settings for it
+  (parameters, volume, pan, routing) and × closes it. Click the instrument again to close it.
+- **Plugin windows on Linux.** VST3 plugins (such as Vitalium and the DISTRHO and ZAM
+  plugins) and LV2 plugins with their own interface (such as x42, ZAM and Dragonfly) now show
+  their windows on Linux too, also under Wayland through XWayland. LV2 plugins whose interface
+  needs GTK or Qt keep WAVE's parameter list.
+- **Pattern previews in the Project tab.** Each pattern in the list shows its notes in
+  miniature: drum rows and melodic lines laid out like its clips in the Playlist. Its icon
+  comes from the instruments it plays, so the patterns made by *Split by channel* read at a
+  glance.
+- **Playback uses all your CPU cores.** Synths and mixer effect chains are processed in
+  parallel while the song plays, like FL Studio's multithreaded processing. A song the size
+  of an FL demo project takes about a third of the time per audio buffer that it took before,
+  which leaves room against dropouts while you edit. The sound is bit-for-bit the same.
+- **Metronome, count-in, input monitoring and the computer keyboard as piano** are in the
+  View menu too.
+- **The Channel Rack's mixer box works like the one in the sample editor.** Scroll over it to
+  route the channel to the next or previous insert, and double-click it to show that insert in
+  the mixer. A single click still opens the list.
+
+### Changed
+- **The toolbar fits any window size.** On a smaller window the least needed controls step
+  aside one by one: the loop readout, the BPM label, count-in and monitoring, the metronome,
+  then the panel buttons. Each is still in the View menu or on its key. Nothing is cut off at
+  any width.
+- **Recording works like FL Studio: nothing to arm.** Press R and Space: the recording goes to the
+  first track that has room from the playhead on, or to a new track when every track is in use
+  (undo removes that track with the take). The record button on every track is gone; a track's
+  menu still has **Record into this track** for recording more takes over what it holds. While
+  Record is on, the toolbar shows where the recording will go.
+- **Right-click Record to choose what it records: Audio, Notes or both.** In PAT mode, with Notes
+  ticked and a MIDI keyboard connected, Record + Space loops the current pattern and adds what you
+  play to it, one undo step per recording. Other recordings run the song, and the PAT/SONG switch
+  changes to SONG so it shows what plays. With only Notes ticked, the microphone stays closed.
+- **Record notes from the computer keyboard** (Ctrl+T, also in the Record menu), with no MIDI
+  keyboard needed, and **quantize recorded notes** to 1/16, 1/8 or 1/4 (Record menu → Quantize
+  notes). Starts snap to the grid and lengths stay as played.
+- **After a recording, a notice says what landed where**, for example "Recorded Take 3 on Pad",
+  with **Delete**, and **Show takes** when the recording added takes.
+
+### Fixed
+- **The metronome clicks in PAT mode.** It was silent while a pattern looped and seemed to start
+  only after switching modes.
+- **PAT/SONG always shows what plays.** In SONG mode with an empty playlist, Space played the
+  pattern while SONG stayed lit. The switch now changes to PAT, and a notice offers **Add to
+  playlist**, which puts the pattern at bar 1. A quick switch between modes no longer flips back.
+- **The sample editor no longer sticks over plugin windows.** Clicking an effect or plugin window
+  now brings it in front of the sample editor (and the channel settings window); clicking the
+  editor brings it back on top.
+- DISTRHO-based plugins (Vitalium and others) can now talk between their engine and their
+  interface: knobs and displays stay in step.
+- **Browsing big sample folders works again.** In a folder with many groups, opening a group
+  further down the list could show only a "search to narrow the list" note instead of its
+  files. The library list is now virtualized: it draws only the rows on screen, so any folder
+  browses fully whatever its size, and a folder beyond the 5000-file walk limit says so
+  instead of ending silently.
+- **Starting the song while a pattern loops with Record on** now ends the pattern recording and
+  plays the song. Before, the song did not start until you stopped first.
+- **Changing the pattern loop range while recording in PAT mode** keeps your notes where you
+  played them. Before, notes played after the change could land on the wrong steps.
+- **Quantized notes stay on the grid on every pass of the loop**, also when the loop is not a
+  whole number of grid steps long.
+- A pattern loop can no longer start during a notes-only song recording, which left the
+  recording stuck until Stop.
+- **Linux and macOS: fewer dropouts with multi-core playback.** The audio worker threads now run
+  at real-time priority like the audio callback, where the system allows it.
+
+## 0.9.17 — 2026-11-15
+
+### Added
+- **Trap sounds and melodic loops in the library.** 38 new sounds you can use freely: five
+  808s tuned to their root, kicks, snares, claps, open and closed hats, percussion, impacts,
+  risers and sub drops, and a new Loops group of ten keys, piano, pluck, guitar, pad and flute
+  loops with their tempo and key in the name.
+- **Drop a sample from anywhere onto the Channel Rack.** Drag a file from Explorer or your web
+  browser, or a sample from Browser ▸ Project ▸ Audio: on a channel's edge it becomes a new
+  sampler there, on its middle it replaces the sample, below the channels it is added at the
+  end. The channel it lands on lights up while you drag.
+- **Export in place.** Right-click a clip (or press Ctrl+Alt+E) to render the selected clips,
+  with their mixer effects, into one audio clip on a new track right below them; the originals
+  are muted, and Ctrl+Z undoes it all.
+- **Drag effects between mixer channels.** Drag an effect onto another mixer strip to move it
+  there (with Ctrl to copy it), or drag the effect list's header to move the whole chain.
+- **Stop twice to silence everything.** A second Stop (or Ctrl+H) cuts reverb and delay tails,
+  held notes and the preview at once, without a click.
+- **Windows at a click.** Buttons for the Browser, the Channel Rack and the Piano roll sit in the
+  toolbar and light up when open. Click the pattern name in the toolbar, or a pattern in the
+  Browser, to see it in the Channel Rack; switching patterns shows a closed rack.
+- **Double-click to jump to the mixer.** Double-click the header of a sample or channel window,
+  or a track's icon, and the mixer opens on its channel.
+- **Double-click a sample in Browser ▸ Project ▸ Audio to hear it.**
+- **Live coding from a text file: `wave watch song.txt`.** Write the song as `wave` commands
+  in a file (tempo, step patterns, effects…), start the loop and save: the song changes while
+  it plays, every time you save. The file is the song: remove a line and its effect is gone.
+  Each save is one undo step; a mistake in the file changes nothing and the terminal names the
+  line; an edit you make in WAVE meanwhile is not overwritten. Without the app,
+  `wave -p song.wave watch song.txt --render preview.wav` bounces a preview on every save.
+
+### Changed
+- **A sample's sound is shared by all its clips**, as in FL Studio: volume, pan, pitch,
+  normalize, reverse and the mixer channel set in the sample window change every clip of that
+  sample. "Make unique" splits one off.
+- **The mixer channel set in a sample window belongs to that sample**, not to the whole
+  playlist track (the track's own routing is still in the track menu).
+- **The song loops as soon as the last clip ends**: an audio file a hair longer than its bars
+  no longer adds an empty bar.
+- Track numbers are gone from the playlist headers.
+
+### Fixed
+- **Notes you play are heard at once** while the song is stopped. With a long look-ahead effect
+  such as the Vocal Rider in the mix, a plugin instrument could sound up to 1.6 s late.
+- **"Open plugin GUI" opens the plugin's window in front of WAVE.** It could open behind it and
+  look like nothing happened; the button now also follows the window when you close it, and a
+  plugin with no window of its own (WAVE Demo Synth) says so.
+- Hosted VST3 plugins can no longer repeat their previous block of audio, and effects no longer
+  do extra work on the audio thread.
+
+## 0.9.16 — 2026-11-15
+
+### Added
+- **WAVE Demo Synth comes with WAVE.** A small VST3 synth (saw, square or triangle through a
+  resonant filter, with an envelope) is in the Channel Rack's "+" menu under "Plugin
+  instruments (VST3)" right after installing, so you can try plugin instruments before you own
+  any. The mod wheel opens its filter.
+- **Play your VST3 instruments in the Channel Rack.** Serum, Analog Lab, Vital and the other
+  synths you have installed are listed under "Plugin instruments (VST3)" in the Channel Rack's
+  "+" and "Replace" menus. Draw notes for them in the Piano roll or the step sequencer, play
+  them from your MIDI keyboard (sustain, pitch bend and mod wheel included), open their own
+  window from the channel's settings, and export the song with them. Your sound is saved with
+  the project. A plugin that is missing on another computer keeps the channel and its notes
+  and is marked in the rack.
 - **Ask AI how to do something (F1).** Click Ask next to the menus, press F1 or pick Help → Ask
   AI, and type your question, e.g. "can I reorder the effects on a mixer track?". It opens
   ChatGPT with the question and your WAVE version, and since WAVE is open source it checks the
@@ -35,6 +712,34 @@ shown in the app after an update and is published as the release notes (see
   rack to select several, pick an insert and press Ctrl+L to send them all there, or Shift+Ctrl+L
   to give each its own insert from that one on (new inserts are added and named after the
   channels). Both are in a strip's right-click menu too, and one Ctrl+Z undoes them.
+- **Chorus and Phaser effects.** A new Modulation group in the effect picker: Chorus (Chorus,
+  Ensemble and Vibrato modes) and Phaser (2 to 12 stages), both with a rate you can sync to
+  the tempo, a live display of what they do and presets to start from.
+- **Save an insert's effects as an FX chain preset.** Save the whole chain of a mixer insert
+  by name and load it onto any insert of any project, replacing what is there or adding to
+  it. Loading is one undo step; rename and delete presets in place.
+- **Import and export MIDI files.** File → Import MIDI file… (or drop a `.mid` on the Playlist)
+  lists the parts in the file with the WAVE instrument each one becomes: drums become
+  samplers, pianos WAVE Keys, everything else the closest synth preset. The parts you pick land
+  on the Playlist as one pattern, with the file's tempo if you want it. A channel's menu
+  imports one part into that channel. Export writes the whole song or one pattern as a
+  standard MIDI file, one track per channel.
+- **Find missing audio when a project opens.** When samples or recordings were moved, WAVE
+  shows a Missing audio dialog: point it at a folder (subfolders included) and it relinks
+  everything it finds, lets you choose when several files match, or locate a file by hand.
+  Missing clips are marked FILE MISSING in the Playlist and a toolbar chip reopens the dialog.
+  Each relink can be undone.
+- **Export 16-bit WAV.** CD-quality WAV for the mix or stems next to 24-bit and 32-bit float,
+  dithered by default.
+- **Watch an export as it renders.** The Export dialog shows the file in progress with a live
+  waveform, the bar being rendered, elapsed and remaining time, the peak level with a clipping
+  warning, and which stems are done.
+- **Copy, paste and reorder in the Channel rack.** Copy and paste a channel's notes from its
+  menu, drag channels to reorder them, and drop a sample from the library between two
+  channels to add it exactly there.
+- **Switch to WASAPI when your ASIO interface is unplugged (Windows).** If the interface goes
+  away, the audio notification and Settings → Audio offer Switch to WASAPI to keep playing
+  through the default Windows output, and Retry ASIO once it is back.
 
 ### Changed
 - The Channel rack and the Piano roll remember where you put them when floating, after a restart too.
@@ -45,9 +750,24 @@ shown in the app after an update and is published as the release notes (see
 - Mixer strips show one name row: the insert number and its name, with the effect count beside
   it. Inserts you have not named show just their number. The docked mixer keeps only the
   controls you need while arranging; the Mix view shows the rest.
-- **A plugin's own window and WAVE stay in step.** Turn a knob in a VST3 plugin's own editor and
-  the parameter list in WAVE's effect window follows it. Close the plugin's window with its close
-  button and the effect window's button says "Open plugin GUI" again, so one click reopens it.
+- **Sung notes come out as the notes you sang.** The pitch editor keeps vibrato, drift, scoops
+  and slides inside their note instead of chopping them into many short ones, splits a note
+  you sing again on the same pitch, and keeps quick notes you actually hold. *Copy notes* now
+  pastes a melody into the Piano roll that resembles what was sung, with far fewer stray notes.
+  Clips whose notes you already edited keep them.
+- *Copy notes* keeps the timing you sang instead of snapping to the 1/16 grid, which moved
+  notes and dropped quick ones. The pasted notes stay selected: Quantize snaps them in one step.
+- The Export dialog is grouped into "What to export" and "File format" and says what it will
+  write: the file name or number of files, length, sample rate, format and estimated size.
+  Sample rate and tail are remembered, and Enter starts the export.
+- A sampler channel's window and the sample window are now one sample editor with the same
+  controls in both places.
+- Piano roll notes on a sampler stop at their length (or the end of the sample), in One-shot
+  mode too. Step sequencer hits still play the sample to its end.
+
+### Fixed
+- WAVE recovers when a Focusrite USB interface is not connected: it waits for Windows to
+  detect the interface before opening any ASIO driver instead of probing a missing device.
 
 ## 0.9.15 — 2026-11-14
 

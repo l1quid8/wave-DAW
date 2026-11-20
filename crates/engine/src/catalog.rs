@@ -92,10 +92,12 @@ pub fn params(kind: FxKind) -> &'static [ParamDef] {
         p("mix", "Wet", 0.0, 100.0, 25.0, "%", false),
         p("tone", "Tone", -100.0, 100.0, 0.0, "%", false),
         p("dry", "Dry", 0.0, 100.0, 100.0, "%", false),
+        // appended (not next to Wet) so saved projects and automation keep their slots
+        p("duck", "Ducking", 0.0, 12.0, 0.0, "dB", false),
     ];
     // order = dsp::reverb_v2::idx; size/pre/tone/mix are the macros, the rest is "advanced"
     const REVERB: &[ParamDef] = &[
-        p("size", "Decay", 0.2, 6.0, 1.0, "s", true),
+        p("size", "Decay", 0.2, crate::dsp::reverb_v2::MAX_DECAY as f64, 1.0, "s", true),
         p("pre", "Pre-delay", 0.0, 150.0, 25.0, "ms", false),
         p("lo", "Low cut", 20.0, 1000.0, 300.0, "Hz", true),
         p("hi", "High cut", 2000.0, 16000.0, 7000.0, "Hz", true),
@@ -238,7 +240,47 @@ pub fn params(kind: FxKind) -> &'static [ParamDef] {
         p("stereo", "Stereo", 0.0, 180.0, 90.0, "°", false),
         p("mix", "Mix", 0.0, 100.0, 50.0, "%", false),
     ];
+    // order = dsp::stereo::idx
+    const STEREO: &[ParamDef] = &[
+        p("width", "Width", 0.0, 200.0, 100.0, "%", false),
+        p("spread", "Spread", 0.0, 100.0, 0.0, "%", false),
+        choice("bass", "Bass mono", 0.0, &["Off", "On"]),
+        p("bassf", "Mono below", 40.0, 500.0, 120.0, "Hz", true),
+        p("gain", "Gain", -60.0, 24.0, 0.0, "dB", false),
+        p("pan", "Pan", -100.0, 100.0, 0.0, "%", false),
+        choice("invl", "Invert L", 0.0, &["Off", "On"]),
+        choice("invr", "Invert R", 0.0, &["Off", "On"]),
+        choice("swap", "Swap L/R", 0.0, &["Off", "On"]),
+    ];
+    // the Analyzer has no parameter that changes the sound: only how the window reads it
+    const ANALYZER: &[ParamDef] = &[
+        choice("target", "Target", 1.0, &["Off", "Streaming −14", "Loud −9", "Broadcast −23"]),
+        choice("slope", "Slope", 2.0, &["0 dB", "3 dB", "4.5 dB"]),
+    ];
+    // order = dsp::multiband::idx
+    const MULTIBAND: &[ParamDef] = &[
+        p("depth", "Depth", 0.0, 100.0, 40.0, "%", false),
+        p("time", "Time", 10.0, 1000.0, 100.0, "%", true),
+        p("up", "Upward", 0.0, 200.0, 100.0, "%", false),
+        p("down", "Downward", 0.0, 200.0, 100.0, "%", false),
+        p("in", "In gain", -24.0, 24.0, 0.0, "dB", false),
+        p("out", "Out gain", -24.0, 24.0, 0.0, "dB", false),
+        p("xlo", "Low / mid", 30.0, 1000.0, 88.3, "Hz", true),
+        p("xhi", "Mid / high", 500.0, 16000.0, 2500.0, "Hz", true),
+        p("gl", "Low gain", -24.0, 24.0, 0.0, "dB", false),
+        p("gm", "Mid gain", -24.0, 24.0, 0.0, "dB", false),
+        p("gh", "High gain", -24.0, 24.0, 0.0, "dB", false),
+        p("dl", "Low down thresh", -72.0, 0.0, -33.8, "dB", false),
+        p("dm", "Mid down thresh", -72.0, 0.0, -30.3, "dB", false),
+        p("dh", "High down thresh", -72.0, 0.0, -35.5, "dB", false),
+        p("ul", "Low up thresh", -90.0, 0.0, -40.8, "dB", false),
+        p("um", "Mid up thresh", -90.0, 0.0, -41.8, "dB", false),
+        p("uh", "High up thresh", -90.0, 0.0, -40.8, "dB", false),
+    ];
     match kind {
+        FxKind::Stereo => STEREO,
+        FxKind::Analyzer => ANALYZER,
+        FxKind::Multiband => MULTIBAND,
         FxKind::Chorus => CHORUS,
         FxKind::Phaser => PHASER,
         FxKind::Warp => WARP,
@@ -277,11 +319,14 @@ pub fn type_name(kind: FxKind) -> &'static str {
         FxKind::Warp => "Warp",
         FxKind::Chorus => "Chorus",
         FxKind::Phaser => "Phaser",
+        FxKind::Stereo => "Stereo",
+        FxKind::Analyzer => "Analyzer",
+        FxKind::Multiband => "Multiband",
         FxKind::Plugin => "Plugin",
     }
 }
 
-pub const BUILTIN: [FxKind; 16] = [
+pub const BUILTIN: [FxKind; 19] = [
     FxKind::Denoise,
     FxKind::Tune,
     FxKind::Voice,
@@ -290,14 +335,17 @@ pub const BUILTIN: [FxKind; 16] = [
     FxKind::Deess,
     FxKind::Comp,
     FxKind::Fet,
+    FxKind::Multiband,
     FxKind::Sat,
     FxKind::Delay,
     FxKind::Half,
     FxKind::Warp,
     FxKind::Chorus,
     FxKind::Phaser,
+    FxKind::Stereo,
     FxKind::Reverb,
     FxKind::Limit,
+    FxKind::Analyzer,
 ];
 
 pub fn default_bands() -> Vec<EqBand> {
@@ -533,6 +581,10 @@ pub fn presets(kind: FxKind) -> Vec<Preset> {
             ),
         ],
         FxKind::Reverb => {
+            let with = |mut p: Preset, kv: &[(&'static str, f64)]| {
+                p.params.extend(kv.iter().copied());
+                p
+            };
             let rv = |name, size, pre, lo, hi, width, mix, tone, space, duck, bass| {
                 pr(
                     name,
@@ -560,6 +612,20 @@ pub fn presets(kind: FxKind) -> Vec<Preset> {
                 rv("Ballada — długi plate", 2.4, 40.0, 350.0, 6000.0, 100.0, 18.0, -30.0, 0.0, 6.0, 0.8),
                 rv("Bębny — pokój", 0.7, 0.0, 150.0, 9000.0, 80.0, 12.0, 0.0, 1.0, 0.0, 1.0),
                 rv("Wysyłka — hala 100 %", 2.2, 20.0, 200.0, 7000.0, 100.0, 100.0, -10.0, 2.0, 0.0, 0.9),
+                // added later: kept after the first seven so saved effects keep their preset number
+                rv("Wokal — rap, krótko", 0.5, 10.0, 400.0, 7500.0, 80.0, 10.0, 0.0, 1.0, 5.0, 0.7),
+                rv("Wokal — R&B, hala", 2.6, 45.0, 250.0, 6500.0, 100.0, 16.0, -20.0, 2.0, 5.0, 0.8),
+                rv("Wokal — pop, jasny plate", 1.8, 60.0, 350.0, 9000.0, 100.0, 18.0, 25.0, 0.0, 6.0, 0.7),
+                rv("Werbel — plate", 1.1, 0.0, 250.0, 9000.0, 100.0, 20.0, 10.0, 0.0, 0.0, 0.9),
+                rv("Klawisze — ciepła hala", 2.2, 20.0, 200.0, 5500.0, 100.0, 22.0, -30.0, 2.0, 0.0, 1.1),
+                rv("Lead — EDM, hala", 3.5, 30.0, 300.0, 9000.0, 100.0, 25.0, 10.0, 2.0, 6.0, 0.9),
+                with(
+                    rv("Pad — ambientowa mgła", 8.0, 60.0, 200.0, 7000.0, 100.0, 35.0, -10.0, 2.0, 0.0, 1.0),
+                    &[("mod", 80.0), ("early", 20.0)],
+                ),
+                rv("Lo-fi — ciemny pokój", 1.0, 15.0, 300.0, 3500.0, 100.0, 25.0, -60.0, 1.0, 0.0, 1.0),
+                with(rv("Kosmos — 18 s", 18.0, 80.0, 250.0, 6000.0, 100.0, 40.0, -20.0, 2.0, 0.0, 0.9), &[("mod", 100.0), ("early", 10.0)]),
+                rv("Wysyłka — plate 100 %", 1.5, 20.0, 300.0, 8000.0, 100.0, 100.0, 0.0, 0.0, 0.0, 0.8),
             ]
         }
         FxKind::Limit => vec![
@@ -737,6 +803,70 @@ pub fn presets(kind: FxKind) -> Vec<Preset> {
                 ph("Wir stereo", 3.0, 0.3, 800.0, 75.0, 35.0, 180.0, 50.0),
                 ph("Pusty (ujemny feedback)", 2.0, 0.35, 600.0, 70.0, -60.0, 90.0, 50.0),
                 synced(ph("Pad — przemiatanie (2 takty)", 3.0, 0.4, 900.0, 80.0, 40.0, 90.0, 50.0), 5.0),
+            ]
+        }
+        FxKind::Stereo => {
+            // (name, width %, spread %, bass mono, mono below Hz)
+            let st = |n: &'static str, width: f64, spread: f64, bass: f64, bassf: f64| {
+                pr(n, &[("width", width), ("spread", spread), ("bass", bass), ("bassf", bassf)])
+            };
+            vec![
+                st("Bez zmian", 100.0, 0.0, 0.0, 120.0),
+                st("Bas w mono (120 Hz)", 100.0, 0.0, 1.0, 120.0),
+                st("Szerzej, bas w mono", 140.0, 0.0, 1.0, 150.0),
+                st("Mono → stereo (spread)", 100.0, 60.0, 1.0, 150.0),
+                st("Wokal — dubel szeroki", 120.0, 35.0, 1.0, 200.0),
+                st("Pad — bardzo szeroko", 170.0, 40.0, 1.0, 200.0),
+                st("Węziej (70 %)", 70.0, 0.0, 0.0, 120.0),
+                st("Mono", 0.0, 0.0, 0.0, 120.0),
+            ]
+        }
+        FxKind::Analyzer => vec![
+            pr("Streaming (−14 LUFS)", &[("target", 1.0)]),
+            pr("Głośno (−9 LUFS)", &[("target", 2.0)]),
+            pr("Broadcast (−23 LUFS)", &[("target", 3.0)]),
+        ],
+        FxKind::Multiband => {
+            // (name, depth, time, up, down, in, out, low/mid, mid/high, band gains)
+            #[allow(clippy::too_many_arguments)]
+            fn mb(
+                n: &'static str,
+                depth: f64,
+                time: f64,
+                up: f64,
+                down: f64,
+                inp: f64,
+                out: f64,
+                xlo: f64,
+                xhi: f64,
+                g: [f64; 3],
+            ) -> Preset {
+                pr(
+                    n,
+                    &[
+                        ("depth", depth),
+                        ("time", time),
+                        ("up", up),
+                        ("down", down),
+                        ("in", inp),
+                        ("out", out),
+                        ("xlo", xlo),
+                        ("xhi", xhi),
+                        ("gl", g[0]),
+                        ("gm", g[1]),
+                        ("gh", g[2]),
+                    ],
+                )
+            }
+            vec![
+                mb("Domyślny — klej", 40.0, 100.0, 100.0, 100.0, 0.0, 0.0, 88.3, 2500.0, [0.0, 0.0, 0.0]),
+                mb("Klasyczny OTT (100 %)", 100.0, 100.0, 100.0, 100.0, 0.0, 0.0, 88.3, 2500.0, [0.0, 0.0, 0.0]),
+                mb("Hi-haty — chrupko", 45.0, 40.0, 110.0, 90.0, 0.0, 0.0, 120.0, 3200.0, [-6.0, -1.0, 2.0]),
+                mb("Lead — gęsto", 65.0, 80.0, 125.0, 110.0, 0.0, -1.5, 100.0, 2400.0, [-3.0, 1.0, 1.5]),
+                mb("808 — trzyma dół", 40.0, 160.0, 40.0, 120.0, 0.0, 0.0, 90.0, 1200.0, [0.0, -1.0, -6.0]),
+                mb("Wokal — bliżej", 25.0, 90.0, 90.0, 85.0, 0.0, 0.0, 110.0, 3000.0, [-6.0, 0.0, 1.5]),
+                mb("Pad — powietrze", 50.0, 150.0, 140.0, 60.0, 0.0, -1.0, 150.0, 3500.0, [-3.0, -1.0, 2.0]),
+                mb("Master — lekko", 12.0, 150.0, 55.0, 75.0, 0.0, 0.0, 95.0, 2800.0, [0.0, 0.0, 0.0]),
             ]
         }
         FxKind::Plugin => vec![],

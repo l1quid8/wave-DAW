@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use wave_engine::errors::ERR_EXISTS;
 use wave_engine::{Engine, Fx, FxKind, Op};
 
 use crate::actions::{arg, need_str, need_u64, Host};
@@ -80,11 +81,11 @@ fn read(path: &Path) -> R<Vec<Fx>> {
         return Err("not an FX chain preset".into());
     }
     if head.get("version").and_then(Value::as_u64).is_none_or(|v| v > u64::from(VERSION)) {
-        return Err("this preset was saved by a newer WAVE".into());
+        return Err("this preset was saved by a newer Synkopa".into());
     }
     let file: ChainFile = serde_json::from_value(head).map_err(|e| {
         if e.to_string().contains("unknown variant") {
-            "this preset uses an effect this version of WAVE does not have".to_string()
+            "this preset uses an effect this version of Synkopa does not have".to_string()
         } else {
             format!("the preset is damaged: {e}")
         }
@@ -137,7 +138,7 @@ pub fn save(engine: &Engine, dir: &Path, insert: u64, name: &str, overwrite: boo
     }
     let existing = find(dir, &name);
     if existing.is_some() && !overwrite {
-        return Err(format!("EXISTS: a preset called {name} already exists"));
+        return Err(format!("{ERR_EXISTS} a preset called {name} already exists"));
     }
     let fx: Vec<Fx> = m.fx.iter().map(|f| Fx { id: 0, ..f.clone() }).collect();
     let body = serde_json::to_vec_pretty(&ChainFile { format: FORMAT.into(), version: VERSION, fx }).map_err(|e| e.to_string())?;
@@ -201,7 +202,7 @@ pub fn rename(dir: &Path, from: &str, to: &str) -> R<Value> {
     let src = find(dir, from).ok_or_else(|| format!("no FX chain preset called {}", from.trim()))?;
     if let Some(other) = find(dir, &to) {
         if other != src {
-            return Err(format!("EXISTS: a preset called {to} already exists"));
+            return Err(format!("{ERR_EXISTS} a preset called {to} already exists"));
         }
     }
     std::fs::rename(&src, path_of(dir, &to)).map_err(|e| format!("cannot rename the preset: {e}"))?;

@@ -17,7 +17,7 @@ fn main_window(file: &str) -> Map<String, Value> {
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let config: Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let windows = config["app"]["windows"].as_array().unwrap_or_else(|| panic!("{file} has no app.windows"));
-    assert_eq!(windows.len(), 1, "{file}: WAVE has one main window");
+    assert_eq!(windows.len(), 1, "{file}: Synkopa has one main window");
     windows[0].as_object().cloned().unwrap_or_else(|| panic!("{file}: the window is not an object"))
 }
 

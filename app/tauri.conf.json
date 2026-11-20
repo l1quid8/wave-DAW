@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "WAVE",
-  "version": "0.9.15",
+  "productName": "Synkopa",
+  "version": "0.9.30",
   "identifier": "studio.wave.app",
   "build": {
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "WAVE",
+        "title": "Synkopa",
         "width": 1440,
         "height": 900,
         "minWidth": 960,
@@ -33,7 +33,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDg0RUM3OTRGNjU4MTU4RUMKUldUc1dJRmxUM25zaElEa1crQXhYaUl2Q21mMUlwd05MWmNFYVFCSG1QanM5VXVzZzlycS9PQjYK",
       "endpoints": [
-        "https://github.com/miskibin/wave-DAW/releases/latest/download/latest.json"
+        "https://github.com/miskibin/synkopa/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "passive"
@@ -41,6 +41,7 @@
     }
   },
   "bundle": {
+    "macOS": { "minimumSystemVersion": "13.4", "signingIdentity": "-" },
     "active": true,
     "targets": "all",
     "icon": [
@@ -50,7 +51,8 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "resources/keys/": "keys/"
+      "resources/keys/": "keys/",
+      "resources/plugins/": "plugins/"
     },
     "linux": {
       "deb": {

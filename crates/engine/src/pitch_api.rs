@@ -365,11 +365,21 @@ pub struct RefNote {
     pub ornament: bool,
 }
 
+/// Confidently matched notes needed before the take and the reference can be called the same
+/// melody.
+pub const MIN_SAME_NOTES: usize = 3;
+/// Share of them that must agree. Measured on the agent benchmarks (VocalSet, GTSinger,
+/// MedleyDB): related references sit at 0.56–1.0 mostly, unrelated ones and harmony parts that
+/// double the lead in places reach 0.53; at 0.55 none of 33 is taken for the melody (at 0.5,
+/// 4 were) and 110 of 141 related ones are (117).
+pub const SAME_NOTES: f32 = 0.55;
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Comparison {
     /// The reference sings the same melody: the alignment is trusted (`aligned`) and at least
-    /// half of the confidently matched notes agree within 50 ct once the interval is applied.
+    /// [`SAME_NOTES`] of the confidently matched notes (and [`MIN_SAME_NOTES`] or more) agree within 50 ct
+    /// once the interval is applied.
     /// Only a related reference is used by [`suggest`].
     pub related: bool,
     /// The two performances could be aligned in time (score ≥ 0.3): the same words or material,
@@ -694,8 +704,10 @@ pub fn compare(
     let held: Vec<f32> =
         reference.notes.iter().filter(|nt| nt.end - nt.start >= 0.15).map(|nt| (nt.pitch - nt.pitch.round()) * 100.0).collect();
     let reference_tuning_cents = (held.len() >= 3).then(|| circular_cents(&held)).flatten().map(r1);
-    // the same material is not yet the same melody: most matched notes must agree
-    let related = related && same_notes.is_some_and(|s| s >= 0.5);
+    // the same material is not yet the same melody: most matched notes must agree, and there must
+    // be enough of them to tell (one or two notes an unrelated line happens to share are not a
+    // melody; a take segmented into whole notes rather than vibrato fragments gives few pairs)
+    let related = related && confident_diffs.len() >= MIN_SAME_NOTES && same_notes.is_some_and(|s| s >= SAME_NOTES);
     Comparison {
         related,
         aligned,
@@ -733,7 +745,7 @@ pub struct SuggestParams {
     /// Key (0 = C) and scale (`pitch::scale_mask`) when known; None = chromatic.
     pub key: Option<(u32, u32)>,
     /// Reference of the equal-tempered grid, cents off A440 (an instrument tuned to 442 Hz is
-    /// +7.9; `wave analyze` measures a backing track's). None = A440. Not guessed from the
+    /// +7.9; `synkopa analyze` measures a backing track's). None = A440. Not guessed from the
     /// reference vocal: an unaccompanied singer's own drift is not the song's tuning.
     pub tuning: Option<f32>,
 }

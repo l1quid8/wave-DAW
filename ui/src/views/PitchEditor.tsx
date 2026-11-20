@@ -25,7 +25,7 @@ import { commit, Gesture, inGesture } from '../state/edit';
 import { clipPeaksPending, getClipPeaks, peakRange, peaksVersion } from '../state/peaks';
 import { plain, S } from '../state/store';
 import { tele } from '../state/telemetry';
-import { rackFloating, rollFloating } from '../state/pattern';
+import { outerZ } from '../state/winOrder';
 import { say, setU, U } from '../state/ui';
 import { dblCheck, track } from '../ui/drag';
 import { addFrameTask, fitCanvas, fonts, Layer } from '../ui/frameLoop';
@@ -212,7 +212,7 @@ function PitchBody(props: { clipId: number }) {
   const showEdited = () => !!tune() || !!activeTarget();
   const mask = () => scaleMask(scale());
   const putTune = (t: ClipTune | null): Op => ({ op: 'putClips', clips: [{ ...plain(c()), tune: t } as Clip] });
-  /** Note edits go to the engine as `editTune` (the op `wave pitch edit` sends too): indices are the notes shown, and
+  /** Note edits go to the engine as `editTune` (the op `synkopa pitch edit` sends too): indices are the notes shown, and
    *  a clip without notes of its own starts from the analysis' segmentation (`init`). */
   const editOp = (e: TuneEdit): Op => ({ op: 'editTune', clip: c().id, edit: tune()?.notes.length ? e : { init: tuneOrInit().notes.map(n => [n.start, n.end] as [number, number]), ...e } });
 
@@ -685,7 +685,9 @@ function PitchBody(props: { clipId: number }) {
   const solo = () => {
     if (previewing()) { void be().previewStop(); return; }
     const ts = tOfBeat(U.start), from = ts > t0() && ts < t1() ? ts : t0();
-    be().previewClip(c().id, from).catch(e => say(String(e?.message ?? e)));
+    // optimistic: telemetry reports the preview a frame later, and a close before that must still stop it
+    setU('previewing', true);
+    be().previewClip(c().id, from).catch(e => { setU('previewing', false); say(String(e?.message ?? e)); });
   };
   const resize = (e: PointerEvent) => {
     if (e.button !== 0) return; e.preventDefault(); e.stopPropagation();
@@ -693,11 +695,10 @@ function PitchBody(props: { clipId: number }) {
     track(ev => setU('pitchEd', ed => ed && { ...ed, w: clamp(o.w + ev.clientX - sx, 720, window.innerWidth - 20), h: clamp(o.h + ev.clientY - sy, 380, window.innerHeight - 20) }), null, 'nwse-resize');
   };
   // over the plugin / Channel Rack / Piano roll layer when it was used after them
-  const aboveWins = () => { const z = E().z ?? 0; return !U.plugsHidden && [...U.plugs.map(p => p.z), rackFloating() ? U.rackWin!.z : 0, rollFloating() ? U.rollWin!.z : 0].every(o => z > o); };
   void theme; void fonts;
   return (
-    <div ref={root} tabIndex={0} class="win pitchwin" style={{ left: E().x + 'px', top: E().y + 'px', width: E().w + 'px', height: E().h + 'px', 'z-index': aboveWins() ? 46 : 44 }}
-      onKeyDown={onKey} onPointerDown={A.pitchFront} data-pitched>
+    <div ref={root} tabIndex={0} class="win pitchwin" style={{ left: E().x + 'px', top: E().y + 'px', width: E().w + 'px', height: E().h + 'px', 'z-index': outerZ(E().z) }}
+      onKeyDown={onKey} on:pointerdown={{ capture: true, handleEvent: () => A.pitchFront() }} data-pitched>
       <div class="winhd" onPointerDown={e => moveWindow(e, () => E(), (x, y) => setU('pitchEd', ed => ed && { ...ed, x, y }))}>
         <span class="tile" style={{ width: '20px', height: '20px', background: FXMETA.tune.color + '26', color: FXMETA.tune.color }}><Icon d={FXMETA.tune.icon} size={13} /></span>
         <span class="title">{t('d.pitch.title')}</span>

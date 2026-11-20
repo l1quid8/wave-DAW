@@ -1,4 +1,4 @@
-//! `wave` — the command line: the project open in a running WAVE app, or (with `--project`,
+//! `synkopa` — the command line: the project open in a running Synkopa app, or (with `--project`,
 //! given a [`Files`] provider by the app binary) a project file with no app running.
 //!
 //! stdout is only the JSON result; diagnostics go to stderr.
@@ -10,14 +10,16 @@ use std::process::ExitCode;
 use serde_json::{json, Value};
 use wave_session as ws;
 
-const HELP: &str = r#"wave — edit, render and inspect WAVE projects
-docs: https://github.com/miskibin/wave-DAW/blob/main/docs/cli.md
+mod watch;
+
+const HELP: &str = r#"synkopa — edit, render and inspect Synkopa projects
+docs: https://github.com/miskibin/synkopa/blob/main/docs/cli.md
 
 USAGE
-  wave <command> [options]                 the project open in the running app (--session ID if several are open)
-  wave -p song.wave <command> [options]    a project file, no app needed: load, run, save back if it changed
+  synkopa <command> [options]              the project open in the running app (--session ID if several are open)
+  synkopa -p song.synkopa <command> [options]  a project file, no app needed: load, run, save back if it changed
                                            [--save-as FILE] [--dry-run: save nothing] [--force: even if the app has it open]
-  wave new song.wave [--template empty|sketch] [--bpm N]   create a project file
+  synkopa new song.synkopa [--template empty|sketch|demo] [--bpm N]   create a project file
 
 FOR SCRIPTS AND AGENTS
   stdout is one JSON value, messages go to stderr. Exit: 0 ok, 1 usage, 2 app not running/unreachable,
@@ -31,11 +33,18 @@ FOR SCRIPTS AND AGENTS
 
 SCRIPTS
   script FILE|-                            one command per line ('…'/"…" quote, # comments, a leading
-                                           `wave` is ignored); stops at the first failing line. With -p:
+                                           `synkopa` is ignored); stops at the first failing line. With -p:
                                            one load and one save, nothing written if a line fails
+  watch FILE [--render OUT.wav] [--once] [--force]
+                                           live coding: the script FILE describes the song. On every save
+                                           it runs on a copy of the project as it was when the watch
+                                           started and the result replaces the open project as one undo
+                                           step while the loop plays (a failing line changes nothing).
+                                           One JSON line per save on stdout. --render: bounce it each time;
+                                           --once: apply and exit. With -p FILE: on the file, never saved
 
 READ
-  sessions                                 list running WAVE apps
+  sessions                                 list running Synkopa apps
   status                                   transport, revision, file, audio device
   context [--full]                         project summary (--full: every clip, note and parameter)
   catalog                                  effect types, parameters and presets
@@ -46,7 +55,10 @@ EDIT  (all edits are one undo step each; --if-revision N refuses to act if the p
   apply --file ops.json | --json '[...]'   apply a batch of ops atomically   [--label TEXT]
   undo | redo                              (running app only)
   bpm <value>
-  add-fx --insert ID --type eq|comp|sat|delay|half|warp|chorus|phaser|reverb|limit|... [--preset N]
+  add-fx --insert ID --type eq|comp|sat|delay|half|warp|chorus|phaser|stereo|multiband|analyzer|reverb|limit|... [--preset N]
+  route --from ID --to ID [--gain 0..2] [--only]   mixer routing: insert FROM sends to TO (post-fader;
+                                                  --only: no longer to the master; --to 0: to the master again)
+  unroute --from ID --to ID                       remove that send (--to 0: stop going to the master)
   set-param --fx ID --param NAME --value V
   preset --fx ID --index N
   import <file>... [--track N --beat B]    load audio, optionally place it
@@ -56,13 +68,22 @@ EDIT  (all edits are one undo step each; --if-revision N refuses to act if the p
   relink --source ID --path FILE           point a source at another file (one undo step)
   make-unique --clip ID[,ID...]            give audio clips (one sample, one track) their own copy of the
                                            sample on a new track below, routed to a free mixer insert
+  export-in-place --clip ID[,ID...]        render clips (with their mixer effects) to one audio clip on a new
+                                           track below them; the originals are muted (one undo step)
+  stems --clip ID [--only drums,bass,other,vocals]
+                                           extract stems (HTDemucs) from an audio clip: one new track per
+                                           stem right below it, same place and length; the clip is muted
+                                           (one undo step; about 25 s per minute of audio on 6 cores)
+  stems [--install]                        stem model install state (--install: downloads ~90 MB, MIT,
+                                           SHA-256 checked)
 
 PATTERNS & CHANNELS  (steps: x = on, 1-9 = velocity 10-90 %, . = off; spaces and | are ignored)
   channels                                 Channel Rack: ids, instrument/sample, volume, pan, insert
   channels --add kick-808|snare|marimba…   add a sampler of a standard-library sample (--sample SOURCE_ID: of a project source)
-  channels --keys                          add WAVE Keys, the sampled grand piano
+  channels --keys                          add Synkopa Keys, the sampled grand piano
+  channels --plugin "NAME|CID"             add a scanned VST3 instrument (name, start of a name, or class id)
   channels --synth "PRESET"                add a synth channel ("" = blank patch); --ch C --preset NAME loads one
-  channels --ch C --param ID --value V     one knob of a synth (ids in `catalog`) or of WAVE Keys (release ms, dynamics %)
+  channels --ch C --param ID --value V     one knob of a synth (ids in `catalog`) or of Synkopa Keys (release ms, dynamics %)
   channels --remove ID|NAME                remove a channel and its notes
   pattern [--id N]                         a pattern as step strings per channel
   pattern --id N --ch C --steps "x... x... x... x..." [--vel 0.8]   replace channel C's notes with step triggers
@@ -92,6 +113,7 @@ FILES
                                            one file per mixer insert with sound, plus the optional master mix
   WAV options: --wav-bits 16|24|32 (default 32-bit float); --dither (16/24-bit PCM only)
                --wrap-tail (carry effects into the start of the loop)
+  --pattern P: render pattern P alone, as PAT mode plays it (an empty Playlist is fine)
   save [--path FILE] | open <FILE>          (app; with -p the file is saved for you, --save-as copies)
   export-project --out FILE.zip            package the project and its audio sources for sharing
 
@@ -120,7 +142,9 @@ PITCH  (Tune to Reference: pull a vocal take onto another performance of the sam
                                            channel plays over the clip in the playlist (taken again each time)
   melody-channels --clip ID                channels playing notes over the clip, best fit to the singing first
   pitch-target --clip ID [--full]          the computed target: score, octave, notes (--full: curves)
-  f0-model                                 pitch detector in use; RMVPE model install state
+  f0-model [--install]                     pitch detector in use; RMVPE model install state
+                                           (--install: downloads ~345 MB after printing its licence note,
+                                           SHA-256 checked, then switches the detector to it)
 
 PITCH EDITING  (the pitch editor's notes for scripts and agents; indices come from `pitch inspect`)
   pitch inspect --clip ID [--full [--from S --to S]] [--all]
@@ -139,13 +163,24 @@ PITCH EDITING  (the pitch editor's notes for scripts and agents; indices come fr
   tune-file --take u.wav --reference r.wav --out o.wav [--json target.json]
             [--model rmvpe.onnx | --yin] [same options as tune-ref]   headless; needs no running app
 
+AUTO VOCAL  (one call: measure the take, bake the rider into the audio, put the tuned chain on the insert)
+  auto-vocal --clip ID [--style natural|hard] [--beat-clip ID] [--no-bake] [--plan]
+                                           the calibrated chain (tune, rider, fet comp, deess, reverb, limit)
+                                           replaces the insert's effects of the same kinds; the key comes from
+                                           the beat clip or the other tracks. Default renders the rider into
+                                           the clip's audio first (two undo steps, the original source stays);
+                                           --no-bake keeps it live on the insert; --plan only prints the
+                                           plan, read-only (riderBake holds the rider's params)
+
 PLUGINS  (VST3 everywhere, LV2 on Linux)
-  plugins [--rescan]                       installed effects of every format ({plugins, unavailable})
+  plugins [--rescan]                       installed effects of every format and VST3 instruments ({plugins, instruments, unavailable})
   plugin-add --insert ID --cid C [--format vst3|lv2] [--path P]
                                            put a plugin on an insert (VST3: --path and class id;
                                            LV2: --cid is the plugin URI)
-  plugin-params --fx ID [--query TEXT]     parameters of a plugin instance (LV2: real range and unit too)
+  plugin-params --fx ID [--query TEXT]     parameters of a plugin instance: an effect, or a plugin channel by its id (LV2: real range and unit too)
   plugin-set --fx ID --id PARAM --value 0..1
+  plugin-load-anyway --fx ID               load a plugin Synkopa's safety check refused (it crashed or hung
+                                           when tried in a separate process); from now on, every project
   vst3 [--rescan] | vst3-add | vst3-params | vst3-set    the same, VST3 only (older names)
   auto-add --fx ID --param ID [--points "0:0.2,4:0.8" | --value V] [--track N --name TEXT]
                                            automate a hosted plugin parameter (adds the playlist clip too)
@@ -157,6 +192,13 @@ NOTES  (deterministic transforms and generators for a pattern's notes)
   notes strum --pattern ID [--width STEPS --ramp VEL]
   notes drums --pattern ID --bars N --seed S --voice "CH:K:N[:ROT[:VEL]]" (repeatable)
   notes melody --pattern ID --ch CH [--bars N --density 0..1 --repeat N --seed S]
+  notes chord --pattern ID [--type diatonic|maj|min|7|maj7|min7]        harmonize single notes
+  notes progression --pattern ID --ch CH [--bars 1..32 --template pop|pop2|minloop|trap|iivI|doowop|
+           andalusian|blues|canon|chance --seed S --degrees "0:5:2:6" --no-voice-lead]
+           one diatonic 7th chord per bar; --degrees replaces template+bars; inversions are
+           voice-led to move the least unless --no-voice-lead
+  notes stamp --pattern ID --ch CH --step S --root R --type maj|min|…|5 [--inv 0..3 --len STEPS]
+           write one chord rooted at R (MIDI key or note name like A3); replaces that step
   notes … [--select "FROM:TO[@CH]" | --indices "1,2,5"]                limit the notes a verb touches
   key [NOTE] [SCALE] [--off]                            project key/scale (major minor pent…) for scale-aware tools
 
@@ -165,11 +207,11 @@ NOTES  (deterministic transforms and generators for a pattern's notes)
 "#;
 
 /// Opens and creates project files in this process: what `--project` and `new` need.
-/// The app binary provides it; the standalone `wave` binary only talks to a running app.
+/// The app binary provides it; the standalone `synkopa` binary only talks to a running app.
 pub trait Files {
     /// Loads a project file; the warnings name audio that could not be loaded.
     fn open(&self, path: &Path) -> Result<(Box<dyn Doc>, Vec<String>), String>;
-    /// A new, unsaved project from a template: `empty` or `sketch`.
+    /// A new, unsaved project from a template: `empty`, `sketch` or `demo`.
     fn create(&self, template: &str) -> Result<Box<dyn Doc>, String>;
 }
 
@@ -191,13 +233,18 @@ const SWITCHES: &[&str] = &[
     "dry-run",
     "flatten",
     "force",
+    "once",
     "full",
     "help",
+    "install",
     "keys",
     "new",
+    "no-bake",
     "no-master",
+    "no-voice-lead",
     "off",
     "original",
+    "plan",
     "play",
     "pretty",
     "remove-unused",
@@ -310,14 +357,7 @@ pub fn run_cli_with(raw: Vec<String>, files: Option<&dyn Files>) -> ExitCode {
         print!("{HELP}");
         return ExitCode::SUCCESS;
     }
-    let res = if cmd == "new" {
-        new_file(files, &a)
-    } else if a.has("project") {
-        on_file(files, &cmd, &a)
-    } else {
-        run(&Cx { doc: None }, &cmd, &a)
-    };
-    match res {
+    match dispatch(&cmd, &a, files) {
         Ok(mut v) => {
             tidy_numbers(&mut v);
             let s = if pretty { serde_json::to_string_pretty(&v) } else { serde_json::to_string(&v) };
@@ -325,24 +365,46 @@ pub fn run_cli_with(raw: Vec<String>, files: Option<&dyn Files>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(Fail::Usage(m)) => {
-            eprintln!("wave: {m}\n(run `wave help`)");
+            eprintln!("synkopa: {m}\n(run `synkopa help`)");
             ExitCode::from(1)
         }
         Err(Fail::Conn(m)) => {
-            eprintln!("wave: {m}");
+            eprintln!("synkopa: {m}");
             ExitCode::from(2)
         }
         Err(Fail::App(m)) => {
-            eprintln!("wave: {m}");
+            eprintln!("synkopa: {m}");
             ExitCode::from(3)
         }
     }
 }
 
+fn dispatch(cmd: &str, a: &Args, files: Option<&dyn Files>) -> Result<Value, Fail> {
+    if cmd == "watch" {
+        watch::watch(files, a)
+    } else if cmd == "new" {
+        new_file(files, a)
+    } else if a.has("project") {
+        on_file(files, cmd, a)
+    } else {
+        run(&Cx { doc: None }, cmd, a)
+    }
+}
+
+/// One command, as [`run_cli_with`] runs it, with the result returned instead of printed
+/// (the message of a failure). For embedders and tests; `watch` without `--once` never returns.
+pub fn execute(raw: Vec<String>, files: Option<&dyn Files>) -> Result<Value, String> {
+    let a = Args::parse(raw);
+    let cmd = a.pos.first().cloned().ok_or("no command")?;
+    dispatch(&cmd, &a, files).map_err(|e| match e {
+        Fail::Usage(m) | Fail::Conn(m) | Fail::App(m) => m,
+    })
+}
+
 fn need_files(files: Option<&dyn Files>) -> Result<&dyn Files, Fail> {
     files.ok_or_else(|| {
         Fail::Usage(
-            "this `wave` binary only talks to a running app; project files need the `wave` the WAVE app installs (it runs `WAVE --cli`)"
+            "this `synkopa` binary only talks to a running app; project files need the `synkopa` the Synkopa app installs (it runs `Synkopa --cli`)"
                 .into(),
         )
     })
@@ -373,7 +435,7 @@ fn not_open_in_app(path: &Path, a: &Args) -> Result<(), Fail> {
     }
     match open_in_session(path) {
         Some(id) => Err(Fail::App(format!(
-            "FILE_OPEN: {} is open in WAVE (session {id}). Edit it there (drop --project; the edit joins the app's undo history), close it in the app first, or add --force (the app overwrites the file on its next save)",
+            "FILE_OPEN: {} is open in Synkopa (session {id}). Edit it there (drop --project; the edit joins the app's undo history), close it in the app first, or add --force (the app overwrites the file on its next save)",
             path.display(),
         ))),
         None => Ok(()),
@@ -389,10 +451,10 @@ fn open_in_session(path: &Path) -> Option<String> {
     })
 }
 
-/// `wave --project FILE <command>`: load, run, save if it changed.
+/// `synkopa --project FILE <command>`: load, run, save if it changed.
 fn on_file(files: Option<&dyn Files>, cmd: &str, a: &Args) -> Result<Value, Fail> {
     let files = need_files(files)?;
-    let given = a.get("project").ok_or_else(|| Fail::Usage("--project needs a file: --project song.wave".into()))?;
+    let given = a.get("project").ok_or_else(|| Fail::Usage("--project needs a file: --project song.synkopa".into()))?;
     let path = abs(given);
     if a.has("session") {
         return Err(Fail::Usage("--session talks to a running app and --project works on a file; pick one".into()));
@@ -401,11 +463,11 @@ fn on_file(files: Option<&dyn Files>, cmd: &str, a: &Args) -> Result<Value, Fail
         return Err(Fail::Usage("--save-as needs a file".into()));
     }
     if !path.is_file() {
-        return Err(Fail::Usage(format!("{given} does not exist (create it with `wave new {given}`)")));
+        return Err(Fail::Usage(format!("{given} does not exist (create it with `synkopa new {given}`)")));
     }
     let (doc, warnings) = files.open(&path).map_err(|e| Fail::App(format!("OPEN_FAILED: {e}")))?;
     for w in &warnings {
-        eprintln!("wave: warning: {w}");
+        eprintln!("synkopa: warning: {w}");
     }
     let cx = Cx { doc: Some(&*doc) };
     let mut out = run(&cx, cmd, a)?;
@@ -432,14 +494,14 @@ fn on_file(files: Option<&dyn Files>, cmd: &str, a: &Args) -> Result<Value, Fail
     Ok(out)
 }
 
-/// `wave new FILE [--template empty|sketch] [--bpm N] [--force]`
+/// `synkopa new FILE [--template empty|sketch|demo] [--bpm N] [--force]`
 fn new_file(files: Option<&dyn Files>, a: &Args) -> Result<Value, Fail> {
     let u = Fail::Usage;
     let files = need_files(files)?;
-    let raw = a.pos.get(1).ok_or_else(|| u("new <FILE> [--template empty|sketch] [--bpm N]".into()))?;
+    let raw = a.pos.get(1).ok_or_else(|| u("new <FILE> [--template empty|sketch|demo] [--bpm N]".into()))?;
     let mut path = abs(raw);
     if path.extension().is_none() {
-        path.set_extension("wave");
+        path.set_extension("synkopa");
     }
     if path.exists() && !a.has("force") {
         return Err(Fail::App(format!("EXISTS: {} already exists (--force replaces it)", path.display())));
@@ -455,7 +517,7 @@ fn new_file(files: Option<&dyn Files>, a: &Args) -> Result<Value, Fail> {
     // `--force` here only means "replace an existing file": a project the app has open is never replaced
     // behind its back (its next save would write the old project over the new one)
     if let Some(id) = open_in_session(&path) {
-        return Err(Fail::App(format!("FILE_OPEN: {} is open in WAVE (session {id}); close it in the app first", path.display())));
+        return Err(Fail::App(format!("FILE_OPEN: {} is open in Synkopa (session {id}); close it in the app first", path.display())));
     }
     doc.save(&path).map_err(|e| Fail::App(format!("SAVE_FAILED: {}: {e}", path.display())))?;
     let ctx = doc.call("context", &json!({}), None).map_err(|e| Fail::App(app_error(e)))?;
@@ -478,12 +540,12 @@ fn session(a: &Args) -> Result<ws::Endpoint, Fail> {
     let all = ws::sessions();
     match a.get("session") {
         Some(id) => {
-            all.into_iter().find(|e| e.session_id.starts_with(id)).ok_or_else(|| Fail::Conn(format!("no running WAVE session {id}")))
+            all.into_iter().find(|e| e.session_id.starts_with(id)).ok_or_else(|| Fail::Conn(format!("no running Synkopa session {id}")))
         }
         None => match all.len() {
-            0 => Err(Fail::Conn("WAVE is not running (start the app, or work on a file: wave --project song.wave …)".into())),
+            0 => Err(Fail::Conn("Synkopa is not running (start the app, or work on a file: synkopa --project song.synkopa …)".into())),
             1 => Ok(all.into_iter().next().unwrap()),
-            n => Err(Fail::Conn(format!("{n} WAVE apps are open; pick one with --session ID (see `wave sessions`)"))),
+            n => Err(Fail::Conn(format!("{n} Synkopa apps are open; pick one with --session ID (see `synkopa sessions`)"))),
         },
     }
 }
@@ -499,7 +561,7 @@ fn send(cx: &Cx, a: &Args, command: &str, args: Value) -> Result<Value, Fail> {
     }
     let ep = session(a)?;
     let rep = ws::call(&ep, command, args, rev, a.get("label").map(str::to_owned))
-        .map_err(|e| Fail::Conn(format!("could not reach WAVE: {e}")))?;
+        .map_err(|e| Fail::Conn(format!("could not reach Synkopa: {e}")))?;
     if rep.ok {
         let mut d = rep.data;
         if let Value::Object(m) = &mut d {
@@ -551,7 +613,7 @@ fn split_line(line: &str) -> Result<Vec<String>, String> {
 /// Options of the whole invocation, not of one script line.
 const OUTER_ONLY: &[&str] = &["project", "session", "save-as", "dry-run", "force", "pretty"];
 
-/// `wave [--project FILE] script FILE|-`: one command per line, stops at the first failure.
+/// `synkopa [--project FILE] script FILE|-`: one command per line, stops at the first failure.
 fn script(cx: &Cx, a: &Args) -> Result<Value, Fail> {
     let u = Fail::Usage;
     let src = a.pos.get(1).ok_or_else(|| u("script <FILE> (or - for stdin)".into()))?;
@@ -562,6 +624,12 @@ fn script(cx: &Cx, a: &Args) -> Result<Value, Fail> {
     } else {
         std::fs::read_to_string(src).map_err(|e| u(format!("{src}: {e}")))?
     };
+    Ok(json!({ "results": run_lines(cx, a, &text)? }))
+}
+
+/// Runs a script's lines (see [`script`]): the results of each, or the first failure, naming its line.
+fn run_lines(cx: &Cx, a: &Args, text: &str) -> Result<Vec<Value>, Fail> {
+    let u = Fail::Usage;
     let mut results = vec![];
     for (i, line) in text.lines().enumerate() {
         let n = i + 1;
@@ -570,21 +638,21 @@ fn script(cx: &Cx, a: &Args) -> Result<Value, Fail> {
             continue;
         }
         let mut words = split_line(t).map_err(|e| u(format!("line {n}: {e}")))?;
-        if words.first().map(String::as_str) == Some("wave") {
+        if matches!(words.first().map(String::as_str), Some("synkopa" | "wave")) {
             words.remove(0);
         }
         let mut la = Args::parse(words);
         let Some(cmd) = la.pos.first().cloned() else { continue };
-        if matches!(cmd.as_str(), "script" | "new" | "help") {
+        if matches!(cmd.as_str(), "script" | "new" | "help" | "watch") {
             return Err(u(format!("line {n}: `{cmd}` cannot run inside a script")));
         }
         if let Some((k, _)) = la.opts.iter().find(|(k, _)| OUTER_ONLY.contains(&k.as_str())) {
-            return Err(u(format!("line {n}: --{k} belongs to the whole script: `wave --{k} … script FILE`")));
+            return Err(u(format!("line {n}: --{k} belongs to the whole script: `synkopa --{k} … script FILE`")));
         }
         // on a file, where the project is written is decided once, after the script: a copy made here would be dropped
         if cx.doc.is_some() && cmd == "save" && la.has("path") {
             return Err(u(format!(
-                "line {n}: `save --path` cannot write a copy from a script; use `wave --project … --save-as FILE script …`"
+                "line {n}: `save --path` cannot write a copy from a script; use `synkopa --project … --save-as FILE script …`"
             )));
         }
         if let Some(s) = a.get("session") {
@@ -615,12 +683,66 @@ fn script(cx: &Cx, a: &Args) -> Result<Value, Fail> {
             }
         }
     }
-    Ok(json!({ "results": results }))
+    Ok(results)
 }
 
 /// `12` → 12, `kick` → "kick".
 fn id_or_name(s: &str) -> Value {
     s.parse::<u64>().map(|n| json!(n)).unwrap_or_else(|_| json!(s))
+}
+
+/// A stamp root: a MIDI key (`57`) or a note name with octave (`A3`, `C#4`, `Bb2` —
+/// C4 = 60). Returns the MIDI key.
+fn parse_root(s: &str) -> Result<u64, String> {
+    let t = s.trim();
+    if let Ok(n) = t.parse::<u64>() {
+        return if n <= 127 { Ok(n) } else { Err(format!("--root {n} is outside 0..127")) };
+    }
+    let bad = || format!("--root `{s}` is not a MIDI key or note name (A3, C#4)");
+    // char-aware split: the octave is the last character, so a multi-byte accidental
+    // without an octave (`C♭`) errors out instead of splitting inside a character
+    let chars: Vec<char> = t.chars().collect();
+    let (oct_char, name_chars) = chars.split_last().ok_or_else(bad)?;
+    let oct = oct_char.to_digit(10).ok_or_else(bad)? as i64;
+    let (letter, acc): (char, i64) = match name_chars {
+        [l] => (*l, 0),
+        [l, '#'] => (*l, 1),
+        [l, 'b'] | [l, '♭'] => (*l, -1),
+        _ => return Err(bad()),
+    };
+    let base = match letter.to_ascii_uppercase() {
+        'C' => 0,
+        'D' => 2,
+        'E' => 4,
+        'F' => 5,
+        'G' => 7,
+        'A' => 9,
+        'B' => 11,
+        _ => return Err(bad()),
+    };
+    let midi = 12 * (oct + 1) + base + acc;
+    if !(0..=127).contains(&midi) {
+        return Err(format!("--root {s} is outside 0..127"));
+    }
+    Ok(midi as u64)
+}
+
+#[cfg(test)]
+mod root_tests {
+    #[test]
+    fn parse_root_takes_midi_and_note_names() {
+        assert_eq!(super::parse_root("57").unwrap(), 57);
+        assert_eq!(super::parse_root("60").unwrap(), 60);
+        assert_eq!(super::parse_root("A3").unwrap(), 57);
+        assert_eq!(super::parse_root("c4").unwrap(), 60);
+        assert_eq!(super::parse_root("C#4").unwrap(), 61);
+        assert_eq!(super::parse_root("bb2").unwrap(), 46);
+        assert_eq!(super::parse_root("B3").unwrap(), 59);
+        assert!(super::parse_root("H4").is_err());
+        assert!(super::parse_root("A").is_err());
+        assert!(super::parse_root("128").is_err());
+        assert!(super::parse_root("C♭").is_err()); // multi-byte accidental, no octave
+    }
 }
 
 fn run(cx: &Cx, cmd: &str, a: &Args) -> Result<Value, Fail> {
@@ -663,6 +785,26 @@ fn run(cx: &Cx, cmd: &str, a: &Args) -> Result<Value, Fail> {
             "add_fx",
             json!({"insertId": a.num("insert").map_err(u)?.ok_or_else(|| u("missing --insert".into()))? as u64, "type": a.need("type").map_err(u)?, "preset": a.num("preset").map_err(u)?}),
         ),
+        "route" => send(
+            cx,
+            a,
+            "route",
+            json!({
+                "from": a.num("from").map_err(u)?.ok_or_else(|| u("missing --from".into()))? as u64,
+                "to": a.num("to").map_err(u)?.ok_or_else(|| u("missing --to".into()))? as u64,
+                "gain": a.num("gain").map_err(u)?,
+                "only": a.has("only"),
+            }),
+        ),
+        "unroute" => send(
+            cx,
+            a,
+            "unroute",
+            json!({
+                "from": a.num("from").map_err(u)?.ok_or_else(|| u("missing --from".into()))? as u64,
+                "to": a.num("to").map_err(u)?.ok_or_else(|| u("missing --to".into()))? as u64,
+            }),
+        ),
         "set-param" => send(
             cx,
             a,
@@ -702,8 +844,14 @@ fn run(cx: &Cx, cmd: &str, a: &Args) -> Result<Value, Fail> {
             if a.has("synth") {
                 args["synth"] = json!(a.get("synth").unwrap_or(""));
             }
+            if let Some(v) = a.get("plugin") {
+                args["plugin"] = json!(v);
+            }
             if let Some(c) = a.get("ch") {
                 args["ch"] = id_or_name(c);
+            }
+            if a.has("group") {
+                args["group"] = json!(a.get("group").unwrap_or(""));
             }
             for k in ["preset", "param"] {
                 if let Some(v) = a.get(k) {
@@ -757,7 +905,9 @@ fn run(cx: &Cx, cmd: &str, a: &Args) -> Result<Value, Fail> {
         }
         "missing" => send(cx, a, "missing", json!({})),
         "relink" => {
-            let abs = |p: &str| std::fs::canonicalize(p).map(|x| x.display().to_string()).unwrap_or_else(|_| p.to_string());
+            // not `canonicalize`: on Windows it yields a `\\?\C:\…` path, which a save then cannot make
+            // relative to the project folder
+            let abs = |p: &str| std::path::absolute(p).map(|x| x.display().to_string()).unwrap_or_else(|_| p.to_string());
             match (a.get("folder"), a.num("source").map_err(u)?, a.get("path")) {
                 (Some(f), None, None) => send(cx, a, "relink", json!({ "folder": abs(f) })),
                 (None, Some(id), Some(p)) => send(cx, a, "relink", json!({ "sourceId": id as u64, "path": abs(p) })),
@@ -773,6 +923,27 @@ fn run(cx: &Cx, cmd: &str, a: &Args) -> Result<Value, Fail> {
                 .collect::<Result<Vec<_>, _>>()?;
             send(cx, a, "make_unique", json!({ "clipIds": ids }))
         }
+        "export-in-place" => {
+            let ids = a
+                .need("clip")
+                .map_err(u)?
+                .split(',')
+                .map(|x| x.trim().parse::<u64>().map_err(|_| u(format!("--clip takes clip ids separated by commas, got {x}"))))
+                .collect::<Result<Vec<_>, _>>()?;
+            send(cx, a, "export_in_place", json!({ "clipIds": ids }))
+        }
+        "stems" if a.has("install") => {
+            eprintln!("downloading the HTDemucs stem model (~90 MB; MIT licence)");
+            send(cx, a, "stems_model_install", json!({}))
+        }
+        "stems" => match a.num("clip").map_err(u)? {
+            Some(clip) => {
+                let stems: Option<Vec<&str>> = a.get("only").map(|s| s.split(',').map(str::trim).filter(|x| !x.is_empty()).collect());
+                eprintln!("separating clip {} (this takes a while: about 25 s per minute of audio)", clip as u64);
+                send(cx, a, "extract_stems", json!({ "clipId": clip as u64, "stems": stems }))
+            }
+            None => send(cx, a, "stems_model", json!({})),
+        },
         "takes" => send(cx, a, "takes", json!({"track": a.num("track").map_err(u)?.ok_or_else(|| u("missing --track".into()))? as u64})),
         "comp" => {
             let mut args =
@@ -832,6 +1003,7 @@ fn run(cx: &Cx, cmd: &str, a: &Args) -> Result<Value, Fail> {
                     "format": a.get("format"), "mp3Kbps": a.num("kbps").map_err(u)?,
                     "wavBits": wav_bits, "dither": a.has("dither"), "wrapTail": a.has("wrap-tail"),
                     "stems": a.has("stems"), "master": !a.has("no-master"),
+                    "pattern": a.num("pattern").map_err(u)?,
                 }),
             )
         }
@@ -873,6 +1045,9 @@ fn run(cx: &Cx, cmd: &str, a: &Args) -> Result<Value, Fail> {
             "plugin_set_param",
             json!({"fxId": a.num("fx").map_err(u)?.ok_or_else(|| u("missing --fx".into()))? as u64, "id": a.num("id").map_err(u)?.ok_or_else(|| u("missing --id".into()))? as u64, "value": a.num("value").map_err(u)?.ok_or_else(|| u("missing --value".into()))?}),
         ),
+        "plugin-load-anyway" => {
+            send(cx, a, "plugin_load_anyway", json!({"fxId": a.num("fx").map_err(u)?.ok_or_else(|| u("missing --fx".into()))? as u64}))
+        }
         "vst3" => send(cx, a, "vst3_scan", json!({"rescan": a.has("rescan")})),
         "vst3-add" => send(
             cx,
@@ -931,9 +1106,26 @@ fn run(cx: &Cx, cmd: &str, a: &Args) -> Result<Value, Fail> {
             )
         }
         "notes" => {
-            let verb = a.pos.get(1).ok_or_else(|| u("notes <humanize|quantize|euclid|strum|drums|melody> …".into()))?.clone();
+            let verb = a
+                .pos
+                .get(1)
+                .ok_or_else(|| u("notes <humanize|quantize|euclid|strum|chop|glue|arp|drums|melody|chord|progression|stamp> …".into()))?
+                .clone();
             let pattern = a.num("pattern").map_err(u)?.ok_or_else(|| u("missing --pattern".into()))? as u64;
             let f = |k: &str| a.num(k);
+            if verb == "stamp" {
+                // one chord through the app's `pattern` command (the existing note op):
+                // replaces the notes at that step on the channel, prints notes + label
+                let root = a.get("root").ok_or_else(|| u("missing --root (MIDI key or note name like A3)".into()))?;
+                let st = json!({
+                    "step": f("step").map_err(u)?.ok_or_else(|| u("missing --step (16ths)".into()))?,
+                    "root": parse_root(root).map_err(u)?,
+                    "type": a.need("type").map_err(u)?,
+                    "inv": f("inv").map_err(u)?.unwrap_or(0.0),
+                    "len": f("len").map_err(u)?.unwrap_or(4.0),
+                });
+                return send(cx, a, "pattern", json!({"id": pattern, "ch": id_or_name(a.need("ch").map_err(u)?), "stamp": st}));
+            }
             let (verb_json, needs_ch) = match verb.as_str() {
                 "humanize" => (
                     json!({"kind": "humanize", "timing": f("timing").map_err(u)?.unwrap_or(0.5), "velocity": f("velocity").map_err(u)?.unwrap_or(0.4)}),
@@ -951,6 +1143,35 @@ fn run(cx: &Cx, cmd: &str, a: &Args) -> Result<Value, Fail> {
                     json!({"kind": "strum", "width": f("width").map_err(u)?.unwrap_or(0.5), "ramp": f("ramp").map_err(u)?.unwrap_or(0.05)}),
                     false,
                 ),
+                "chop" => (json!({"kind": "chop", "len": f("len").map_err(u)?.unwrap_or(1.0)}), false),
+                "glue" => (json!({"kind": "glue"}), false),
+                "arp" => (
+                    json!({"kind": "arpeggiate", "mode": a.get("mode").unwrap_or("up"), "rate": f("rate").map_err(u)?.unwrap_or(1.0), "gate": f("gate").map_err(u)?.unwrap_or(0.9), "octaves": f("octaves").map_err(u)?.unwrap_or(1.0) as u32}),
+                    false,
+                ),
+                "chord" => {
+                    let ty = a.get("type").map(str::to_owned).unwrap_or_else(|| "diatonic".into());
+                    let harmony = match ty.as_str() {
+                        "major" => "maj".to_string(),
+                        "minor" => "min".to_string(),
+                        t => t.to_string(),
+                    };
+                    (json!({"kind": "chord", "harmony": harmony}), false)
+                }
+                "progression" => {
+                    let mut v = json!({
+                        "kind": "progression",
+                        "ch": f("ch").map_err(u)?.ok_or_else(|| u("missing --ch (the channel the chords go to)".into()))? as u64,
+                        "bars": f("bars").map_err(u)?.unwrap_or(4.0) as u32,
+                        "template": a.get("template").map(str::to_owned).unwrap_or_else(|| "pop".into()),
+                        "voiceLead": !a.has("no-voice-lead"),
+                    });
+                    if let Some(d) = a.get("degrees") {
+                        let list: Result<Vec<u64>, _> = d.split(':').map(|x| x.trim().parse::<u64>()).collect();
+                        v["degrees"] = json!(list.map_err(|_| u("--degrees is a colon list of scale degrees, e.g. \"0:5:2:6\"".into()))?);
+                    }
+                    (v, true)
+                }
                 "drums" => {
                     let mut voices = vec![];
                     for (i, v) in a.get_all("voice").iter().enumerate() {
@@ -979,7 +1200,11 @@ fn run(cx: &Cx, cmd: &str, a: &Args) -> Result<Value, Fail> {
                     json!({"kind": "melody", "ch": f("ch").map_err(u)?.ok_or_else(|| u("missing --ch".into()))? as u64, "bars": f("bars").map_err(u)?.unwrap_or(2.0) as u32, "density": f("density").map_err(u)?.unwrap_or(0.5), "repeat": f("repeat").map_err(u)?.unwrap_or(1.0) as u32}),
                     true,
                 ),
-                other => return Err(u(format!("unknown notes verb `{other}` (humanize|quantize|euclid|strum|drums|melody)"))),
+                other => {
+                    return Err(u(format!(
+                        "unknown notes verb `{other}` (humanize|quantize|euclid|strum|chop|glue|arp|drums|melody|chord|progression|stamp)"
+                    )))
+                }
             };
             if needs_ch {
                 // a channel id here is the Channel Rack channel: accepted as-is, validated by the engine
@@ -1064,6 +1289,14 @@ fn run(cx: &Cx, cmd: &str, a: &Args) -> Result<Value, Fail> {
         "melody-channels" => {
             send(cx, a, "melody_channels", json!({"clipId": a.num("clip").map_err(u)?.ok_or_else(|| u("missing --clip".into()))? as u64}))
         }
+        "auto-vocal" => {
+            let (command, args) = auto_vocal_args(a)?;
+            send(cx, a, command, args)
+        }
+        "f0-model" if a.has("install") => {
+            eprintln!("downloading the RMVPE model (~345 MB); licence: {}", wave_rmvpe::LICENSE_NOTE);
+            send(cx, a, "f0_model_install", json!({}))
+        }
         "f0-model" => send(cx, a, "f0_model", json!({})),
         "pitch" => pitch(cx, a),
         "midi" => midi(cx, a),
@@ -1075,7 +1308,7 @@ fn run(cx: &Cx, cmd: &str, a: &Args) -> Result<Value, Fail> {
     }
 }
 
-/// `wave fxchain list|save|load|rename|delete`: FX chain presets in the user's library.
+/// `synkopa fxchain list|save|load|rename|delete`: FX chain presets in the user's library.
 fn fxchain(cx: &Cx, a: &Args) -> Result<Value, Fail> {
     let u = Fail::Usage;
     let name = || a.pos.get(2).cloned().ok_or_else(|| u("fxchain save|load|rename|delete NAME (quote a name with spaces)".into()));
@@ -1095,11 +1328,11 @@ fn fxchain(cx: &Cx, a: &Args) -> Result<Value, Fail> {
             send(cx, a, "fx_chain_rename", json!({ "name": name()?, "to": to }))
         }
         Some("delete") => send(cx, a, "fx_chain_delete", json!({ "name": name()? })),
-        _ => Err(u("fxchain list|save|load|rename|delete (see `wave help`)".into())),
+        _ => Err(u("fxchain list|save|load|rename|delete (see `synkopa help`)".into())),
     }
 }
 
-/// `wave midi inspect|import|export`: standard MIDI files.
+/// `synkopa midi inspect|import|export`: standard MIDI files.
 fn midi(cx: &Cx, a: &Args) -> Result<Value, Fail> {
     let u = Fail::Usage;
     let abs = |p: &str| std::fs::canonicalize(p).map(|x| x.display().to_string()).unwrap_or_else(|_| p.to_string());
@@ -1133,11 +1366,11 @@ fn midi(cx: &Cx, a: &Args) -> Result<Value, Fail> {
             }
             send(cx, a, "midi_export", args)
         }
-        _ => Err(u("midi inspect|import|export (see `wave help`)".into())),
+        _ => Err(u("midi inspect|import|export (see `synkopa help`)".into())),
     }
 }
 
-/// `wave pitch inspect|compare|suggest|edit|render`: the pitch editor for scripts and agents.
+/// `synkopa pitch inspect|compare|suggest|edit|render`: the pitch editor for scripts and agents.
 fn pitch(cx: &Cx, a: &Args) -> Result<Value, Fail> {
     let u = Fail::Usage;
     let verb = a.pos.get(1).map(String::as_str).ok_or_else(|| u("pitch inspect|compare|suggest|edit|render --clip ID …".into()))?;
@@ -1189,6 +1422,40 @@ fn pitch(cx: &Cx, a: &Args) -> Result<Value, Fail> {
         }
         other => Err(u(format!("unknown pitch verb `{other}` (inspect, compare, suggest, edit, render)"))),
     }
+}
+
+/// The request `auto-vocal` sends: `auto_vocal` — the plan, the rider bake and the chain in
+/// one call — or, with `--plan`, the read-only `auto_vocal_plan`. Ids are parsed as whole
+/// numbers (`a.num` would truncate `--clip 5.9` to clip 5), and a value flag with no value
+/// (`--style --no-bake`) is a usage error, not a silently dropped option.
+fn auto_vocal_args(a: &Args) -> Result<(&'static str, Value), Fail> {
+    let u = Fail::Usage;
+    let clip: u64 =
+        a.get("clip").ok_or_else(|| u("missing --clip".into()))?.parse().map_err(|_| u("--clip must be a whole number".into()))?;
+    let mut args = json!({ "clipId": clip });
+    if a.has("style") && a.get("style").is_none() {
+        return Err(u("--style needs a value: natural or hard".into()));
+    }
+    if let Some(s) = a.get("style") {
+        if s != "natural" && s != "hard" {
+            return Err(u(format!("--style is natural or hard, not `{s}`")));
+        }
+        args["style"] = json!(s);
+    }
+    if a.has("beat-clip") && a.get("beat-clip").is_none() {
+        return Err(u("--beat-clip needs a value".into()));
+    }
+    if let Some(v) = a.get("beat-clip") {
+        let beat: u64 = v.parse().map_err(|_| u("--beat-clip must be a whole number".into()))?;
+        args["beatClipId"] = json!(beat);
+    }
+    if a.has("plan") {
+        // read-only: the plan itself, the rider stage in `riderBake` unless --no-bake
+        args["bakeRider"] = json!(!a.has("no-bake"));
+        return Ok(("auto_vocal_plan", args));
+    }
+    args["noBake"] = json!(a.has("no-bake"));
+    Ok(("auto_vocal", args))
 }
 
 /// The arguments of `pitch_edit`: a whole edit as JSON (`--json`/`--file`: the `edit` of an
@@ -1341,7 +1608,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::{Arc, Once};
 
-    /// Keeps the tests away from WAVE apps really running on this machine.
+    /// Keeps the tests away from Synkopa apps really running on this machine.
     fn isolate() -> PathBuf {
         static ONCE: Once = Once::new();
         let root = std::env::temp_dir().join(format!("wave-cli-tests-{}", std::process::id()));
@@ -1368,6 +1635,8 @@ mod tests {
         bpm: RefCell<f64>,
         dirty: RefCell<bool>,
         saves: Rc<RefCell<Vec<PathBuf>>>,
+        /// `transformNotes` ops it was sent, as sent.
+        ops: Rc<RefCell<Vec<Value>>>,
     }
 
     impl Doc for FakeDoc {
@@ -1377,6 +1646,7 @@ mod tests {
                     for op in args["ops"].as_array().cloned().unwrap_or_default() {
                         match op["op"].as_str() {
                             Some("setBpm") => *self.bpm.borrow_mut() = op["bpm"].as_f64().unwrap(),
+                            Some("transformNotes") => self.ops.borrow_mut().push(op.clone()),
                             other => return Err(format!("BAD_OPS: unknown op {other:?}")),
                         }
                     }
@@ -1405,11 +1675,12 @@ mod tests {
     #[derive(Default)]
     struct FakeFiles {
         saves: Rc<RefCell<Vec<PathBuf>>>,
+        ops: Rc<RefCell<Vec<Value>>>,
     }
 
     impl FakeFiles {
         fn doc(&self) -> Box<dyn Doc> {
-            Box::new(FakeDoc { bpm: RefCell::new(120.0), dirty: RefCell::new(false), saves: self.saves.clone() })
+            Box::new(FakeDoc { bpm: RefCell::new(120.0), dirty: RefCell::new(false), saves: self.saves.clone(), ops: self.ops.clone() })
         }
         fn saves(&self) -> Vec<PathBuf> {
             self.saves.borrow().clone()
@@ -1422,7 +1693,7 @@ mod tests {
         }
         fn create(&self, template: &str) -> Result<Box<dyn Doc>, String> {
             match template {
-                "empty" | "sketch" => Ok(self.doc()),
+                "empty" | "sketch" | "demo" => Ok(self.doc()),
                 t => Err(format!("unknown template `{t}`")),
             }
         }
@@ -1501,6 +1772,22 @@ mod tests {
     }
 
     #[test]
+    fn chop_glue_and_arp_send_their_transform_verbs() {
+        let d = dir("notetools");
+        let p = project(&d);
+        let f = FakeFiles::default();
+        file(&f, &["notes", "chop", "--pattern", "3", "--len", "0.5", "--select", "0:16@7", "--project", &p]).unwrap();
+        file(&f, &["notes", "glue", "--pattern", "3", "--project", &p]).unwrap();
+        file(&f, &["notes", "arp", "--pattern", "3", "--mode", "upDown", "--octaves", "2", "--seed", "4", "--project", &p]).unwrap();
+        let ops = f.ops.borrow();
+        assert_eq!(ops[0]["verb"], json!({"kind": "chop", "len": 0.5}));
+        assert_eq!(ops[0]["select"], json!({"kind": "range", "from": 0.0, "to": 16.0, "ch": 7}));
+        assert_eq!(ops[1]["verb"], json!({"kind": "glue"}));
+        assert_eq!(ops[2]["verb"], json!({"kind": "arpeggiate", "mode": "upDown", "rate": 1.0, "gate": 0.9, "octaves": 2}));
+        assert_eq!(ops[2]["seed"], json!(4));
+    }
+
+    #[test]
     fn dry_run_reports_and_save_as_leaves_the_original() {
         let d = dir("dry");
         let p = project(&d);
@@ -1535,7 +1822,7 @@ mod tests {
         let d = dir("missing");
         let missing = d.join("nope.wave").display().to_string();
         match file(&FakeFiles::default(), &["context", "--project", &missing]) {
-            Err(Fail::Usage(m)) => assert!(m.contains("wave new"), "{m}"),
+            Err(Fail::Usage(m)) => assert!(m.contains("synkopa new"), "{m}"),
             other => panic!("{other:?}"),
         }
         let p = project(&d);
@@ -1549,11 +1836,12 @@ mod tests {
         let p = project(&d);
         let f = FakeFiles::default();
         let ok = d.join("ok.txt");
-        std::fs::write(&ok, "# tempo first\n\nwave bpm 100\napply --json '[{\"op\":\"setBpm\",\"bpm\":101}]'\ncontext\n").unwrap();
+        std::fs::write(&ok, "# tempo first\nsynkopa bpm 99\nwave bpm 100\napply --json '[{\"op\":\"setBpm\",\"bpm\":101}]'\ncontext\n")
+            .unwrap();
         let v = file(&f, &["script", &ok.display().to_string(), "--project", &p]).unwrap();
         let lines: Vec<_> = v["results"].as_array().unwrap().iter().map(|r| r["line"].as_u64().unwrap()).collect();
-        assert_eq!(lines, [3, 4, 5]);
-        assert_eq!(v["results"][2]["result"]["bpm"], 101.0);
+        assert_eq!(lines, [2, 3, 4, 5]);
+        assert_eq!(v["results"][3]["result"]["bpm"], 101.0);
         assert_eq!(f.saves().len(), 1, "one save for the whole script");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "bpm 101");
 
@@ -1600,7 +1888,7 @@ mod tests {
         let f = FakeFiles::default();
         let base = d.join("beat").display().to_string();
         let v = new_file(Some(&f), &args(&["new", &base, "--bpm", "95"])).unwrap();
-        let made = d.join("beat.wave");
+        let made = d.join("beat.synkopa");
         assert_eq!(v["saved"], json!(made.display().to_string()));
         assert_eq!(v["bpm"], 95.0);
         assert_eq!(std::fs::read_to_string(&made).unwrap(), "bpm 95");
@@ -1727,5 +2015,82 @@ mod pitch_args_tests {
         ] {
             assert!(matches!(pitch_edit_args(&args(&bad), 5, json!({ "clipId": 5 })), Err(Fail::Usage(_))), "{bad:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod auto_vocal_args_tests {
+    use super::*;
+
+    fn args(s: &[&str]) -> Args {
+        Args::parse(s.iter().map(|x| x.to_string()).collect())
+    }
+
+    #[test]
+    fn flags_build_the_apply_request() {
+        let (command, v) = auto_vocal_args(&args(&["auto-vocal", "--clip", "5"])).unwrap();
+        assert_eq!(command, "auto_vocal");
+        assert_eq!(v, json!({ "clipId": 5, "noBake": false }));
+        let (command, v) =
+            auto_vocal_args(&args(&["auto-vocal", "--clip", "5", "--style", "hard", "--beat-clip", "3", "--no-bake"])).unwrap();
+        assert_eq!(command, "auto_vocal");
+        assert_eq!(v, json!({ "clipId": 5, "style": "hard", "beatClipId": 3, "noBake": true }));
+    }
+
+    #[test]
+    fn plan_is_read_only_and_keeps_the_bake_flag() {
+        let (command, v) = auto_vocal_args(&args(&["auto-vocal", "--clip", "5", "--plan"])).unwrap();
+        assert_eq!(command, "auto_vocal_plan");
+        assert_eq!(v, json!({ "clipId": 5, "bakeRider": true }));
+        let (command, v) = auto_vocal_args(&args(&["auto-vocal", "--clip", "5", "--plan", "--no-bake"])).unwrap();
+        assert_eq!(command, "auto_vocal_plan");
+        assert_eq!(v, json!({ "clipId": 5, "bakeRider": false }));
+    }
+
+    #[test]
+    fn style_is_validated_here() {
+        let bad = ["auto-vocal", "--clip", "5", "--style", "crunchy"];
+        assert!(matches!(auto_vocal_args(&args(&bad)), Err(Fail::Usage(_))), "{bad:?}");
+    }
+
+    #[test]
+    fn ids_are_whole_numbers_not_truncated_or_saturated() {
+        for bad in [
+            vec!["auto-vocal", "--clip", "5.9"], // would silently select clip 5
+            vec!["auto-vocal", "--clip", "-3"],  // would saturate to clip 0
+            vec!["auto-vocal", "--clip", "nan"],
+            vec!["auto-vocal", "--clip", "5", "--beat-clip", "3.9"],
+        ] {
+            assert!(matches!(auto_vocal_args(&args(&bad)), Err(Fail::Usage(_))), "{bad:?}");
+        }
+        assert!(
+            matches!(auto_vocal_args(&args(&["auto-vocal", "--style", "hard"])), Err(Fail::Usage(_))),
+            "no --clip at all is a usage error"
+        );
+    }
+
+    #[test]
+    fn a_value_flag_with_no_value_is_an_error_not_a_default() {
+        // `--style --no-bake`: the parser records style as present with no value, and the
+        // request must refuse instead of quietly using the default style
+        for bad in
+            [vec!["auto-vocal", "--clip", "5", "--style", "--no-bake"], vec!["auto-vocal", "--clip", "5", "--beat-clip", "--no-bake"]]
+        {
+            assert!(matches!(auto_vocal_args(&args(&bad)), Err(Fail::Usage(_))), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_new_switches_do_not_swallow_the_next_word() {
+        // `--plan --style hard` must not eat `--style`; same for --no-bake and --install
+        let a = args(&["auto-vocal", "--clip", "5", "--plan", "--style", "hard"]);
+        assert!(a.has("plan"));
+        assert_eq!(a.get("style"), Some("hard"));
+        let a = args(&["auto-vocal", "--clip", "5", "--no-bake", "--style", "natural"]);
+        assert!(a.has("no-bake"));
+        assert_eq!(a.get("style"), Some("natural"));
+        let a = args(&["f0-model", "--install", "--session", "1"]);
+        assert!(a.has("install"));
+        assert_eq!(a.get("session"), Some("1"));
     }
 }

@@ -388,7 +388,7 @@ impl Processor for Chorus {
 
     fn tail_samples(&self) -> Option<usize> {
         let longest = (MAX_DELAY_MS * 1.37 + MAX_SWING_MS) / 1000.0 * self.sr;
-        Some((longest * repeats(self.fb.target.max(self.fb.v)) + 0.05 * self.sr) as usize)
+        Some((longest * repeats(self.fb.target.abs().max(self.fb.v.abs())) + 0.05 * self.sr) as usize)
     }
 
     /// `[0]` LFO phase 0..1, `[1..4]` left voices' delay (ms), `[4..7]` right voices', `[7]` voices,
@@ -477,7 +477,16 @@ impl Processor for Phaser {
     fn set_params(&mut self, p: &ParamBlock) {
         use phaser_idx as i;
         let v = &p.values;
-        self.stages = STAGE_N[(v[i::STAGES].round().max(0.0) as usize).min(STAGE_N.len() - 1)];
+        let stages = STAGE_N[(v[i::STAGES].round().max(0.0) as usize).min(STAGE_N.len() - 1)];
+        if stages != self.stages {
+            // stages that are not run keep no signal: brought back later, they start silent
+            // instead of releasing what they held when they were switched off
+            for c in 0..2 {
+                self.x1[c][stages..].fill(0.0);
+                self.y1[c][stages..].fill(0.0);
+            }
+            self.stages = stages;
+        }
         self.sync = v[i::SYNC] >= 0.5;
         self.rate = v[i::RATE].clamp(0.01, 20.0);
         self.div = (v[i::DIV].round().max(0.0) as usize).min(DIVS.len() - 1);
@@ -545,7 +554,7 @@ impl Processor for Phaser {
     fn tail_samples(&self) -> Option<usize> {
         // the stages ring for about 1/(2π·f) each at the lowest sweep frequency; feedback repeats that
         let ring = self.stages as f32 / (TAU * 20.0) * self.sr;
-        Some((ring * repeats(self.fb.target.max(self.fb.v)).min(400.0) + 0.05 * self.sr) as usize)
+        Some((ring * repeats(self.fb.target.abs().max(self.fb.v.abs())).min(400.0) + 0.05 * self.sr) as usize)
     }
 
     /// `[0]`/`[1]` the stages' break frequency left/right (Hz), `[2]` stages, `[3]` LFO phase.

@@ -25,10 +25,22 @@ jobs:
           - os: windows-latest
             features: asio
             bundles: nsis
-          - os: ubuntu-24.04
+          # the oldest Ubuntu LTS still supported: a binary only runs where glibc and libstdc++ are
+          # at least as new as the build system's (24.04's need glibc 2.38: Ubuntu 22.04, Debian 12
+          # and the AppImage catalog could not start Synkopa). ONNX Runtime is loaded at run time on
+          # Linux from Microsoft's build (glibc 2.27), see scripts/fetch-onnxruntime.mjs.
+          - os: ubuntu-22.04
             features: ""
             bundles: deb,rpm,appimage
+          # Apple Silicon, macOS 13.4+ (ONNX Runtime's prebuilt library needs it). Ad-hoc signed, not
+          # notarized: the first start needs System Settings → Privacy & Security → Open Anyway. VST3 plugins
+          # (Apple Silicon or universal) load and open their windows; the Demo Synth is not bundled yet.
+          - os: macos-latest
+            features: ""
+            bundles: app,dmg
     runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.4"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -48,8 +60,24 @@ jobs:
         with: { node-version: 22, cache: pnpm, cache-dependency-path: ui/pnpm-lock.yaml }
       - run: pnpm --dir ui install --frozen-lockfile
       # downloads the originals and cuts them to what the app plays (needs cargo, set up above)
-      - name: WAVE Keys piano (bundled into the installer)
+      - name: Synkopa Keys piano (bundled into the installer)
         run: node scripts/fetch-keys.mjs
+      - name: Synkopa Demo Synth (VST3 instrument bundled into the installer)
+        if: runner.os != 'macOS'
+        run: node scripts/build-demo-synth.mjs
+      - name: ONNX Runtime (Linux; loaded at run time, bundled into the packages)
+        if: runner.os == 'Linux'
+        run: node scripts/fetch-onnxruntime.mjs
+      # fail before publishing anything that would not start on the oldest supported systems
+      - name: Linux binaries run on glibc 2.35 (Ubuntu 22.04, Debian 12)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cargo build --release -p wave-app
+          need=$(objdump -T target/release/wave-app | grep -o 'GLIBC_[0-9.]*' | sort -V -u | tail -1)
+          echo "wave-app needs $need"
+          newest=$(printf '%s\n%s\n' "$need" GLIBC_2.35 | sort -V | tail -1)
+          [ "$newest" = "GLIBC_2.35" ] || { echo "::error::wave-app needs $need, newer than Ubuntu 22.04's glibc 2.35"; exit 1; }
       # The release notes are the CHANGELOG.md section of this version (fails when it is missing). They
       # become the release body and the "notes" the in-app updater shows; see docs/releasing.md.
       - name: Release notes from CHANGELOG.md
@@ -71,18 +99,19 @@ jobs:
           includeUpdaterJson: true
           updaterJsonPreferNsis: true
           tagName: v__VERSION__
-          releaseName: "WAVE v__VERSION__"
+          releaseName: "Synkopa v__VERSION__"
           # the notes end at the rule: the app shows only what is above it
           releaseBody: |
             ${{ steps.notes.outputs.notes }}
 
             ---
-            WAVE: a fast, FL-Studio-style DAW. Website and audio examples: https://miskibin.github.io/wave-DAW/
-            * The Windows installer is built **with ASIO** (Settings → Audio → ASIO) and includes the WAVE Keys piano.
-            * Windows: there is no `.msi` any more. If you installed WAVE from an `.msi`, uninstall it and install `WAVE_…_x64-setup.exe` once; updates then arrive by themselves.
+            Synkopa (formerly WAVE): a fast, FL-Studio-style DAW. Website and audio examples: https://miskibin.github.io/synkopa/
+            * The Windows installer is built **with ASIO** (Settings → Audio → ASIO) and includes the Synkopa Keys piano.
+            * Windows: there is no `.msi` any more. If you installed it from an `.msi`, uninstall it and install `Synkopa_…_x64-setup.exe` once; updates then arrive by themselves.
             * Linux: `.AppImage` (any distribution), `.deb` (Ubuntu, Debian, Mint) or `.rpm` (Fedora, openSUSE).
+            * macOS (Apple Silicon, 13.4 or newer): the `.dmg`. It is not notarized yet: the first time, open it, then System Settings → Privacy & Security → Open Anyway. VST3 plugins built for Apple Silicon (or universal) work, with their own windows.
             * The interface is English by default; Polish is in Settings.
-            * The `wave` command line works after the first start (open a new terminal): `wave status`, `wave context`, see docs/cli.md.
+            * The `synkopa` command line works after the first start (open a new terminal): `synkopa status`, `synkopa context` (the old `wave` name still works), see docs/cli.md.
             * VST3 effects: Add effect → VST3… (the first scan may take a while).
           releaseDraft: false
           prerelease: false

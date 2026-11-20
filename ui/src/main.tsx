@@ -7,26 +7,35 @@ import { onStateEvent } from './state/edit';
 import { replaceState, S, setS } from './state/store';
 import { openRack } from './state/pattern';
 import { startTelemetry } from './state/telemetry';
+import { restoreRecFilter } from './state/actions';
+import './state/recFeedback';
 import { say, setU } from './state/ui';
 import { watchAudio } from './state/audioWatch';
 import { App } from './App';
 import { initTheme } from './ui/theme';
-import { initPrefs } from './state/prefs';
-import { initUpdates } from './state/updates';
+import { initPrefs, prefs } from './state/prefs';
+import { setFullscreen, watchFullscreen } from './state/fullscreen';
+import { initUpdates, offerWelcome } from './state/updates';
 import { t } from './lib/i18n';
 import { loadStdLib } from './state/library';
 import { offerRecovery, projectOpen } from './state/actions';
 
+import { installSelectPopups } from './ui/SelectPopup';
+
 initTheme();
+installSelectPopups();
 initPrefs();
 if (import.meta.env.VITE_PERF) void import('./perfHook'); // perf harness only; compiled out otherwise
 
 async function boot() {
   const be = await getBackend();
+  watchFullscreen();
+  if (prefs().startFullscreen) void setFullscreen(true);
   const [catalog, state] = await Promise.all([be.fxCatalog(), be.getState()]);
   setS('catalog', catalog);
   replaceState(state);
   await be.on('state', onStateEvent);
+  await restoreRecFilter();
   await startTelemetry();
   void watchAudio(() => be.audioGetConfig(), cb => be.on('audio-status', cb), say)
     .catch(e => console.error('[wave] audio status', e));
@@ -36,14 +45,14 @@ async function boot() {
   const voc = S.project.inserts.find(m => m.fx.length > 1) ?? S.project.inserts[1] ?? S.project.inserts[0];
   if (voc) setU({ mixSel: voc.id, fxSel: voc.fx[1]?.id ?? voc.fx[0]?.id ?? null });
   const p = S.project.patterns[0];
-  setU('cur', p ? { kind: 'pat', ref: p.id } : S.project.sources[0] ? { kind: 'audio', ref: S.project.sources[0].id } : null);
+  setU('cur', p ? { kind: 'pat', ref: p.id, clipId: null } : S.project.sources[0] ? { kind: 'audio', ref: S.project.sources[0].id, clipId: null } : null);
   setU('playing', S.transport.playing);
   const root = document.getElementById('root')!;
   root.replaceChildren(); // the loading bar from index.html
   render(() => <App />, root);
   // nothing on the playlist yet: start on the Channel Rack, where a beat begins (FL)
   if (!S.project.clips.length && S.project.patterns.length) openRack();
-  void initUpdates(); // version, "What's new" after an update, the first automatic check
+  const updatesReady = initUpdates(); // version, "What's new" after an update, the first automatic check
   let offerStartupRecovery = true;
   let projectOpens = Promise.resolve();
   const openRequestedProjects = () => {
@@ -60,6 +69,8 @@ async function boot() {
   };
   await be.on('project-open-requested', openRequestedProjects);
   openRequestedProjects(); // also catch launches received while the webview was starting
+  // the first start of a fresh install offers the demo project, unless it began with the user's own file
+  void Promise.all([updatesReady, projectOpens]).then(() => offerWelcome(!S.path && !S.dirty));
 }
 
 boot().catch(e => {

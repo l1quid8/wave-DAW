@@ -5,8 +5,9 @@ import { Channel, invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import type { BeatRange } from '../lib/patLoop';
 import type {
-  AudioConfig, AudioDevices, AudioHost, AudioStatus, LatencyReport, Catalog, CliStatus, ExportAudioOptions, ExportProgress, ExportResult, ExportStemsOptions, ExportStemsResult, F0ModelStatus, FxChainLoadResult, FxChainPreset, Id, ImportResult, LibFile, MidiExportResult, MidiImportArgs, MidiImportResult, MidiInfo, Relinked, RelinkSearch,
-  KeysStatus, LibraryList, LibraryProgress, Melody, MelodyChannel, MidiDevice, MidiNoteEvent, MidiStatus, ModelProgress, AppInfo, UpdateInfo, UpdateProgress, MusicAnalysis, AutoVocalPlan, AutoVocalStyle, Op, OpenResult, PitchAnalysis, PitchTarget, RecoveredProject, RefTune, SaveResult, StateDto, TransportDto, PluginScan, PluginParam, PluginEditorEvent,
+  AudioConfig, AudioDevices, AudioHost, AudioStatus, LatencyReport, Catalog, CliStatus, ExportAudioOptions, ExportProgress, ExportResult, ExportStemsOptions, ExportStemsResult, F0ModelStatus, FxChainLoadResult, FxChainPreset, Id, ImportResult, MidiExportResult, MidiImportArgs, MidiImportResult, MidiInfo, Relinked, RelinkSearch,
+  KeysStatus, LibraryFiles, LibraryList, LibraryProgress, Melody, MelodyChannel, MidiDevice, MidiNoteEvent, MidiStatus, ModelProgress, AppInfo, UpdateInfo, UpdateProgress, MusicAnalysis, AutoVocalPlan, AutoVocalStyle, Op, OpenResult, PitchAnalysis, RecentProject, PitchTarget, RecoveredProject, RefTune, SaveResult, StateDto, TransportDto, PluginScan, PluginParam, PluginCrashSuspect, PluginEditorEvent,
+  ExtractStemsResult, StemId, StemModelStatus, StemsProgress,
 } from './types';
 
 export interface OsDropEvent { type: 'over' | 'drop' | 'leave'; paths: string[]; x: number; y: number }
@@ -14,10 +15,16 @@ export interface OsDropEvent { type: 'over' | 'drop' | 'leave'; paths: string[];
 export interface EventMap {
   state: StateDto;
   'project-open-requested': null;
+  /** The gear in a plugin window's header (Synkopa's header above a plugin's own interface): show Synkopa's window for that effect or plugin channel. */
+  'plugin-settings': { id: Id };
+  /** The pin in a plugin window's header: the user pinned (`pinned`) or unpinned the window on top of the app. */
+  'plugin-pin': { id: Id; pinned: boolean };
   'library-progress': LibraryProgress;
-  /** WAVE Keys: the piano started loading, is ready, or is not on this computer. */
+  /** Synkopa Keys: the piano started loading, is ready, or is not on this computer. */
   'keys-status': KeysStatus;
   'model-progress': ModelProgress;
+  /** `extractStems` moved on (stage, fraction of the separation done). */
+  'stems-progress': StemsProgress;
   /** A stem export (`exportStems`) started the next file. */
   'export-progress': ExportProgress;
   /** The update installer is downloading (`updateDownload`). `total` is 0 when the size is unknown. */
@@ -41,14 +48,19 @@ export interface Backend {
   redo(): Promise<StateDto>;
   transportPlay(fromBeat: number): Promise<void>;
   transportStop(): Promise<void>;
-  transportSet(patch: Partial<Pick<TransportDto, 'metro' | 'countIn' | 'rec' | 'monitor'>>): Promise<TransportDto>;
+  /** A second Stop (panic): cut every tail still ringing — voices, effect tails, the preview. Not an edit. */
+  transportSilence(): Promise<void>;
+  transportSet(patch: Partial<Pick<TransportDto, 'metro' | 'countIn' | 'rec' | 'monitor' | 'recAudio' | 'recNotes' | 'recQuantize'>>): Promise<TransportDto>;
   subscribeTelemetry(onFrame: (buf: ArrayBuffer) => void): Promise<void>;
   watchFx(ids: Id[]): Promise<void>;
   fxCatalog(): Promise<Catalog>;
-  importAudio(args: { paths: string[]; track?: number; beat?: number }): Promise<ImportResult>;
+  /** `step: false`: the files are loaded for an edit that follows (a sampler channel made from them), which is the undo step. */
+  importAudio(args: { paths: string[]; track?: number; beat?: number; step?: boolean }): Promise<ImportResult>;
   /** Native "open files" dialog for audio; null when cancelled. */
   pickAudioFiles(): Promise<string[] | null>;
   sourcePeaks(id: Id, norm?: boolean, rev?: boolean): Promise<Float32Array>;
+  /** Candidate slice points of a source (the sampler's slice mode): [position 0..1, strength 0..1] pairs. */
+  sourceOnsets(id: Id): Promise<Float32Array>;
   /** Like sourcePeaks, but of what the clip actually plays (norm/rev/pitch edits applied); whole source length. */
   clipPeaks(clipId: Id): Promise<Float32Array>;
   /** Pitch curve, levels and note segmentation of an audio clip's source (seconds of the source). */
@@ -76,6 +88,20 @@ export interface Backend {
    *  insert (no track or channel routed to it, no effects; a new one when none is free), named after the copy.
    *  One undo step; other clips of the source are untouched. Rejects other clip kinds and mixed sources/tracks. */
   makeUnique(clipIds: Id[]): Promise<{ sourceId: Id; track: number; insertId: Id }>;
+  /** FL's *Export in place*: the clips rendered (through their inserts and effects, not the master's, tails kept) over the span
+   *  they cover into one audio clip on a new track right below them, routed to the master; the originals are muted.
+   *  One undo step. Rejects a selection that renders silent; `exportCancel` stops it (`cancelled`). */
+  exportInPlace(clipIds: Id[]): Promise<{ sourceId: Id; clipId: Id; track: number } | { cancelled: true }>;
+  /** The stem separation model (HTDemucs): size, licence, whether it is installed. */
+  stemsModelStatus(): Promise<StemModelStatus>;
+  /** Downloads the stem model (progress: `model-progress` with id `htdemucs`), SHA-256 checked. `stemsCancel` stops it. */
+  stemsModelInstall(): Promise<StemModelStatus | { cancelled: true }>;
+  /** FL's *Extract stems*: the audio clip separated into `stems` (progress: `stems-progress`), one new track per stem
+   *  right below the clip with a clip at the same place playing the same part the same way; the clip is muted. One
+   *  undo step. Rejects with `ERR_NO_STEM_MODEL` when the model is missing; `stemsCancel` stops it (`cancelled`). */
+  extractStems(clipId: Id, stems: StemId[]): Promise<ExtractStemsResult | { cancelled: true }>;
+  /** Stops a running `extractStems` or `stemsModelInstall`; nothing is left behind. */
+  stemsCancel(): Promise<void>;
   /** Points sources at other files (decoded first), one undo step. Rejects when no file decodes. */
   relinkSources(items: { sourceId: Id; path: string }[]): Promise<Relinked[]>;
   /** Finds the missing sources' files in `folder` (and below) by name; relinks the unambiguous ones of the remembered length. */
@@ -110,12 +136,17 @@ export interface Backend {
   /** Plays one clip alone. `from` (seconds of the source): from there, the take with its pitch edits at the
    *  source's own speed, to the end of the clip (the pitch editor's Solo); rejects when nothing is left after it. */
   previewClip(clipId: Id, from?: number): Promise<void>;
+  /** The sample editor's keyboard on an audio clip: its sample at MIDI `key`, transposed from the clip's root (plus its
+   *  pitch knob) at the sample's own speed, over the clip's region. `vel` 0..1. Rejects for a missing clip. */
+  previewClipKey(args: { clipId: Id; key: number; vel?: number }): Promise<void>;
   /** Channels whose notes play over an audio clip (pattern clips in the playlist), best fit to the singing first. */
   melodyChannels(clipId: Id): Promise<MelodyChannel[]>;
   /** The notes `channel` plays over the clip as a melody reference (a copy; `span`: seconds of the source). */
   melodyReference(clipId: Id, channel: Id, span?: [number, number] | null): Promise<{ melody: Melody; fit: number }>;
   previewFile(path: string): Promise<void>;
   previewStop(): Promise<void>;
+  /** Play a project source alone (Browser ▸ Project ▸ Audio), from its loaded audio. */
+  previewSource(id: Id): Promise<void>;
   /** Play one note of a channel now (not an edit). `key` MIDI (default: the channel's root), `vel` 0..1, `pattern`: the one being edited (routing). */
   noteAudition(args: { ch: Id; key?: number; vel?: number; pattern?: Id }): Promise<void>;
   /** Computer keyboard as a piano: key down (`on`) / up on a channel. */
@@ -142,27 +173,35 @@ export interface Backend {
   midiStatus(): Promise<MidiStatus>;
   /** Which channel (instrument) the keyboard plays (null = the first pitched channel). With a track armed and transport recording, played notes land as a pattern clip on that track. */
   midiSetTarget(channel: Id | null): Promise<MidiStatus>;
+  /** Plays every key at `fixed` (1..127), or at the keyboard's velocity (null); saved across sessions. */
+  midiSetVelocity(fixed: number | null): Promise<MidiStatus>;
   libraryList(): Promise<LibraryList>;
   libraryInstall(id: string): Promise<void>;
-  /** WAVE Keys: whether the piano's recordings are on this computer and loaded. */
+  /** Synkopa Keys: whether the piano's recordings are on this computer and loaded. */
   keysStatus(): Promise<KeysStatus>;
-  libraryFiles(q: { kit?: string; folder?: string }): Promise<LibFile[]>;
+  libraryFiles(q: { kit?: string; folder?: string }): Promise<LibraryFiles>;
   libraryAddFolder(): Promise<string[]>;
   libraryRemoveFolder(path: string): Promise<string[]>;
-  projectNew(): Promise<StateDto>;
+  /** A new project: empty (eight tracks, the starter kit in the Channel Rack), or with `demo` the built-in demo project. */
+  projectNew(demo?: boolean): Promise<StateDto>;
   /** The file dialog when `path` is omitted. */
   projectOpen(path?: string, ifRevision?: number): Promise<OpenResult>;
+  /** File → Open recent: projects opened or saved lately, newest first (at most 10). */
+  recentProjects(): Promise<RecentProject[]>;
+  /** Takes `path` off the recent list; without a path, clears it. */
+  recentForget(path?: string): Promise<void>;
   /** Project paths received at launch or forwarded by another instance. */
   takeProjectOpenRequests(): Promise<string[]>;
   /** The save dialog when the project has no path yet or `saveAs`. */
-  projectSave(saveAs?: boolean): Promise<SaveResult>;
+  /** `version`: save beside the current file as the next `Name_N` and continue there (FL's save new version); a project never saved asks for a name. */
+  projectSave(saveAs?: boolean, version?: boolean): Promise<SaveResult>;
   projectExportZip(ifRevision: number): Promise<SaveResult>;
-  /** Autosave tick for a project that was never saved: keeps its crash-recovery copy current
-   *  (removes it once the project has a file or nothing unsaved). True when a copy was written. */
+  /** Autosave tick: keeps the crash-recovery snapshot of the unsaved changes current, saved project
+   *  or not, without touching the project's file (removes it once nothing is unsaved). True when written. */
   recoveryWrite(): Promise<boolean>;
-  /** Unsaved projects left behind by a WAVE that crashed or was killed, newest first. */
+  /** Unsaved projects left behind by a Synkopa that crashed or was killed, newest first. */
   recoveryList(): Promise<RecoveredProject[]>;
-  /** Opens a recovered project as an unsaved project (Save asks where to put it). */
+  /** Opens a recovered project with its changes unsaved: as its own file again (Save writes there), or untitled. */
   recoveryRestore(id: string): Promise<{ state: StateDto; warnings: string[] }>;
   /** Deletes a recovered project the user does not want. */
   recoveryDiscard(id: string): Promise<void>;
@@ -180,9 +219,20 @@ export interface Backend {
   exportCancel(): Promise<void>;
   /** Installed effects of every hosted format (VST3; LV2 on Linux). A cold `rescan` is slow. */
   pluginScan(rescan: boolean): Promise<PluginScan>;
-  /** A VST3 plugin's own editor window (Windows); LV2 plugins have none here and reject. */
-  pluginEditor(fxId: Id, open: boolean): Promise<void>;
+  /** A plugin's own window (VST3; LV2 with an X11 interface on Linux) under Synkopa's header showing `label`. Rejects with
+   *  `NO_EDITOR: …` when the plugin has no window of its own, and with the reason when none can be shown here. */
+  pluginEditor(fxId: Id, open: boolean, label?: { title: string; subtitle: string }, pinned?: boolean): Promise<void>;
+  /** Whether the plugin's own window is open (it may have been closed with its X). */
+  pluginEditorOpen(fxId: Id): Promise<boolean>;
+  /** The plugins that were loaded when the last session ended without exiting (usually empty): Synkopa did not leave through the front door, and one of these may be why. */
+  pluginCrashSuspects(): Promise<PluginCrashSuspect[]>;
+  /** Keep a plugin's module out of future scans (the follow-up to `pluginCrashSuspects`). */
+  pluginBlock(format: string, path: string): Promise<void>;
+  /** Load a plugin Synkopa's safety check refused (its `fxErrors` entry contains `UNSAFE_PLUGIN`), from now on; every slot with it is retried. */
+  pluginLoadAnyway(fxId: Id): Promise<void>;
   pluginParams(fxId: Id): Promise<PluginParam[]>;
+  /** A live plugin's current state (base64, what `PluginRef.state` stores): an effect or a plugin channel by id. */
+  pluginState(fxId: Id): Promise<string>;
   pluginSetParam(fxId: Id, id: number, value: number): Promise<void>;
   cliStatus(): Promise<CliStatus>;
   /** The running version, the version whose release notes were last shown, and whether updates are checked automatically. */
@@ -191,7 +241,7 @@ export interface Backend {
   updateCheck(): Promise<UpdateInfo | null>;
   /** Downloads the update found by `updateCheck` (progress: `update-progress`) and verifies its signature. Nothing restarts. */
   updateDownload(): Promise<void>;
-  /** Installs the downloaded update and restarts WAVE (the call does not return then). Rejects on a failure; the old version keeps running. */
+  /** Installs the downloaded update and restarts Synkopa (the call does not return then). Rejects on a failure; the old version keeps running. */
   updateInstall(): Promise<void>;
   updateSetAuto(on: boolean): Promise<void>;
   /** Remembers that the release notes of `version` were shown. */
@@ -201,6 +251,8 @@ export interface Backend {
   /** "Ask AI": opens `service` in the system browser (ChatGPT with `prompt` in the link, DeepWiki on the
    *  repository). No ChatGPT prompt opens a new chat; one whose link is past MAX_ASK_URL (lib/askLink) is rejected. */
   openAsk(service: AskService, prompt: string | null): Promise<void>;
+  /** Opens the Synkopa Discord server in the system browser. */
+  openDiscord(): Promise<void>;
   on<K extends keyof EventMap>(ev: K, cb: (payload: EventMap[K]) => void): Promise<() => void>;
   /** OS file drag & drop with real paths (Tauri) or file names (mock). */
   onOsDrop(cb: (e: OsDropEvent) => void): Promise<() => void>;
@@ -216,8 +268,17 @@ export interface WindowCtl {
   close(): Promise<void>;
   isMaximized(): Promise<boolean>;
   startDragging(): Promise<void>;
+  /** Full screen (F11): no taskbar, no window frame. */
+  isFullscreen(): Promise<boolean>;
+  setFullscreen(on: boolean): Promise<void>;
   /** Called on every window resize (maximise state may have changed). */
   onResized(cb: () => void): Promise<() => void>;
+  /** The user asked to close the window (its X, Alt+F4): decide (save prompts) and call
+   *  `destroy()` to really close it, or do nothing to keep it open. */
+  onCloseRequested(cb: (destroy: () => Promise<void>) => Promise<void>): Promise<() => void>;
+  /** The webview's own zoom (the View menu's scale; keeps text crisp). False = not supported
+   *  here, the caller falls back to CSS zoom. */
+  setZoom(z: number): Promise<boolean>;
 }
 
 function tauriWindow(): WindowCtl {
@@ -228,7 +289,34 @@ function tauriWindow(): WindowCtl {
     close: async () => (await w()).close(),
     isMaximized: async () => (await w()).isMaximized(),
     startDragging: async () => (await w()).startDragging(),
+    isFullscreen: async () => (await w()).isFullscreen(),
+    setFullscreen: async on => (await w()).setFullscreen(on),
     onResized: async cb => (await w()).onResized(() => cb()),
+    onCloseRequested: async cb => {
+      const win = await w();
+      // one guard at a time: a second close event while the save prompt is open is swallowed
+      // (the window stays open) instead of prompting again or destroying mid-prompt
+      let guarding = false;
+      return win.onCloseRequested(async ev => {
+        ev.preventDefault();
+        if (guarding) return;
+        guarding = true;
+        try {
+          await cb(async () => { await win.destroy(); });
+        } finally {
+          guarding = false;
+        }
+      });
+    },
+    setZoom: async z => {
+      try {
+        const { getCurrentWebview } = await import('@tauri-apps/api/webview');
+        await getCurrentWebview().setZoom(z);
+        return true;
+      } catch {
+        return false;
+      }
+    },
   };
 }
 
@@ -255,6 +343,7 @@ export function tauriBackend(): Backend {
     redo: () => invoke('redo'),
     transportPlay: fromBeat => invoke('transport_play', { fromBeat }),
     transportStop: () => invoke('transport_stop'),
+    transportSilence: () => invoke('transport_silence'),
     transportSet: patch => invoke('transport_set', patch),
     async subscribeTelemetry(onFrame) {
       const ch = new Channel<ArrayBuffer>();
@@ -263,7 +352,7 @@ export function tauriBackend(): Backend {
     },
     watchFx: ids => invoke('watch_fx', { ids }),
     fxCatalog: () => invoke('fx_catalog'),
-    importAudio: a => invoke('import_audio', { paths: a.paths, track: a.track ?? null, beat: a.beat ?? null }),
+    importAudio: a => invoke('import_audio', { paths: a.paths, track: a.track ?? null, beat: a.beat ?? null, step: a.step ?? true }),
     async pickAudioFiles() {
       // tauri-plugin-dialog's command, invoked directly so the UI needs no extra npm dependency.
       const r = await invoke<string | string[] | null>('plugin:dialog|open', {
@@ -272,6 +361,7 @@ export function tauriBackend(): Backend {
       return r == null ? null : Array.isArray(r) ? r : [r];
     },
     sourcePeaks: async (id, norm, rev) => toF32(await invoke('source_peaks', { id, norm: !!norm, rev: !!rev })),
+    sourceOnsets: async id => toF32(await invoke('source_onsets', { id })),
     clipPeaks: async clipId => toF32(await invoke('clip_peaks', { clipId })),
     pitchAnalyze: clipId => invoke('pitch_analyze', { clipId }),
     pitchTarget: (clipId, reference) => invoke('pitch_target', { clipId, reference: reference ?? null }),
@@ -282,6 +372,11 @@ export function tauriBackend(): Backend {
     bakeRider: a => invoke('bake_rider', { clipId: a.clipId, params: a.params }),
     trimClip: clipId => invoke('trim_clip', { clipId }),
     makeUnique: clipIds => invoke('make_unique', { clipIds }),
+    exportInPlace: clipIds => invoke('export_in_place', { clipIds }),
+    stemsModelStatus: () => invoke('stems_model_status'),
+    stemsModelInstall: () => invoke('stems_model_install'),
+    extractStems: (clipId, stems) => invoke('extract_stems', { clipId, stems }),
+    stemsCancel: () => invoke('stems_cancel'),
     relinkSources: async items => (await invoke<{ relinked: Relinked[] }>('relink_sources', { args: { items } })).relinked,
     relinkSearch: async folder => (await invoke<{ search: RelinkSearch }>('relink_search', { args: { folder } })).search,
     async pickFolder(start) {
@@ -312,10 +407,12 @@ export function tauriBackend(): Backend {
     flattenComp: clipId => invoke('flatten_comp', { clipId }),
     compAudition: (compId, takeId) => invoke('comp_audition', { compId, takeId }),
     previewClip: (clipId, from) => invoke('preview_clip', { clipId, from: from ?? null }),
+    previewClipKey: a => invoke('preview_clip_key', { clipId: a.clipId, key: a.key, vel: a.vel ?? null }),
     melodyChannels: clipId => invoke('melody_channels', { clipId }),
     melodyReference: (clipId, channel, span) => invoke('melody_reference', { clipId, channel, span: span ?? null }),
     previewFile: path => invoke('preview_file', { path }),
     previewStop: () => invoke('preview_stop'),
+    previewSource: id => invoke('preview_source', { id }),
     typingNote: a => invoke('typing_note', { ch: a.ch, key: a.key, vel: a.vel ?? null, on: a.on }),
     noteAudition: a => invoke('note_audition', { ch: a.ch, key: a.key ?? null, vel: a.vel ?? null, pattern: a.pattern ?? null }),
     patternPlay: (pattern, o) => invoke('pattern_play', { pattern, from: o?.from ?? null, range: o?.range ? [o.range.a, o.range.b] : null }),
@@ -330,16 +427,19 @@ export function tauriBackend(): Backend {
     midiSelectDevice: id => invoke('midi_select_device', { id }),
     midiStatus: () => invoke('midi_status'),
     midiSetTarget: channel => invoke('midi_set_target', { channel }),
+    midiSetVelocity: fixed => invoke('midi_set_velocity', { fixed }),
     libraryList: () => invoke('library_list'),
     libraryInstall: id => invoke('library_install', { id }),
     keysStatus: () => invoke('keys_status'),
     libraryFiles: q => invoke('library_files', { kit: q.kit ?? null, folder: q.folder ?? null }),
     libraryAddFolder: () => invoke('library_add_folder'),
     libraryRemoveFolder: path => invoke('library_remove_folder', { path }),
-    projectNew: () => invoke('project_new'),
+    projectNew: demo => invoke('project_new', { demo: !!demo }),
     projectOpen: (path, ifRevision) => invoke('project_open', { path: path ?? null, ifRevision }),
     takeProjectOpenRequests: () => invoke('take_project_open_requests'),
-    projectSave: saveAs => invoke('project_save', { saveAs: !!saveAs }),
+    recentProjects: () => invoke('recent_projects'),
+    recentForget: path => invoke('recent_forget', { path: path ?? null }),
+    projectSave: (saveAs, version) => invoke('project_save', { saveAs: !!saveAs, version: !!version }),
     projectExportZip: ifRevision => invoke('project_export_zip', { ifRevision }),
     recoveryWrite: () => invoke('recovery_write'),
     recoveryList: () => invoke('recovery_list'),
@@ -349,8 +449,13 @@ export function tauriBackend(): Backend {
     exportStems: opts => invoke('export_stems', { ...opts }),
     exportCancel: () => invoke('export_cancel'),
     pluginScan: rescan => invoke('plugin_scan', { rescan }),
-    pluginEditor: (fxId, open) => invoke('plugin_editor', { fxId, open }),
+    pluginEditor: (fxId, open, label, pinned) => invoke('plugin_editor', { fxId, open, title: label?.title, subtitle: label?.subtitle, pinned }),
+    pluginEditorOpen: fxId => invoke('plugin_editor_open', { fxId }),
+    pluginCrashSuspects: () => invoke('plugin_crash_suspects'),
+    pluginBlock: (format, path) => invoke('plugin_block', { format, path }),
+    pluginLoadAnyway: fxId => invoke('plugin_load_anyway', { fxId }),
     pluginParams: fxId => invoke('plugin_params', { fxId }),
+    pluginState: fxId => invoke('plugin_state', { fxId }),
     pluginSetParam: (fxId, id, value) => invoke('plugin_set_param', { fxId, id, value }),
     cliStatus: () => invoke('cli_status'),
     appInfo: () => invoke('app_info'),
@@ -361,6 +466,7 @@ export function tauriBackend(): Backend {
     updateMarkSeen: version => invoke('update_mark_seen', { version }),
     openReleasePage: version => invoke('open_release_page', { version: version ?? null }),
     openAsk: (service, prompt) => invoke('open_ask', { service, prompt }),
+    openDiscord: () => invoke('open_discord'),
     on: async (ev, cb) => listen(ev, e => cb(e.payload as never)),
     async onOsDrop(cb) {
       const { getCurrentWebview } = await import('@tauri-apps/api/webview');

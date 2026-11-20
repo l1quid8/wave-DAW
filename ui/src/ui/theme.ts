@@ -12,7 +12,7 @@ export interface Tokens {
   // text
   fg: string; fgHi: string; fg2: string; fg3: string; fg4: string; fg5: string; fg6: string;
   // accents
-  blue: string; blueHi: string; green: string; amber: string; red: string; onBg: string;
+  blue: string; blueHi: string; green: string; amber: string; pan: string; red: string; onBg: string;
   // plots (effect windows, editors)
   viz: string; vizPanel: string; vizGrid: string; vizGrid2: string; vizAxis: string; vizLabel: string;
   /** main curve / ink on plots */
@@ -41,29 +41,29 @@ export interface Tokens {
 export const DARK: Tokens = {
   bg0: '#0a0c0f', bg1: '#0e1013', bg2: '#111419', bg3: '#14181e', bg4: '#161a21', bg5: '#171b21', bg6: '#1c2128', bg7: '#1e242d',
   line: '#252b34', line2: '#2c333d', line3: '#2e3641',
-  fg: '#d5dae2', fgHi: '#f2f4f7', fg2: '#b4bac4', fg3: '#9aa2ad', fg4: '#7d8592', fg5: '#5c6573', fg6: '#4a5360',
-  blue: '#4f8ef7', blueHi: '#8fb6ff', green: '#4ec08a', amber: '#e0a44a', red: '#e05263', onBg: '#2f3a4b',
+  fg: '#d5dae2', fgHi: '#f2f4f7', fg2: '#b4bac4', fg3: '#9aa2ad', fg4: '#8a93a1', fg5: '#727c8c', fg6: '#5e6877',
+  blue: '#4f8ef7', blueHi: '#8fb6ff', green: '#4ec08a', amber: '#e0a44a', pan: '#b18cf5', red: '#e05263', onBg: '#2f3a4b',
   viz: '#0c0e12', vizPanel: '#101318', vizGrid: '#161b22', vizGrid2: '#20262f', vizAxis: '#2a313b', vizLabel: '#4a5360',
   ink: '#f2f4f7', pre: '#9aa2ad', post: '#8fb6ff', playhead: '#eef1f5', onFill: '#0b1220',
   grid: '#111419', gridBar: '#232a33', gridBeat: '#1a1f27', laneAlt: '#13171c', rulerBg: '#14181e', rulerText: '#7d8592', clipBody: '#101318',
   shade: 'rgba(0,0,0,.55)',
-  keyW: '#c9ced6', keyB: '#20252d', keyWText: '#1a1e24', keyBText: '#e6e9ee', onBand: '#0b1220', tint: 1,
+  keyW: '#9aa1ad', keyB: '#1b1f26', keyWText: '#1a1e24', keyBText: '#e6e9ee', onBand: '#0b1220', tint: 1,
   clipBase: '#101318', clipBodyPct: 14, clipHeadPct: 42, clipHeadSelPct: 75, clipHeadSelTo: '#ffffff',
-  clipInkTo: '#ffffff', clipInkPct: 80, clipText: '#f2f4f7', clipTextSel: '#0b1220', laneArm: '#16121a', gridShade: 'rgba(255,255,255,.018)',
+  clipInkTo: '#ffffff', clipInkPct: 80, clipText: '#f2f4f7', clipTextSel: '#0b1220', laneArm: '#16121a', gridShade: 'rgba(255,255,255,.04)',
 };
 
 export const LIGHT: Tokens = {
   bg0: '#d9dde3', bg1: '#eef0f3', bg2: '#f6f7f9', bg3: '#f1f3f5', bg4: '#f7f8fa', bg5: '#e9ecf0', bg6: '#e2e6eb', bg7: '#ffffff',
   line: '#d3d8df', line2: '#c6ccd4', line3: '#bfc6cf',
   fg: '#2a3038', fgHi: '#0f1318', fg2: '#3c444f', fg3: '#525b67', fg4: '#69727e', fg5: '#858d98', fg6: '#9aa1ab',
-  blue: '#2563d9', blueHi: '#1f56c2', green: '#1f9461', amber: '#b9770f', red: '#cf2f45', onBg: '#d6e3fb',
+  blue: '#2563d9', blueHi: '#1f56c2', green: '#1f9461', amber: '#b9770f', pan: '#7446d6', red: '#cf2f45', onBg: '#d6e3fb',
   viz: '#fbfcfd', vizPanel: '#f3f5f8', vizGrid: '#eceff3', vizGrid2: '#dfe3e9', vizAxis: '#c9cfd7', vizLabel: '#8a929d',
   ink: '#151a21', pre: '#7f8894', post: '#2563d9', playhead: '#11161c', onFill: '#ffffff',
   grid: '#f6f7f9', gridBar: '#cfd5dc', gridBeat: '#e3e7ec', laneAlt: '#eff1f4', rulerBg: '#eceff3', rulerText: '#5d6672', clipBody: '#ffffff',
   shade: 'rgba(255,255,255,.62)',
-  keyW: '#ffffff', keyB: '#3a4049', keyWText: '#1a1e24', keyBText: '#eef1f4', onBand: '#0b1220', tint: 1.4,
+  keyW: '#eceff3', keyB: '#3a4049', keyWText: '#1a1e24', keyBText: '#eef1f4', onBand: '#0b1220', tint: 1.4,
   clipBase: '#ffffff', clipBodyPct: 16, clipHeadPct: 62, clipHeadSelPct: 100, clipHeadSelTo: '#000000',
-  clipInkTo: '#000000', clipInkPct: 78, clipText: '#0f1318', clipTextSel: '#ffffff', laneArm: '#f7eef1', gridShade: 'rgba(0,0,0,.025)',
+  clipInkTo: '#000000', clipInkPct: 78, clipText: '#0f1318', clipTextSel: '#ffffff', laneArm: '#f7eef1', gridShade: 'rgba(0,0,0,.045)',
 };
 
 // ---- extra themes: generated from a hue/saturation for surfaces and an accent ----
@@ -85,7 +85,7 @@ function darkTheme(id: string, name: string, h: number, s: number, accent: [stri
     bg0: L(4.5), bg1: L(6.5), bg2: L(8.4), bg3: L(9.8), bg4: L(10.6), bg5: L(11), bg6: L(13), bg7: L(14.8),
     line: L(17.6), line2: L(20.6), line3: L(21.8),
     fg: F(86), fgHi: F(96), fg2: F(74), fg3: F(64), fg4: F(53), fg5: F(40), fg6: F(32),
-    blue: accent[0], blueHi: accent[1], green, amber, red, onBg: L(24),
+    blue: accent[0], blueHi: accent[1], green, amber, pan: DARK.pan, red, onBg: L(24),
     viz: L(5.5), vizPanel: L(7.5), vizGrid: L(11), vizGrid2: L(15), vizAxis: L(19), vizLabel: F(32),
     grid: L(8.4), gridBar: L(17), gridBeat: L(12.5), laneAlt: L(9.5), rulerBg: L(9.8), rulerText: F(53), clipBody: L(7.5),
     keyB: L(15), clipBase: L(7.5), laneArm: hsl(330, 18, 8.5 + d),
@@ -120,14 +120,14 @@ const SLATE_T: Tokens = {
   bg0: '#15171c', bg1: '#1d2026', bg2: '#282c34', bg3: '#2c313a', bg4: '#30353f', bg5: '#333945', bg6: '#3c424e', bg7: '#454c59',
   line: '#474e5b', line2: '#535b69', line3: '#606979',
   fg: '#d3d8e0', fgHi: '#f6f8fb', fg2: '#c4cad4', fg3: '#b6bdc9', fg4: '#a5adba', fg5: '#8f97a6', fg6: '#788190',
-  blue: '#61afef', blueHi: '#a8d4fa', green: '#98c379', amber: '#e5c07b', red: '#e06c75', onBg: '#3d5270',
+  blue: '#61afef', blueHi: '#a8d4fa', green: '#98c379', amber: '#e5c07b', pan: '#c678dd', red: '#e06c75', onBg: '#3d5270',
   viz: '#1a1d22', vizPanel: '#20242a', vizGrid: '#30353f', vizGrid2: '#3c424e', vizAxis: '#535b69', vizLabel: '#8f97a6',
   ink: '#f6f8fb', pre: '#b6bdc9', post: '#a8d4fa', playhead: '#ffffff', onFill: '#15171c',
   grid: '#282c34', gridBar: '#525a69', gridBeat: '#3a404b', laneAlt: '#2d323b', rulerBg: '#2c313a', rulerText: '#a5adba', clipBody: '#20242a',
   shade: 'rgba(0,0,0,.45)',
   keyW: '#d5d9e0', keyB: '#2c313a', keyWText: '#15171c', keyBText: '#f6f8fb', onBand: '#15171c', tint: 1,
   clipBase: '#20242a', clipBodyPct: 22, clipHeadPct: 52, clipHeadSelPct: 78, clipHeadSelTo: '#ffffff',
-  clipInkTo: '#ffffff', clipInkPct: 85, clipText: '#f6f8fb', clipTextSel: '#15171c', laneArm: '#3a2c33', gridShade: 'rgba(255,255,255,.03)',
+  clipInkTo: '#ffffff', clipInkPct: 85, clipText: '#f6f8fb', clipTextSel: '#15171c', laneArm: '#3a2c33', gridShade: 'rgba(255,255,255,.05)',
 };
 const SLATE: ThemeDef = {
   id: 'slate', name: 'Łupek', light: false, t: SLATE_T, swatch: [SLATE_T.bg2, SLATE_T.bg6, SLATE_T.blue],
@@ -139,10 +139,62 @@ const SLATE: ThemeDef = {
   },
 };
 
+/** A mid-grey dark theme (Ableton's "Mid Dark" idea): surfaces around 20–30 % lightness, for
+ *  bright rooms and for eyes that tire of near-black. Text stays near white so contrast holds. */
+function midDarkTheme(id: string, name: string, h: number, s: number, accent: [string, string]): ThemeDef {
+  const L = (l: number) => hsl(h, s, l), F = (l: number) => hsl(h, Math.min(s, 8), l);
+  const t: Tokens = {
+    ...DARK,
+    bg0: L(12.5), bg1: L(16.5), bg2: L(20.5), bg3: L(22), bg4: L(23.5), bg5: L(24.5), bg6: L(28), bg7: L(31.5),
+    line: L(34), line2: L(38.5), line3: L(43),
+    fg: F(89), fgHi: F(98), fg2: F(83), fg3: F(76), fg4: F(68), fg5: F(60), fg6: F(51),
+    blue: accent[0], blueHi: accent[1], green: '#6fcf98', amber: '#ebb35c', pan: '#b99cf7', red: '#f06b7a', onBg: hsl(218, 26, 38),
+    viz: L(15), vizPanel: L(18), vizGrid: L(23.5), vizGrid2: L(28), vizAxis: L(38.5), vizLabel: F(60),
+    ink: F(98), pre: F(76), post: accent[1], playhead: '#ffffff', onFill: L(12.5),
+    grid: L(20.5), gridBar: L(38), gridBeat: L(27), laneAlt: L(22), rulerBg: L(22), rulerText: F(68), clipBody: L(18),
+    shade: 'rgba(0,0,0,.4)', keyW: F(87), keyB: L(22), keyWText: L(12.5), keyBText: F(98), onBand: L(12.5),
+    clipBase: L(18), clipBodyPct: 24, clipHeadPct: 54, clipHeadSelPct: 80, clipText: F(98), clipTextSel: L(12.5),
+    laneArm: hsl(335, 12, 25), gridShade: 'rgba(255,255,255,.05)',
+  };
+  const css: Css = {
+    '--sel-bg': hsl(218, 14, 37), '--sel-bg2': hsl(218, 12, 32), '--sel-ring': hsl(218, 20, 59), '--drag-bg': hsl(218, 14, 42),
+    '--mixer-bg': L(18), '--dialog-bg': L(25), '--on-accent': L(12.5), '--on-warm': L(12.5), '--danger': '#ff8592',
+    '--arm-bg': hsl(335, 14, 26), '--playhead': '#ffffff', '--knob-track': L(38.5), '--knob-cap': L(43), '--knob-ptr': '#ffffff',
+    '--fader-cap': F(87), '--shadow': 'rgba(0,0,0,.45)', '--shadow2': 'rgba(0,0,0,.32)', '--viz': t.viz, '--win-close': '#c42b1c', '--on-band': L(12.5),
+  };
+  return { id, name, light: false, t, css, swatch: [t.bg2, t.bg6, accent[0]] };
+}
+
+/** A mid-grey light theme (Ableton's "Mid Light"): surfaces around 75–85 %, no glaring white,
+ *  text and accents darkened so labels keep ≥ 4.5:1 against the panels. */
+function midLightTheme(id: string, name: string, h: number, s: number, accent: [string, string]): ThemeDef {
+  const L = (l: number) => hsl(h, s, l), F = (l: number) => hsl(h, Math.min(s, 14), l);
+  const t: Tokens = {
+    ...LIGHT,
+    bg0: L(70), bg1: L(78.5), bg2: L(82), bg3: L(80.5), bg4: L(83.5), bg5: L(76.5), bg6: L(74), bg7: L(88),
+    line: L(70), line2: L(66), line3: L(62),
+    fg: F(14), fgHi: F(4), fg2: F(20), fg3: F(26), fg4: F(32), fg5: F(40), fg6: F(48),
+    blue: accent[0], blueHi: accent[1], green: '#16784d', amber: '#8f5c08', pan: '#6a3fc4', red: '#b3243a', onBg: hsl(h, 30, 70),
+    viz: L(85), vizPanel: L(81.5), vizGrid: L(78.5), vizGrid2: L(73), vizAxis: L(64), vizLabel: F(40),
+    ink: F(6), pre: F(32), post: accent[0], playhead: F(4), onFill: '#ffffff',
+    grid: L(82), gridBar: L(63), gridBeat: L(73.5), laneAlt: L(79.5), rulerBg: L(78.5), rulerText: F(26), clipBody: L(88),
+    shade: 'rgba(200,205,212,.6)', keyW: L(94), keyWText: F(10), tint: 1.5,
+    clipBase: L(88), clipBodyPct: 22, clipHeadPct: 66, clipText: F(4), laneArm: hsl(340, 14, 80), gridShade: 'rgba(0,0,0,.055)',
+  };
+  const css: Css = {
+    '--sel-bg': hsl(h, 30, 74), '--sel-bg2': hsl(h, 26, 77), '--sel-ring': hsl(218, 40, 57), '--drag-bg': hsl(h, 32, 70),
+    '--mixer-bg': L(75), '--dialog-bg': L(84), '--on-accent': '#ffffff', '--on-warm': '#ffffff', '--danger': '#a81c33',
+    '--arm-bg': hsl(340, 16, 80), '--playhead': F(4), '--knob-track': L(66), '--knob-cap': L(91), '--knob-ptr': F(10),
+    '--fader-cap': L(94), '--shadow': 'rgba(20,28,40,.28)', '--shadow2': 'rgba(20,28,40,.3)', '--viz': t.viz,
+  };
+  return { id, name, light: true, t, css, swatch: [t.bg2, t.bg6, accent[0]] };
+}
+
 /** Every theme the settings offer. Ids are saved on this computer, never rename them. */
 export const THEMES: ThemeDef[] = [
   { id: 'dark', name: 'Grafit', light: false, t: DARK, css: {}, swatch: [DARK.bg2, DARK.bg6, DARK.blue] },
   SLATE,
+  midDarkTheme('dim', 'Przyciemniony', 220, 5, ['#6fa3ff', '#b0ccff']),
   darkTheme('midnight', 'Północ', 220, 34, ['#5b8cff', '#9db8ff'], { lift: 1 }),
   darkTheme('violet', 'Fiolet', 265, 22, ['#a07cf6', '#c6b0ff'], { lift: 1 }),
   darkTheme('forest', 'Las', 155, 16, ['#3fbf8a', '#86e0b8'], { warm: ['#5cc98f', '#e0a44a', '#e05263'] }),
@@ -152,11 +204,14 @@ export const THEMES: ThemeDef[] = [
   { id: 'light', name: 'Jasny', light: true, t: LIGHT, css: {}, swatch: [LIGHT.bg2, LIGHT.bg6, LIGHT.blue] },
   lightTheme('paper', 'Papier', 38, 30, ['#c2651b', '#a9530f']),
   lightTheme('sky', 'Błękit', 210, 35, ['#1f6fe0', '#1858b8']),
+  midLightTheme('fog', 'Mgła', 215, 10, ['#1d55c4', '#1747a8']),
+  midLightTheme('sand', 'Piasek', 36, 16, ['#a4480c', '#8a3b08']),
 ];
 
 const THEME_NAME_KEYS: Record<string, TranslationKey> = {
   dark: 'd.theme.dark', slate: 'd.theme.slate', midnight: 'd.theme.midnight', violet: 'd.theme.violet', forest: 'd.theme.forest', studio: 'd.theme.studio',
   rose: 'd.theme.rose', oled: 'd.theme.oled', light: 'd.theme.light', paper: 'd.theme.paper', sky: 'd.theme.sky',
+  dim: 'd.theme.dim', fog: 'd.theme.fog', sand: 'd.theme.sand',
 };
 /** Display name of a theme in the current language (the Polish `name` stays as the data). */
 export function themeName(th: ThemeDef): string { const k = THEME_NAME_KEYS[th.id]; return k ? t(k) : th.name; }
@@ -179,7 +234,7 @@ function resolve(mode: ThemeMode): ThemeDef {
   return THEMES.find(t => t.id === id) ?? THEMES[0];
 }
 
-const VAR_TOKENS = ['bg0', 'bg1', 'bg2', 'bg3', 'bg4', 'bg5', 'bg6', 'bg7', 'line', 'line2', 'line3', 'fg', 'fgHi', 'fg2', 'fg3', 'fg4', 'fg5', 'fg6', 'blue', 'blueHi', 'green', 'amber', 'red', 'onBg'] as const;
+const VAR_TOKENS = ['bg0', 'bg1', 'bg2', 'bg3', 'bg4', 'bg5', 'bg6', 'bg7', 'line', 'line2', 'line3', 'fg', 'fgHi', 'fg2', 'fg3', 'fg4', 'fg5', 'fg6', 'blue', 'blueHi', 'green', 'amber', 'pan', 'red', 'onBg'] as const;
 
 function apply(def: ThemeDef) {
   Object.assign(T, def.t);

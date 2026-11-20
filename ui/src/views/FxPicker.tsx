@@ -4,12 +4,12 @@
 // column for the focused effect, Recent and Favourites at the top, built-in and VST3 separated.
 // A tile can also be dragged onto any mixer strip or the effect rack to add it there.
 import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from 'solid-js';
-import { PLUGIN_FORMAT_LABEL, type BuiltinKind, type Id, type PluginInfo, type PluginScan } from '../api/types';
-import { be } from '../api/backend';
+import { PLUGIN_FORMAT_LABEL, type BuiltinKind, type Id, type PluginInfo } from '../api/types';
 import { lang, t as tr, tName, type TranslationKey } from '../lib/i18n';
 import { presetList } from '../lib/presets';
 import * as A from '../state/actions';
 import { S } from '../state/store';
+import { ensurePluginScan, pluginScan, runPluginScan, setPluginScan } from '../state/pluginScan';
 import { say, setU, U } from '../state/ui';
 import { openNotebook } from '../state/notebook';
 import { NOTEBOOK_ICON } from './Notebook';
@@ -31,6 +31,9 @@ const DESC: Record<BuiltinKind, TranslationKey> = {
   warp: 'c.picker.desc.warp',
   chorus: 'c.picker.desc.chorus',
   phaser: 'c.picker.desc.phaser',
+  stereo: 'c.picker.desc.stereo',
+  multiband: 'c.picker.desc.multiband',
+  analyzer: 'c.picker.desc.analyzer',
   reverb: 'c.picker.desc.reverb',
   limit: 'c.picker.desc.limit',
 };
@@ -41,6 +44,7 @@ const KW: Record<BuiltinKind, TranslationKey> = {
   eq: 'c.picker.kw.eq', deess: 'c.picker.kw.deess', rider: 'c.picker.kw.rider', comp: 'c.picker.kw.comp',
   fet: 'c.picker.kw.fet', sat: 'c.picker.kw.sat', delay: 'c.picker.kw.delay', half: 'c.picker.kw.half', warp: 'c.picker.kw.warp',
   chorus: 'c.picker.kw.chorus', phaser: 'c.picker.kw.phaser',
+  stereo: 'c.picker.kw.stereo', multiband: 'c.picker.kw.multiband', analyzer: 'c.picker.kw.analyzer',
   reverb: 'c.picker.kw.reverb', limit: 'c.picker.kw.limit',
 };
 
@@ -51,10 +55,11 @@ const CATS: Cat[] = [
   { id: 'fav', label: 'c.picker.cat.fav' },
   { id: 'vocal', label: 'c.picker.cat.vocal', types: ['tune', 'voice', 'rider', 'deess'] },
   { id: 'repair', label: 'c.picker.cat.repair', types: ['denoise', 'deess'] },
-  { id: 'dyn', label: 'c.picker.cat.dyn', types: ['rider', 'comp', 'fet', 'limit'] },
+  { id: 'dyn', label: 'c.picker.cat.dyn', types: ['rider', 'comp', 'fet', 'multiband', 'limit'] },
   { id: 'tone', label: 'c.picker.cat.tone', types: ['eq', 'sat'] },
   { id: 'mod', label: 'c.picker.cat.mod', types: ['chorus', 'phaser'] },
   { id: 'space', label: 'c.picker.cat.space', types: ['delay', 'half', 'warp', 'reverb'] },
+  { id: 'image', label: 'c.picker.cat.image', types: ['stereo', 'analyzer'] },
   { id: 'vst', label: 'c.picker.cat.vst' },
   { id: 'tools', label: 'c.picker.cat.tools' },
 ];
@@ -80,17 +85,11 @@ const toggleFav = (key: string) => { const f = favs().includes(key) ? favs().fil
 
 // the plugin list is scanned once per session; "Rescan" in the Plugins category looks again
 // (new or updated plugins: a VST3 rescan opens only modules it has not seen)
-const [scan, setScan] = createSignal<PluginScan | null>(null);
-let scanning = false;
-function runScan(rescan: boolean) {
-  if (scanning) return;
-  scanning = true;
-  if (rescan) setScan(null);
-  be().pluginScan(rescan).then(setScan).catch(e => { say(String(e)); setScan({ plugins: [], unavailable: {} }); }).finally(() => { scanning = false; });
-}
-const ensureScan = () => { if (!scan()) runScan(false); };
+const scan = pluginScan;
+const runScan = (rescan: boolean) => void runPluginScan(rescan);
+const ensureScan = ensurePluginScan;
 /** Lets "Add plugin…" share a fresh rescan with the picker. */
-export const setPluginScan = (s: PluginScan) => setScan(s);
+export { setPluginScan };
 
 /** Project tools that open their own window instead of adding an effect. */
 const tools = (): Entry[] => [{ key: 'tool:notebook', tool: 'notebook', name: tr('c.picker.notebook'), desc: tr('c.picker.notebookDesc'), presets: 0 }];
@@ -258,12 +257,12 @@ function FxPicker(props: { insId: Id; x: number; y: number }) {
   };
   onCleanup(() => setDrag(null));
 
-  // anchored at the slot, always fully on screen
+  // centred over the app, like the command palette: wherever it was opened from (a slot, a strip,
+  // the master), it is in the same place and never cut by a window edge
   const pos = () => {
     const vw = window.innerWidth, vh = window.innerHeight, m = 12;
     const w = Math.min(W, vw - 2 * m), h = Math.min(H, vh - 2 * m);
-    if (props.x < 0) return { left: (vw - w) / 2, top: Math.max(m, (vh - h) / 2.4), w, h };
-    return { left: Math.min(Math.max(m, props.x - w / 2), vw - w - m), top: Math.min(Math.max(m, props.y - h - 10 > m ? props.y - h - 10 : props.y + 10), vh - h - m), w, h };
+    return { left: (vw - w) / 2, top: Math.max(m, (vh - h) / 2.4), w, h };
   };
   const activeCat = () => CATS.find(c => c.id === cat())!;
 

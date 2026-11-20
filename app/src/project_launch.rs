@@ -6,7 +6,8 @@ use std::path::{Component, Path, PathBuf};
 /// the UI compares it with the open project's path to avoid reopening it.
 pub fn project_path(arg: &str, cwd: Option<&Path>) -> Option<String> {
     let path = Path::new(arg);
-    if arg.starts_with('-') || !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("wave")) {
+    if arg.starts_with('-') || !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("synkopa") || ext.eq_ignore_ascii_case("wave"))
+    {
         return None;
     }
     let absolute = if path.is_absolute() { path.to_path_buf() } else { cwd?.join(path) };
@@ -76,6 +77,15 @@ mod tests {
         assert_eq!(project_path(r".\Song.wave", Some(cwd)).as_deref(), Some(r"C:\Music\Song.wave"));
         assert_eq!(project_path(r"C:/Music/./Song.wave", None).as_deref(), Some(r"C:\Music\Song.wave"));
         assert_eq!(project_path(r"\\server\share\x\..\Song.wave", None).as_deref(), Some(r"\\server\share\Song.wave"));
+    }
+
+    #[test]
+    fn opens_projects_saved_before_and_after_the_rename() {
+        let cwd = std::env::temp_dir();
+        for name in ["Song.synkopa", "Song.SYNKOPA", "Song.wave"] {
+            assert_eq!(project_path(name, Some(&cwd)).as_deref(), cwd.join(name).to_str(), "{name}");
+        }
+        assert_eq!(project_path("Song.synkopa.bak", Some(&cwd)), None);
     }
 
     #[test]

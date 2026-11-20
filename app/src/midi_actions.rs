@@ -1,8 +1,8 @@
 //! Standard MIDI files in and out (`midi_inspect`, `midi_import`, `midi_export`): the same
-//! functions answer the running app and `wave --project FILE midi …`.
+//! functions answer the running app and `synkopa --project FILE midi …`.
 //!
 //! Import makes one pattern with a Channel Rack channel per part (General MIDI drums become
-//! samplers of the standard library, one per drum; other parts the closest WAVE instrument)
+//! samplers of the standard library, one per drum; other parts the closest Synkopa instrument)
 //! and places it on the Playlist, or puts one part's notes into a channel of a pattern. Export
 //! writes the song (pattern clips as the Playlist plays them) or one pattern as a format 1
 //! file with the tempo, one track per channel.
@@ -153,7 +153,7 @@ pub fn import(app: &dyn Host, a: &Value, if_revision: Option<u64>) -> R<Value> {
             for part in &parts {
                 if part.channel == DRUM_CHANNEL {
                     for n in &part.notes {
-                        notes.push(Note { ch: drum_ch[&n.key], step: steps(n.start), len: steps(n.len).max(0.01), p: None, v: vel(n.vel), trig: Some(false) });
+                        notes.push(Note { ch: drum_ch[&n.key], step: steps(n.start), len: steps(n.len).max(0.01), p: None, v: vel(n.vel), trig: Some(false), pan: 0.0, slide: false });
                     }
                     continue;
                 }
@@ -169,7 +169,7 @@ pub fn import(app: &dyn Host, a: &Value, if_revision: Option<u64>) -> R<Value> {
                 ops.push(Op::PutChannel { channel: ch, index: None });
                 channels.push(cid);
                 for n in &part.notes {
-                    notes.push(Note { ch: cid, step: steps(n.start), len: steps(n.len).max(0.01), p: Some(n.key), v: vel(n.vel), trig: Some(false) });
+                    notes.push(Note { ch: cid, step: steps(n.start), len: steps(n.len).max(0.01), p: Some(n.key), v: vel(n.vel), trig: Some(false), pan: 0.0, slide: false });
                 }
             }
             let end = parts.iter().flat_map(|p| &p.notes).map(|n| n.start + n.len).fold(0.0, f64::max);
@@ -201,6 +201,8 @@ pub fn import(app: &dyn Host, a: &Value, if_revision: Option<u64>) -> R<Value> {
                         stretch: 1.0,
                         resample: false,
                         pitch: 0.0,
+                        insert: None,
+                        root: wave_engine::CLIP_ROOT,
                     }],
                 });
             }
@@ -230,12 +232,14 @@ fn import_into(app: &dyn Host, parts: &[&midi_file::Part], into: &Value, if_revi
     }
     let added = part.notes.len();
     pat.notes.extend(part.notes.iter().map(|n| Note {
+        pan: 0.0,
         ch,
         step: steps(n.start),
         len: steps(n.len).max(0.01),
         p: Some(n.key),
         v: vel(n.vel),
         trig: Some(false),
+        slide: false,
     }));
     let rev = e.apply(&[Op::PutPattern { pattern: pat }], false, if_revision).map_err(|x| x.to_string())?;
     Ok(json!({ "patternId": pid, "channelIds": [ch], "notes": added, "revision": rev }))
@@ -252,6 +256,8 @@ struct Voice {
 fn voice(p: &Project, c: &Channel) -> Voice {
     match &c.src {
         ChannelSrc::Keys { .. } => Voice { drum_key: None, program: Some(0) },
+        // a hosted plugin's sound is its own: no General MIDI program stands for it
+        ChannelSrc::Plugin { .. } => Voice { drum_key: None, program: None },
         ChannelSrc::Synth { synth } => {
             let cat = synth
                 .preset
@@ -281,7 +287,9 @@ fn clip_notes(c: &Clip, pat: &Pattern, out: &mut Vec<(Id, SmfNote, Option<u8>)>)
     let end = c.start + c.len;
     let mut base = c.start - off;
     while base < end {
-        for n in &pat.notes {
+        // a slide note bends other notes and has no sound of its own: a MIDI file has no
+        // such note, so it is left out (it would play as an extra note)
+        for n in pat.notes.iter().filter(|n| !n.slide) {
             let t = f64::from(n.step) / 4.0;
             if t >= plen {
                 continue;
@@ -350,7 +358,7 @@ pub fn export(app: &dyn Host, a: &Value) -> R<Value> {
         .path
         .as_deref()
         .and_then(|s| Path::new(s).file_stem().map(|x| x.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "WAVE".into());
+        .unwrap_or_else(|| "Synkopa".into());
     let bytes = midi_file::write(p.bpm, &title, &tracks)?;
     if let Some(d) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
@@ -380,6 +388,8 @@ fn placeholder_clip(pattern: Id) -> Clip {
         stretch: 1.0,
         resample: false,
         pitch: 0.0,
+        insert: None,
+        root: wave_engine::CLIP_ROOT,
     }
 }
 

@@ -21,11 +21,17 @@ pub const VOL_UNITY: f32 = 0.7937;
 /// Beats shown on the playlist. The arrangement may not go past this: 512 bars of 4/4,
 /// 11:46 at 174 BPM, 17 minutes at 120. Nothing is allocated per beat, so the limit
 /// only bounds the playlist's scroll width (≈200k px at the deepest zoom).
+/// How far (beats) a clip may run past a bar line before the song gets that extra bar: a 16th.
+pub const SONG_END_SLACK: f64 = 0.25;
 pub const TOTAL_BEATS: f64 = 2048.0;
 
 pub fn fader_gain(t: f32) -> f32 {
     2.0 * t * t * t
 }
+
+/// The project format `migrate` brings a file up to. 3: the Reverb's Decay reaches 20 s
+/// (was 6 s), so automation of it (stored normalised over the range) is rescaled once.
+pub const PROJECT_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -107,6 +113,28 @@ pub struct Insert {
     pub muted: bool,
     pub solo: bool,
     pub fx: Vec<Fx>,
+    /// Post-fader sends to other inserts (FL Studio's mixer routing, see `crate::routing`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sends: Vec<InsertSend>,
+    /// The output also goes to the master (the default). Off: it goes only where it sends
+    /// ("route to this track only").
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub master: bool,
+}
+
+/// One send of an insert: the insert it feeds and the level (linear, 0..=2).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InsertSend {
+    pub to: Id,
+    pub gain: f32,
+}
+
+fn yes() -> bool {
+    true
+}
+fn is_yes(b: &bool) -> bool {
+    *b
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -132,6 +160,12 @@ pub enum FxKind {
     Chorus,
     /// Swept all-pass stages with feedback (`dsp::modulation`).
     Phaser,
+    /// Width, mono-safe spread, bass mono, gain, balance, polarity (`dsp::stereo`).
+    Stereo,
+    /// Loudness, true peak, spectrum and stereo field; passes the sound unchanged (`dsp::loudness`).
+    Analyzer,
+    /// Three-band upward + downward compression, the "OTT" sound (`dsp::multiband`).
+    Multiband,
     /// A hosted plugin (VST3 or LV2, see [`PluginRef::format`]). Written as `"plugin"`;
     /// projects from before LV2 support say `"vst3"`, which still loads.
     #[serde(alias = "vst3")]
@@ -305,10 +339,18 @@ impl PluginRef {
             _ => "VST3",
         }
     }
+
+    /// Whether `other` names the same plugin class (state aside): an instance of one can
+    /// stand for the other.
+    pub fn same_class(&self, other: &PluginRef) -> bool {
+        self.format == other.format && self.path == other.path && self.cid == other.cid
+    }
 }
 
 /// MIDI key at which a sampler channel plays its sample unpitched (C5 in FL's naming).
 pub const SAMPLE_ROOT: u8 = 60;
+/// Most slices a sampler channel holds (keys `root` … `root + 127` can reach them).
+pub const MAX_SLICES: usize = 128;
 
 /// Standard-library files of a new project's channels, and the channel names.
 pub const STARTER_KIT: [(&str, &str); 4] =
@@ -323,17 +365,26 @@ pub enum ChannelSrc {
         source: Id,
         #[serde(default)]
         sampler: SamplerState,
+        /// Slice mode (FL Studio's Slicex, Ableton Simpler's Slice): where each slice starts, as
+        /// sorted fractions of the file in 0..1. Key `root` plays slice 1, `root + 1` slice 2, …;
+        /// a slice plays to the next one (the last to the end of the file) at the file's pitch,
+        /// and a new slice cuts the one sounding. Empty = the sampler plays the region by pitch.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        slices: Vec<f32>,
     },
     /// The built-in polyphonic synthesizer (see `crate::poly`).
     Synth {
         #[serde(default)]
         synth: SynthState,
     },
-    /// WAVE Keys: the sampled grand piano (see `crate::keys`).
+    /// Synkopa Keys: the sampled grand piano (see `crate::keys`).
     Keys {
         #[serde(default)]
         keys: KeysState,
     },
+    /// A hosted plugin instrument (VST3): its notes, live keys and auditions go to one
+    /// instance of the plugin, whose stereo output plays like any channel's.
+    Plugin { plugin: PluginRef },
 }
 
 /// How a sampler channel plays its sample (FL Studio's Sampler, Ableton's Simpler).
@@ -355,20 +406,35 @@ pub struct SamplerState {
     pub semi: i8,
     #[serde(default)]
     pub fine: f32,
-    /// For live keys, auditions and legacy notes: one-shot plays the whole sample,
-    /// Gate fades it over `release` after note-off. Explicit held notes end at their length.
+    /// The volume envelope switch (FL Studio's Channel settings ▸ Volume ▸ Envelope). Off, the
+    /// sample plays as recorded: live keys, auditions and legacy notes ring to its end, sized
+    /// notes stop at theirs. On, every note is shaped by the DAHDSR envelope below and fades over
+    /// `release` from its note-off (a step trigger has none, so it holds the sustain level).
     #[serde(default)]
-    pub gate: bool,
-    /// Volume envelope: `attack` and `decay` in ms, `sustain` 0..1 (the level after the
-    /// decay; 0 makes the decay the whole sound), `release` in ms (gate mode).
+    pub env: bool,
+    /// Envelope stage times in ms: `delay` (silence before the attack), `attack` (0 → full),
+    /// `hold` (at full), `decay` (full → `sustain`), `release` (→ silence after note-off).
+    /// `sustain` 0..1 is the level held until note-off (0 makes the decay the whole sound).
+    #[serde(default)]
+    pub delay: f32,
     #[serde(default)]
     pub attack: f32,
+    #[serde(default)]
+    pub hold: f32,
     #[serde(default)]
     pub decay: f32,
     #[serde(default = "one")]
     pub sustain: f32,
     #[serde(default = "sampler_release")]
     pub release: f32,
+    /// Curve of the attack, decay and release, −1..1: 0 is a straight line, positive bows the
+    /// segment up (a fast attack, a slow decay), negative bows it down.
+    #[serde(default, rename = "attackTension")]
+    pub attack_tension: f32,
+    #[serde(default, rename = "decayTension")]
+    pub decay_tension: f32,
+    #[serde(default, rename = "releaseTension")]
+    pub release_tension: f32,
     /// Cut group 1..8 (0 = none): a new note silences every sounding note of the channels in
     /// the same group, itself included. A closed hat that cuts the open one.
     #[serde(default)]
@@ -387,7 +453,9 @@ fn sampler_release() -> f32 {
 impl SamplerState {
     pub const SEMI: (i8, i8) = (-24, 24);
     pub const FINE: (f32, f32) = (-100.0, 100.0);
+    pub const DELAY_MS: (f32, f32) = (0.0, 5000.0);
     pub const ATTACK_MS: (f32, f32) = (0.0, 2000.0);
+    pub const HOLD_MS: (f32, f32) = (0.0, 5000.0);
     pub const DECAY_MS: (f32, f32) = (0.0, 5000.0);
     pub const RELEASE_MS: (f32, f32) = (1.0, 5000.0);
     pub const FADE_MS: (f32, f32) = (0.0, 5000.0);
@@ -405,12 +473,17 @@ impl SamplerState {
         if !(Self::SEMI.0..=Self::SEMI.1).contains(&self.semi) || !within(self.fine, Self::FINE) {
             return Err("sampler pitch is -24..24 semitones and -100..100 cents".into());
         }
-        if !within(self.attack, Self::ATTACK_MS)
+        if !within(self.delay, Self::DELAY_MS)
+            || !within(self.attack, Self::ATTACK_MS)
+            || !within(self.hold, Self::HOLD_MS)
             || !within(self.decay, Self::DECAY_MS)
             || !within(self.sustain, (0.0, 1.0))
             || !within(self.release, Self::RELEASE_MS)
         {
-            return Err("sampler envelope: attack 0..2000 ms, decay 0..5000 ms, sustain 0..1, release 1..5000 ms".into());
+            return Err("sampler envelope: delay 0..5000 ms, attack 0..2000 ms, hold 0..5000 ms, decay 0..5000 ms, sustain 0..1, release 1..5000 ms".into());
+        }
+        if ![self.attack_tension, self.decay_tension, self.release_tension].iter().all(|&k| within(k, (-1.0, 1.0))) {
+            return Err("sampler envelope tensions are -1..1".into());
         }
         if !within(self.fade_in_ms, Self::FADE_MS) || !within(self.fade_out_ms, Self::FADE_MS) {
             return Err("sampler fades must be 0..5000 ms".into());
@@ -419,6 +492,24 @@ impl SamplerState {
             return Err("sampler cut group is 0 (none) or 1..8".into());
         }
         Ok(())
+    }
+}
+
+/// Files from before the volume-envelope switch (`env`) had a `gate` mode and always applied
+/// attack, decay and sustain. A sampler that was gated or shaped opens with its envelope on, so
+/// the shape keeps sounding; an untouched one-shot opens with it off and plays as before.
+fn migrate_sampler_envelopes(v: &mut serde_json::Value) {
+    use serde_json::Value;
+    for c in v.get_mut("channels").and_then(Value::as_array_mut).into_iter().flatten() {
+        let Some(s) = c.get_mut("sampler").and_then(Value::as_object_mut) else { continue };
+        if s.contains_key("env") {
+            continue;
+        }
+        let num = |k: &str, d: f64| s.get(k).and_then(Value::as_f64).unwrap_or(d);
+        let shaped = num("attack", 0.0) > 0.0 || num("sustain", 1.0) < 1.0;
+        let gate = s.get("gate").and_then(Value::as_bool).unwrap_or(false);
+        s.remove("gate");
+        s.insert("env".into(), Value::Bool(gate || shaped));
     }
 }
 
@@ -431,11 +522,16 @@ impl Default for SamplerState {
             norm: false,
             semi: 0,
             fine: 0.0,
-            gate: false,
+            env: false,
+            delay: 0.0,
             attack: 0.0,
+            hold: 0.0,
             decay: 0.0,
             sustain: 1.0,
             release: Self::RELEASE_DEFAULT,
+            attack_tension: 0.0,
+            decay_tension: 0.0,
+            release_tension: 0.0,
             cut: 0,
             fade_in_ms: 0.0,
             fade_out_ms: 0.0,
@@ -443,7 +539,7 @@ impl Default for SamplerState {
     }
 }
 
-/// A WAVE Keys channel's settings.
+/// A Synkopa Keys channel's settings.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct KeysState {
     /// How long a note rings after its key is let go, in milliseconds.
@@ -506,6 +602,9 @@ pub struct Channel {
     /// the sample plays at its original pitch.
     #[serde(default = "sample_root")]
     pub root: u8,
+    /// The Channel Rack filter group it belongs to (FL's filter groups); `None` = unsorted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 fn vol_unity() -> f32 {
@@ -529,16 +628,24 @@ impl Channel {
             solo: false,
             insert: None,
             root: SAMPLE_ROOT,
+            group: None,
         }
     }
     /// A sampler channel playing `source` with the default settings.
     pub fn sampler(id: Id, name: &str, color: &str, source: Id) -> Self {
-        Self::new(id, name, color, ChannelSrc::Sample { source, sampler: SamplerState::default() })
+        Self::new(id, name, color, ChannelSrc::Sample { source, sampler: SamplerState::default(), slices: Vec::new() })
     }
     /// The source a sampler channel plays.
     pub fn sample_source(&self) -> Option<Id> {
         match self.src {
             ChannelSrc::Sample { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+    /// The plugin a plugin-instrument channel hosts.
+    pub fn plugin(&self) -> Option<&PluginRef> {
+        match &self.src {
+            ChannelSrc::Plugin { plugin } => Some(plugin),
             _ => None,
         }
     }
@@ -564,13 +671,23 @@ pub struct Note {
     /// Velocity 0..1 (gain).
     #[serde(default = "one", skip_serializing_if = "is_one")]
     pub v: f32,
+    /// Pan of this note, -1 (left) ..= 1 (right), added to its channel's pan (FL's per-note
+    /// panning). Sampler and Synkopa Keys channels play it; Synth and plugin channels ignore it.
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub pan: f32,
     /// A step-sequencer trigger (FL Studio's zero-length step): a note-on without a note-off.
     /// A sampler plays its part to the end (or until a cut group or its own decay stops it),
-    /// whatever its One-shot / Gate mode. Synth and WAVE Keys channels hold it for `len`.
+    /// whatever its One-shot / Gate mode. Synth and Synkopa Keys channels hold it for `len`.
     /// `false` = a held Piano Roll note: a sampler stops at its end, or when the sample runs out.
     /// Legacy notes without this flag follow the channel's One-shot / Gate mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trig: Option<bool>,
+    /// A slide note (FL Studio's): it starts no sound of its own. When it starts, the notes of
+    /// its channel that are sounding glide by the distance from the highest of them to this
+    /// note's key, over this note's length, and keep that pitch until they end. Sampler, Synkopa
+    /// Keys and Synth channels play it; plugin instruments ignore it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub slide: bool,
 }
 
 fn is_one(v: &f32) -> bool {
@@ -580,7 +697,7 @@ fn is_one(v: &f32) -> bool {
 impl Note {
     /// A held note: note-on at `step`, note-off `len` steps later.
     pub fn new(ch: Id, step: f32, len: f32, p: Option<u8>) -> Self {
-        Self { ch, step, len, p, v: 1.0, trig: Some(false) }
+        Self { ch, step, len, p, v: 1.0, trig: Some(false), pan: 0.0, slide: false }
     }
     /// A Channel Rack step: a trigger in one grid cell.
     pub fn trigger(ch: Id, step: f32, p: Option<u8>) -> Self {
@@ -712,7 +829,7 @@ pub enum AutoTarget {
         chan_id: Id,
         param: String,
     },
-    /// A WAVE Keys channel's `release` (ms, logarithmic) or `dynamics` (%).
+    /// A Synkopa Keys channel's `release` (ms, logarithmic) or `dynamics` (%).
     Keys {
         chan_id: Id,
         param: String,
@@ -917,6 +1034,25 @@ pub struct Clip {
     /// way; the length stays. Rendered offline with the stretch, like it.
     #[serde(default, skip_serializing_if = "is_zero_f32")]
     pub pitch: f32,
+    /// Audio clips: the mixer insert this clip plays into, past its track (FL: an audio
+    /// clip's own mixer track; the editor sets it for every clip of the sample). `None` =
+    /// the track's insert. The track still mutes it and scales it with its fader.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insert: Option<Id>,
+    /// Audio clips: the key at which the sample sounds at its own pitch (FL's root note of an
+    /// audio clip channel, shared by every clip of the sample). The sample editor's keyboard
+    /// plays the sample transposed from here; a sampler channel made from the clip starts here.
+    #[serde(default = "clip_root", skip_serializing_if = "is_clip_root")]
+    pub root: u8,
+}
+
+/// Default `Clip::root`: C5 (MIDI 60), like a new sampler channel.
+pub const CLIP_ROOT: u8 = 60;
+fn clip_root() -> u8 {
+    CLIP_ROOT
+}
+fn is_clip_root(x: &u8) -> bool {
+    *x == CLIP_ROOT
 }
 
 fn is_zero_f32(x: &f32) -> bool {
@@ -1274,6 +1410,32 @@ impl Project {
         if self.channels.is_empty() {
             self.add_starter_kit();
         }
+        // synth presets were named in Polish before 0.9.30: the preset reference follows the
+        // rename, and so does a synth channel still called after a preset, and an insert named
+        // after such a channel (any other name is the user's and stays)
+        let renamed = |n: &str| crate::poly::presets::LEGACY_NAMES.iter().find(|(old, _)| *old == n).map(|(_, new)| new.to_string());
+        let mut moved: Vec<(String, String)> = vec![];
+        for ch in &mut self.channels {
+            if let ChannelSrc::Synth { synth } = &mut ch.src {
+                if let Some(new) = synth.preset.as_deref().and_then(renamed) {
+                    synth.preset = Some(new);
+                }
+                if let Some(new) = renamed(&ch.name) {
+                    moved.push((std::mem::replace(&mut ch.name, new.clone()), new));
+                }
+            }
+        }
+        for ins in &mut self.inserts {
+            if let Some((_, new)) = moved.iter().find(|(old, _)| *old == ins.name) {
+                ins.name = new.clone();
+            }
+        }
+        // a pattern split per channel is called "<pattern> – <channel>"
+        for pt in &mut self.patterns {
+            if let Some((old, new)) = moved.iter().find(|(old, _)| pt.name.ends_with(&format!(" – {old}"))) {
+                pt.name = format!("{} – {new}", &pt.name[..pt.name.len() - old.len() - " – ".len()]);
+            }
+        }
         // saturator parameters from before the character saturator
         for ins in &mut self.inserts {
             for fx in ins.fx.iter_mut().filter(|f| f.kind == FxKind::Sat) {
@@ -1302,6 +1464,20 @@ impl Project {
                 }
             }
         }
+        // projects from before the 20 s reverb decay: its automation lands on the same seconds
+        if self.version < 3 {
+            let reverbs: Vec<Id> = self.inserts.iter().flat_map(|i| &i.fx).filter(|f| f.kind == FxKind::Reverb).map(|f| f.id).collect();
+            for a in &mut self.automations {
+                if let AutoTarget::Fx { fx_id, param } = &a.target {
+                    if param == "size" && reverbs.contains(fx_id) {
+                        for pt in a.points.iter_mut() {
+                            pt.v = crate::dsp::reverb_v2::migrate_auto_size(pt.v);
+                        }
+                    }
+                }
+            }
+        }
+        self.version = self.version.max(PROJECT_VERSION);
         // ids the file used must stay taken
         let max = self.channels.iter().map(|c| c.id).chain(self.sources.iter().map(|s| s.id)).max().unwrap_or(0);
         if max >= self.next_id {
@@ -1316,6 +1492,7 @@ impl Project {
         use serde_json::{json, Value};
         const LEGACY: [(&str, &str); 4] =
             [("kick", "kick-808-short.flac"), ("clap", "clap-808.flac"), ("hat", "hat-808-closed.flac"), ("bass", "bass-808-short.flac")];
+        migrate_sampler_envelopes(&mut v);
         let file_of = |inst: &Value| LEGACY.iter().find(|(k, _)| inst.as_str() == Some(k)).map(|(_, f)| *f);
         // (channel index or None for "notes of this instrument", file)
         let mut chans: Vec<(usize, &str)> = vec![];
@@ -1371,15 +1548,15 @@ impl Project {
             let (source, f) = (crate::factory::source(&mut p, file), crate::factory::file(file));
             if let (Some(source), Some(f), Some(c)) = (source, f, p.channels.get_mut(i)) {
                 // the synthesised bass held its note; the drums rang out
-                let sampler = SamplerState { gate: file == LEGACY[3].1, ..Default::default() };
-                c.src = ChannelSrc::Sample { source, sampler };
+                let sampler = SamplerState { env: file == LEGACY[3].1, ..Default::default() };
+                c.src = ChannelSrc::Sample { source, sampler, slices: Vec::new() };
                 c.root = f.root;
             }
         }
         let ids: Vec<Id> = loose.iter().map(|f| p.factory_channel(f).unwrap_or(0)).collect();
         for (id, file) in ids.iter().zip(&loose) {
             if let Some(ChannelSrc::Sample { sampler, .. }) = p.channels.iter_mut().find(|c| c.id == *id).map(|c| &mut c.src) {
-                sampler.gate = *file == LEGACY[3].1;
+                sampler.env = *file == LEGACY[3].1;
             }
         }
         for (pt, flags) in p.patterns.iter_mut().zip(legacy_notes) {
@@ -1406,9 +1583,26 @@ impl Project {
     }
 
     /// End of the last clip, rounded up to a bar; at least one bar.
+    /// Where the song ends (SONG playback wraps there, a song export stops there): the bar the
+    /// last clip ends in. A clip running into the next bar by less than [`SONG_END_SLACK`] (an
+    /// audio file a hair longer than its bars: encoder padding, a click of tail) does not add
+    /// that bar, so the playhead goes back to the start as soon as the music is over. A clip
+    /// that *starts* in a bar always keeps that bar.
+    /// The mixer insert a clip is heard on: its own (audio clips), else its track's.
+    pub fn clip_insert(&self, c: &Clip) -> Id {
+        c.insert
+            .filter(|id| self.inserts.iter().any(|m| m.id == *id))
+            .unwrap_or_else(|| self.tracks.get(c.track as usize).map_or(0, |t| t.insert))
+    }
+
     pub fn song_end(&self) -> f64 {
-        let end = self.clips.iter().map(|c| c.start + c.len).fold(4.0, f64::max);
+        let end = self.clips.iter().fold(4.0f64, |m, c| m.max(c.start + c.len - SONG_END_SLACK).max(c.start + 1e-6));
         (end / 4.0).ceil() * 4.0
+    }
+
+    /// The demo song (see [`crate::demo::demo_project`]).
+    pub fn demo() -> Self {
+        crate::demo::demo_project()
     }
 
     /// The small fixed song tests and benchmarks build on.

@@ -1,5 +1,9 @@
-//! The project the program starts with (eight tracks, the starter kit in the Channel Rack) and
-//! the small fixed song tests and benchmarks build on.
+//! The projects the program ships with: the empty project it starts on (eight tracks, the
+//! starter kit in the Channel Rack), the finished 2026 trap demo project (`demo_project`), and
+//! the small fixed song tests and benchmarks build on (`sketch_project`).
+//!
+//! The demo is a project made in the program itself and kept as `demo_project.json`. To change
+//! it, edit it in Synkopa, save it, and run `python scripts/update-demo.py <file.synkopa>`.
 
 use crate::catalog::{load_preset, new_fx};
 use crate::model::*;
@@ -9,7 +13,7 @@ const COLORS: [usize; 8] = [0, 6, 5, 3, 4, 8, 9, 9];
 
 fn base(names: &[&str], ins_names: &[&str]) -> Project {
     let mut p = Project {
-        version: 2,
+        version: PROJECT_VERSION,
         bpm: 128.0,
         tracks: vec![],
         inserts: vec![Insert {
@@ -22,6 +26,8 @@ fn base(names: &[&str], ins_names: &[&str]) -> Project {
             muted: false,
             solo: false,
             fx: vec![],
+            sends: vec![],
+            master: true,
         }],
         patterns: vec![],
         sources: vec![],
@@ -46,6 +52,8 @@ fn base(names: &[&str], ins_names: &[&str]) -> Project {
             muted: false,
             solo: false,
             fx: vec![],
+            sends: vec![],
+            master: true,
         });
     }
     for (i, name) in names.iter().enumerate() {
@@ -80,13 +88,44 @@ pub fn routed_project() -> Project {
     p
 }
 
+/// Playlist tracks a new project has.
+pub const EMPTY_TRACKS: usize = 30;
+
 /// What the program starts with. Playlist tracks are plain lanes, as in FL Studio: none is tied
 /// to a mixer insert (they play into the master); routing belongs to the channels, and a track
-/// is sent to an insert by hand.
+/// is sent to an insert by hand. As in FL Studio's default template, the starter kit's Kick,
+/// Clap, Hat and Snare play into inserts 1-4, named after them, so a fader or an effect there
+/// acts on the drum at once.
 pub fn empty_project() -> Project {
     let mut p = routed_project();
     for t in &mut p.tracks {
         t.insert = 0;
+    }
+    // room to arrange from the start (FL Studio opens with many empty tracks): the first eight
+    // keep their colours, the rest are plain lanes like a track added later
+    for i in p.tracks.len()..EMPTY_TRACKS {
+        p.tracks.push(Track {
+            id: i as Id + 1,
+            name: format!("Track {}", i + 1),
+            color: "#8b93a1".into(),
+            muted: false,
+            solo: false,
+            arm: false,
+            vol: VOL_UNITY,
+            h: 56.0,
+            insert: 0,
+            icon: None,
+        });
+    }
+    let kit: Vec<(Id, String)> = p.channels.iter().take(STARTER_KIT.len()).map(|c| (c.id, c.name.clone())).collect();
+    for (i, (ch, name)) in kit.into_iter().enumerate() {
+        let ins = i as Id + 1;
+        if let Some(c) = p.channels.iter_mut().find(|c| c.id == ch) {
+            c.insert = Some(ins);
+        }
+        if let Some(m) = p.inserts.iter_mut().find(|m| m.id == ins) {
+            m.name = name;
+        }
     }
     p
 }
@@ -105,7 +144,7 @@ pub fn sketch_project() -> Project {
     for c in p.channels.iter_mut().filter(|c| c.id == bass) {
         c.name = "Bass".into();
         if let ChannelSrc::Sample { sampler, .. } = &mut c.src {
-            sampler.gate = true;
+            sampler.env = true;
         }
     }
     let n = |c: Id, step: f32, len: f32, key: Option<u8>| Note::new(c, step, len, key);
@@ -174,6 +213,8 @@ pub fn sketch_project() -> Project {
         stretch: 1.0,
         resample: false,
         pitch: 0.0,
+        insert: None,
+        root: crate::model::CLIP_ROOT,
     };
     p.clips = vec![clip(1, 0, 0.0, 16.0, 1), clip(2, 0, 16.0, 16.0, 1), clip(3, 1, 8.0, 24.0, 2), clip(4, 2, 0.0, 32.0, 3)];
     // Vocal chain: EQ (custom) → comp → reverb, drum bus comp.
@@ -184,4 +225,20 @@ pub fn sketch_project() -> Project {
     load_preset(&mut comp, 2, p.bpm);
     p.inserts[1].fx = vec![comp];
     p
+}
+
+/// Beats per minute of the 2026 trap demo ("OBSIDIAN 2093").
+pub const DEMO_BPM: f64 = 136.0;
+
+/// The demo project: 40 bars (160 beats) of dark trap in D# minor at 136 BPM, arranged and mixed
+/// in Synkopa itself (`demo_project.json`, see the module comment).
+///
+/// Every sample is a standard-library file (`lib:Standard/…`) and every instrument and effect
+/// is built in, so it opens and plays the same on every computer without a download: layered
+/// drums and an 808, two stretched loops, three synths, a Beat Bus whose Half-Speed, reverb and
+/// low-pass are automated across the arrangement, a ready vocal chain and a bar-synced Notebook.
+pub fn demo_project() -> Project {
+    let file = serde_json::from_str(include_str!("demo_project.json")).expect("demo_project.json is JSON");
+    // read like any project file, so one saved by an older version still opens
+    Project::from_json(file).expect("demo_project.json is a valid project")
 }
