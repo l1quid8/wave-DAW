@@ -24,7 +24,7 @@ const [open, setOpen] = createSignal<ReadonlySet<Id>>(new Set());
 export const editorOpen = (id: Id) => open().has(id);
 
 let editors: Promise<boolean> | null = null;
-/** Whether plugin windows can be shown in this session (Windows; Linux with X11 / XWayland). */
+/** Whether plugin windows can be shown in this session (Windows, macOS; Linux with X11 / XWayland). */
 export function editorsHere(): Promise<boolean> {
   editors ??= be().appInfo().then(i => i.pluginEditors).catch(() => false);
   return editors;
@@ -80,6 +80,13 @@ function watch() {
   }, 700);
 }
 
+// A VST3 editor's close button is reported at once (`plugin-editor`); the poll above stays for LV2
+// UIs, which report nothing, and for a plugin that goes away.
+let closes: Promise<unknown> | null = null;
+function followCloses() {
+  closes ??= be().on('plugin-editor', e => { if (!e.open) mark(e.fxId, false); }).catch(() => { closes = null; });
+}
+
 /** Open (or bring forward) the plugin's own window. Rejects when it has none or cannot show one. */
 export async function openEditor(id: Id): Promise<void> {
   const p = pluginOf(id);
@@ -91,6 +98,7 @@ export async function openEditor(id: Id): Promise<void> {
     throw e;
   }
   mark(id, true);
+  followCloses();
   watch();
 }
 

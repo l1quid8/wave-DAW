@@ -41,6 +41,12 @@ windows-sys = { version = "0.61", features = [
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
+# On macOS it is a CoreFoundation bundle: `CFBundleCreate` +
+# `CFBundleLoadExecutableAndReturnError` + `CFBundleGetFunctionPointerForName`,
+# and `bundleEntry(CFBundleRef)`.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFBundle", "CFURL", "CFString", "CFError"] }
+
 [dev-dependencies]
 serde_json.workspace = true
 

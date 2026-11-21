@@ -24,7 +24,7 @@ show its notes after the restart.
   updater installs. 13.4 is what ONNX Runtime's prebuilt library (stems, pitch) needs; `app/build.rs`
   links clang's runtime for it. The app is ad-hoc signed, not notarized (that needs an Apple
   Developer account): the first start asks for System Settings → Privacy & Security → Open Anyway.
-  VST3 plugins are not hosted on macOS yet. `.github/workflows/macos.yml` builds it on demand.
+  VST3 plugins (Apple Silicon or universal) are hosted, with their own windows; the Demo Synth is not bundled on macOS yet. `.github/workflows/macos.yml` builds it on demand.
 * A `.sig` beside each (the updater's signature) and `latest.json`.
 
 The bundle list is `bundles` in the matrix of `.github/workflows/release.yml`. Every installer

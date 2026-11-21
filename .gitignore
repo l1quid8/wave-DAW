@@ -33,3 +33,4 @@ app/resources/plugins/*.vst3
 app/resources/ort/libonnxruntime*
 app/resources/ort/LICENSE.txt
 graphify-out/**
+.DS_Store

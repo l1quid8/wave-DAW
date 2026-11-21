@@ -7,6 +7,12 @@ shown in the app after an update and is published as the release notes (see
 ## Unreleased
 
 ### Added
+- **VST3 plugins on macOS.** Synkopa for Mac now finds VST3 instruments and effects in
+  `/Library/Audio/Plug-Ins/VST3` and `~/Library/Audio/Plug-Ins/VST3`, loads them and opens their own
+  windows. Plugins built for Apple Silicon or as universal binaries work; an Intel-only plugin says
+  so instead of loading. Projects open from Finder (double-click, Open With, a drop on the Dock
+  icon), the window has the Mac's traffic lights, and shortcut hints read ⌘ ⌥ ⇧.
+- **Recording on macOS asks for the microphone**, so recordings capture sound instead of silence.
 - **Channel groups in the Channel Rack, as FL's filter groups.** Right-click a channel → Group to
   put it in Drums, Bass or a new group; the filter at the rack's top shows every channel, one group or
   the unsorted ones (hidden channels keep playing). Channels added while a group is shown join it, and
@@ -37,6 +43,9 @@ shown in the app after an update and is published as the release notes (see
   instruments ignore slide notes, so the button is greyed out for them.
 
 ### Changed
+- **A plugin's window and Synkopa's stay in step.** Turning a knob in a VST3 plugin's own window
+  updates its parameter list in Synkopa right away, and closing the plugin's window with its own
+  close button turns the button back to "Open plugin GUI" at once.
 - **The clip menu says what Rename and the colours change.** "Rename pattern…" (sample, automation) and
   "Colour of the pattern · 3 clips" make clear that every clip of it follows; the tooltip points to
   Make unique for changing one copy only.

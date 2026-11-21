@@ -1,7 +1,7 @@
 //! `wave-plugin-windows` -- native top-level windows for plugin editors.
 //!
 //! A plugin editor (VST3, LV2) paints with its own toolkit into a native window handle
-//! (`HWND` on Windows, an X11 window on Linux). That cannot be composited into the Tauri
+//! (`HWND` on Windows, an X11 window on Linux, an `NSView` on macOS). That cannot be composited into the Tauri
 //! webview, so every editor gets its **own floating native window**: Synkopa's header on top
 //! (the name, a gear that opens Synkopa's own settings for the plugin, a close button -- FL
 //! Studio's wrapper; [`header`]) and the plugin's interface embedded below it. The header
@@ -19,6 +19,10 @@
 //! (pure Rust, `x11rb`; the plugin opens another) and reads it from the UI thread's event
 //! loop, which the application installs ([`event_loop::install`]; in Synkopa, GTK's glib
 //! loop). The same loop runs the timers and file descriptors plugins register.
+//!
+//! **macOS.** As on Windows, Tauri's own `NSApplication` loop on the main thread services
+//! every window made there. The tick is an `NSTimer` in the common run-loop modes. Editors
+//! keep the native title bar instead of Synkopa's header (`src/macos.rs`).
 //!
 //! Every call that touches a window checks the calling thread and returns
 //! [`WindowError::WrongThread`] otherwise. Each window has a *tick* at
@@ -45,8 +49,9 @@
 //!
 //! # Platforms
 //!
-//! Windows and Linux (X11, or XWayland under Wayland) have backends. Elsewhere the crate
-//! compiles and every window call returns [`WindowError::Unsupported`].
+//! Windows, Linux (X11, or XWayland under Wayland) and macOS (AppKit, `src/macos.rs`) have
+//! backends. Elsewhere the crate compiles and every window call returns
+//! [`WindowError::Unsupported`].
 //!
 //! # What this crate deliberately does not do
 //! - It knows nothing about VST3 or LV2. It hands out a native handle and reports resize,
@@ -56,7 +61,9 @@
 pub mod event_loop;
 pub mod header;
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 mod unsupported;
 #[cfg(windows)]
 mod win32;
@@ -72,7 +79,7 @@ pub use service::{
 
 /// Whether this build has a native window backend. `false` means every
 /// [`Service::open_window`] returns [`WindowError::Unsupported`].
-pub const SUPPORTED: bool = cfg!(any(windows, target_os = "linux"));
+pub const SUPPORTED: bool = cfg!(any(windows, target_os = "linux", target_os = "macos"));
 
 /// Whether plugin windows can be opened in this session; the error says why not (no
 /// backend; on Linux no X11 display -- a Wayland session without XWayland).
@@ -81,6 +88,8 @@ pub fn available() -> Result<(), WindowError> {
     return Ok(());
     #[cfg(target_os = "linux")]
     return x11::available();
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    return Ok(());
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     return Err(WindowError::Unsupported);
 }

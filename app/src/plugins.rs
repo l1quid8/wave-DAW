@@ -12,7 +12,7 @@ use std::sync::Arc;
 use base64::Engine as _;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use wave_engine::{Id, Instrument, PluginFactory, PluginRef, Processor};
 
 /// A live hosted effect's non-real-time side.
@@ -498,6 +498,15 @@ impl Plugins {
                 return Err(NO_EDITOR.into());
             }
         }
+        if let (true, Handle::Vst3(vst3)) = (open, &h) {
+            // The editor's own edits and its close button, forwarded so the plugin's
+            // parameter list and editor button follow along. (LV2 UIs report neither yet;
+            // the UI's poll notices their close.)
+            let events = app.clone();
+            vst3.set_editor_observer(Some(std::sync::Arc::new(move |event| {
+                let _ = events.emit("plugin-editor", PluginEditorEvent::new(fx, event));
+            })));
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         let a = app.clone();
         app.run_on_main_thread(move || {
@@ -520,6 +529,26 @@ impl Plugins {
         })
         .map_err(|e| e.to_string())?;
         rx.recv().map_err(|e| e.to_string())?
+    }
+}
+
+/// `plugin-editor`: what a plugin's own editor window did.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginEditorEvent {
+    pub fx_id: Id,
+    /// Whether the editor window is still open.
+    pub open: bool,
+    /// The plugin changed parameter values: read them again.
+    pub edited: bool,
+}
+
+impl PluginEditorEvent {
+    fn new(fx_id: Id, event: wave_vst3::EditorEvent) -> Self {
+        match event {
+            wave_vst3::EditorEvent::Edited => Self { fx_id, open: true, edited: true },
+            wave_vst3::EditorEvent::Closed => Self { fx_id, open: false, edited: false },
+        }
     }
 }
 
@@ -582,6 +611,14 @@ mod tests {
         let list = wave_plugin_scan::BlockList::with_file(&file);
         assert!(list.contains(module));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn editor_events_reach_the_ui_as_open_and_edited_flags() {
+        let edited = serde_json::to_value(PluginEditorEvent::new(7, wave_vst3::EditorEvent::Edited)).unwrap();
+        assert_eq!(edited, serde_json::json!({ "fxId": 7, "open": true, "edited": true }));
+        let closed = serde_json::to_value(PluginEditorEvent::new(7, wave_vst3::EditorEvent::Closed)).unwrap();
+        assert_eq!(closed, serde_json::json!({ "fxId": 7, "open": false, "edited": false }));
     }
 
     #[test]

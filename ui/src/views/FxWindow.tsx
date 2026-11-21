@@ -37,6 +37,7 @@ import { halfHit, HalfViz, halfXf } from './fx/half';
 import { ChorusViz, PhaserViz } from './fx/modulation';
 import { warpDown, warpHover, WarpViz } from './fx/warp';
 import { onVoicePad, padParams, padToVoice, VoiceViz } from './fx/voice';
+import { followEditor } from '../lib/pluginEditor';
 import { StereoViz } from './fx/stereo';
 import { AnalyzerViz } from './fx/analyzer';
 import { dbOf, fOf, mbGeom, mbHit, MultibandViz } from './fx/multiband';
@@ -746,11 +747,17 @@ export function PluginBody(props: { id: Id; plugin?: PluginRef; instrument?: boo
   const loadErr = () => S.fxErrors[props.id];
   const [trusting, setTrusting] = createSignal(false);
   onMount(() => { load(); be().appInfo().then(i => { setEditors(i.pluginEditors); setEditorsWhy(i.pluginEditorsWhy ?? null); }).catch(() => {}); });
+  // a VST3 plugin's own window reports its knobs as they move (`plugin-editor`): the list follows at once.
+  // Its close button is followed by the plugin-window store, which owns the editor button.
+  const editor = followEditor(props.id, () => {}, load);
+  let offEditor: (() => void) | null = null, gone = false;
+  void be().on('plugin-editor', editor.handle).then(off => { if (gone) off(); else offEditor = off; });
+  onCleanup(() => { gone = true; offEditor?.(); editor.dispose(); });
   // a window opened with the slot is asked before the engine has the instance: ask again once it does
   createEffect(() => { void S.revision; if (err() && !loadErr()) load(); });
-  // knobs turned in the plugin's own window: the list follows while both are open
+  // an LV2 UI reports nothing: while both are open the list asks again every second
   createEffect(() => {
-    if (!editorOpen(props.id)) return;
+    if (!editorOpen(props.id) || props.plugin?.format === 'vst3') return;
     const iv = window.setInterval(load, 1000);
     onCleanup(() => clearInterval(iv));
   });
@@ -759,6 +766,7 @@ export function PluginBody(props: { id: Id; plugin?: PluginRef; instrument?: boo
   const label = () => PLUGIN_FORMAT_LABEL[props.plugin?.format ?? 'vst3'];
   const set = (id: number, v: number) => {
     setParams(ps => ps.map(p => p.id === id ? { ...p, value: v } : p));
+    editor.localEdit();
     void be().pluginSetParam(props.id, id, v).catch(e => say(label() + ': ' + String(e)));
     clearTimeout(refresh); refresh = window.setTimeout(load, 200);
   };

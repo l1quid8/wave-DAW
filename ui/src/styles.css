@@ -707,6 +707,8 @@ select option { background: var(--bg4); color: var(--fg); }
 /* ---------- title bar (merged into the toolbar) ---------- */
 .toolbar .projName .dirty { margin-left: 4px; color: var(--amber); }
 .toolbar.native { padding-right: 0; }
+/* room for the macOS traffic lights (tauri.macos.conf.json trafficLightPosition) */
+.toolbar.native.mac { padding-left: 84px; padding-right: 8px; }
 /* left: menus over the hint line; middle: transport, centred in the window; right: editing tools and panels */
 .tbleft { min-width: 0; align-self: stretch; display: flex; flex-direction: column; justify-content: center; gap: 4px; }
 /* the Playlist's tools and snap, left of its overview */

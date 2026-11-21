@@ -16,6 +16,14 @@ describe('localization', () => {
     expect(lang()).toBe('en');
     expect(t('startup.failed', { error: 'test' })).toBe('Synkopa: failed to start UI\ntest');
   });
+  it('serves each language its own text, the same on every call', () => {
+    const english = t('a.mn.updates');
+    expect(t('a.mn.updates')).toBe(english);
+    setLang('pl');
+    expect(t('a.mn.updates')).toBe(pl['a.mn.updates']);
+    setLang('en');
+    expect(t('a.mn.updates')).toBe(english);
+  });
   it('passes unknown names through', () => {
     expect(tName('User preset')).toBe('User preset');
   });

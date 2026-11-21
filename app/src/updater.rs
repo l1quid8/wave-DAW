@@ -37,8 +37,8 @@ pub struct AppInfo {
     /// The version whose release notes were last shown (`None` on a fresh install).
     pub seen_version: Option<String>,
     pub auto_update: bool,
-    /// Whether plugins can open their own editor windows in this session (Windows; Linux
-    /// with an X11 display, XWayland under Wayland).
+    /// Whether plugins can open their own editor windows in this session (Windows, macOS;
+    /// Linux with an X11 display, XWayland under Wayland).
     pub plugin_editors: bool,
     /// Why not, when they cannot (no X11 display).
     #[serde(skip_serializing_if = "Option::is_none")]

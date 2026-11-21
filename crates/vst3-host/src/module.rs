@@ -6,8 +6,8 @@
 //! without a plugin in sight.
 //!
 //! ```text
-//!  load the library            LoadLibraryW / dlopen
-//!  InitDll() / ModuleEntry()   optional; false means "refused" (licence checks)
+//!  load the library            LoadLibraryW / dlopen / CFBundleLoadExecutable
+//!  InitDll() / ModuleEntry() / bundleEntry()   optional; false means "refused" (licence checks)
 //!  GetPluginFactory()          required: this is what makes it a VST3 module
 //! ```
 //!
@@ -22,7 +22,7 @@
 //! library is never freed. The cost is address space the OS can page out.
 
 use std::collections::HashMap;
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 use std::ffi::c_void;
 use std::ffi::OsStr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -55,11 +55,33 @@ pub(crate) const ARCH_DIR: &str = "aarch64-linux";
 #[cfg(not(any(windows, target_os = "macos", all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))))]
 pub(crate) const ARCH_DIR: &str = "unsupported";
 
-/// Extension of the binary inside a bundle: `.vst3` on Windows, `.so` on Linux.
+/// Extension of the binary inside a bundle: `.vst3` on Windows, `.so` on Linux,
+/// none on macOS (a Mach-O executable named after the bundle).
 #[cfg(windows)]
 const BINARY_EXTENSION: &str = "vst3";
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+const BINARY_EXTENSION: &str = "";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 const BINARY_EXTENSION: &str = "so";
+
+/// The binary's file name for a bundle stem: the stem with this platform's
+/// extension **appended** (`Foo 2.0` -> `Foo 2.0.so`; macOS: `Foo 2.0` itself).
+/// Never `set_extension`, which would take `.0` for an extension and replace it.
+fn binary_file_name(stem: &OsStr) -> std::ffi::OsString {
+    let mut name = stem.to_os_string();
+    if !BINARY_EXTENSION.is_empty() {
+        name.push(".");
+        name.push(BINARY_EXTENSION);
+    }
+    name
+}
+
+/// Whether `candidate` could be this platform's binary. On macOS any file: a
+/// Mach-O executable has no extension, and its name may contain dots
+/// (`Foo 2.0`), which `Path::extension` would misread as one.
+fn is_platform_binary(candidate: &Path) -> bool {
+    BINARY_EXTENSION.is_empty() || candidate.extension().is_some_and(|ext| ext.eq_ignore_ascii_case(BINARY_EXTENSION))
+}
 
 /// The 16-byte class id naming one plugin inside a module.
 ///
@@ -138,8 +160,9 @@ impl<'de> serde::Deserialize<'de> for ClassId {
 /// Turn a `.vst3` path into the path the OS loader is given.
 ///
 /// A flat file *is* the library. A directory is a bundle: the binary is
-/// `Contents/<arch>/<bundle stem>.<vst3|so>`, or, failing that, the only
-/// binary in the architecture directory (legal, if rare).
+/// `Contents/<arch>/<bundle stem>.<vst3|so>` (`Contents/MacOS/<bundle stem>`
+/// on macOS), or, failing that, the only binary in the architecture directory
+/// (legal, if rare: on macOS the executable is named by `CFBundleExecutable`).
 pub(crate) fn resolve_binary(path: &Path) -> Result<PathBuf, Vst3Error> {
     if !path.is_dir() {
         // A file, or nothing at all: let the loader say why in its own words.
@@ -147,17 +170,13 @@ pub(crate) fn resolve_binary(path: &Path) -> Result<PathBuf, Vst3Error> {
     }
     let stem = path.file_stem().unwrap_or_else(|| OsStr::new("plugin"));
     let arch_dir = path.join(CONTENTS_DIR).join(ARCH_DIR);
-    let mut expected = arch_dir.join(stem);
-    expected.set_extension(BINARY_EXTENSION);
+    let expected = arch_dir.join(binary_file_name(stem));
     if expected.is_file() {
         return Ok(expected);
     }
     if let Ok(entries) = std::fs::read_dir(&arch_dir) {
-        let mut candidates: Vec<PathBuf> = entries
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|candidate| candidate.is_file() && candidate.extension().is_some_and(|ext| ext.eq_ignore_ascii_case(BINARY_EXTENSION)))
-            .collect();
+        let mut candidates: Vec<PathBuf> =
+            entries.flatten().map(|entry| entry.path()).filter(|candidate| candidate.is_file() && is_platform_binary(candidate)).collect();
         candidates.sort();
         if let Some(only) = candidates.into_iter().next() {
             return Ok(only);
@@ -350,10 +369,81 @@ impl LibraryHandle {
     }
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+/// A macOS VST3 module is a CoreFoundation bundle. Hosts load it through
+/// `CFBundle` (not `dlopen` on the inner binary) because the module's
+/// `bundleEntry` takes the `CFBundleRef`, which plugins use to find their own
+/// resources (`Contents/Resources`).
+#[cfg(target_os = "macos")]
+struct LibraryHandle {
+    // Retained for the life of the process: modules are never unloaded.
+    bundle: objc2_core_foundation::CFRetained<objc2_core_foundation::CFBundle>,
+}
+
+#[cfg(target_os = "macos")]
+impl LibraryHandle {
+    /// `binary` is what [`resolve_binary`] returned: the executable inside
+    /// `<name>.vst3/Contents/MacOS/`. The bundle is three levels up.
+    fn load(binary: &Path) -> Result<Self, Vst3Error> {
+        use objc2_core_foundation::{CFBundle, CFError, CFRetained, CFURL};
+
+        let load_error = |message: String| Vst3Error::Load { path: binary.to_path_buf(), message };
+        let bundle_root = binary
+            .parent()
+            .filter(|dir| dir.file_name() == Some(OsStr::new(ARCH_DIR)))
+            .and_then(Path::parent)
+            .filter(|dir| dir.file_name() == Some(OsStr::new(CONTENTS_DIR)))
+            .and_then(Path::parent)
+            .ok_or_else(|| load_error("not a macOS plugin bundle (expected <name>.vst3/Contents/MacOS/<binary>)".to_owned()))?;
+        let url = CFURL::from_directory_path(bundle_root).ok_or_else(|| load_error("the path cannot be expressed as a URL".to_owned()))?;
+        let bundle = CFBundle::new(None, Some(&url)).ok_or_else(|| load_error("CoreFoundation could not open the bundle".to_owned()))?;
+
+        let mut error: *mut CFError = std::ptr::null_mut();
+        // SAFETY: `bundle` is live and `error` is a valid out-pointer. Loading
+        // runs the module's static initialisers -- third-party code, unavoidably.
+        let loaded = unsafe { bundle.load_executable_and_return_error(&mut error) };
+        if !loaded {
+            let message = std::ptr::NonNull::new(error)
+                // SAFETY: a non-null error from a `...AndReturnError` call is +1 retained.
+                .map(|error| unsafe { CFRetained::from_raw(error) })
+                .and_then(|error| error.description())
+                .map(|text| text.to_string())
+                // Typical cause: an Intel-only or 32-bit plugin in an arm64 host.
+                .unwrap_or_else(|| "the bundle's executable could not be loaded (wrong architecture?)".to_owned());
+            return Err(load_error(message));
+        }
+        Ok(Self { bundle })
+    }
+
+    /// `bundleEntry(CFBundleRef)` (older modules: `BundleEntry`), when exported.
+    unsafe fn enter(&self) -> bool {
+        type BundleEntryFn = unsafe extern "C" fn(*const c_void) -> bool;
+        let bundle_ref = objc2_core_foundation::CFRetained::as_ptr(&self.bundle).as_ptr() as *const c_void;
+        match self.symbol::<BundleEntryFn>(b"bundleEntry\0").or_else(|| self.symbol::<BundleEntryFn>(b"BundleEntry\0")) {
+            Some(entry) => entry(bundle_ref),
+            None => true,
+        }
+    }
+
+    /// # Safety
+    /// `F` must be the exact signature of the export and `name` NUL-terminated.
+    unsafe fn symbol<F: Copy>(&self, name: &[u8]) -> Option<F> {
+        debug_assert_eq!(name.last(), Some(&0));
+        debug_assert_eq!(std::mem::size_of::<F>(), std::mem::size_of::<*const c_void>());
+        let name = std::str::from_utf8(&name[..name.len() - 1]).ok()?;
+        let name = objc2_core_foundation::CFString::from_str(name);
+        let address = self.bundle.function_pointer_for_name(Some(&name));
+        if address.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute_copy::<*mut c_void, F>(&address))
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 struct LibraryHandle;
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 impl LibraryHandle {
     fn load(_binary: &Path) -> Result<Self, Vst3Error> {
         Err(Vst3Error::UnsupportedPlatform)
@@ -492,16 +582,35 @@ mod tests {
         let bundle = dir.join("Serum.vst3");
         let arch = bundle.join(CONTENTS_DIR).join(ARCH_DIR);
         std::fs::create_dir_all(&arch).unwrap();
-        let mut binary = arch.join("Serum");
-        binary.set_extension(BINARY_EXTENSION);
+        let binary = arch.join(binary_file_name(OsStr::new("Serum")));
         std::fs::write(&binary, b"x").unwrap();
         assert_eq!(resolve_binary(&bundle).unwrap(), binary);
 
         let renamed = dir.join("Suite.vst3");
         let arch = renamed.join(CONTENTS_DIR).join(ARCH_DIR);
         std::fs::create_dir_all(&arch).unwrap();
-        let mut core = arch.join("SuiteCore");
-        core.set_extension(BINARY_EXTENSION);
+        let core = arch.join(binary_file_name(OsStr::new("SuiteCore")));
+        std::fs::write(&core, b"x").unwrap();
+        assert_eq!(resolve_binary(&renamed).unwrap(), core);
+    }
+
+    #[test]
+    fn a_bundle_name_with_dots_keeps_them_in_the_binary_name() {
+        // `set_extension` would read `.0` as an extension: `Foo 2.0` -> `Foo 2`.
+        let dir = scratch_dir("dotted");
+        let bundle = dir.join("Foo 2.0.vst3");
+        let arch = bundle.join(CONTENTS_DIR).join(ARCH_DIR);
+        std::fs::create_dir_all(&arch).unwrap();
+        let binary = arch.join(binary_file_name(OsStr::new("Foo 2.0")));
+        assert_eq!(binary.file_name().unwrap().to_string_lossy().matches("2.0").count(), 1);
+        std::fs::write(&binary, b"x").unwrap();
+        assert_eq!(resolve_binary(&bundle).unwrap(), binary);
+
+        // the fallback too: an executable named by CFBundleExecutable, with a dot, in a bundle named otherwise
+        let renamed = dir.join("Suite.vst3");
+        let arch = renamed.join(CONTENTS_DIR).join(ARCH_DIR);
+        std::fs::create_dir_all(&arch).unwrap();
+        let core = arch.join(binary_file_name(OsStr::new("Suite Core 1.5")));
         std::fs::write(&core, b"x").unwrap();
         assert_eq!(resolve_binary(&renamed).unwrap(), core);
     }

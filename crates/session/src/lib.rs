@@ -71,6 +71,10 @@ pub fn session_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("WAVE_SESSION_DIR") {
         return PathBuf::from(d);
     }
+    #[cfg(target_os = "macos")]
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join("Library/Application Support/WAVE/sessions");
+    }
     let base = std::env::var_os("LOCALAPPDATA")
         .or_else(|| std::env::var_os("XDG_RUNTIME_DIR"))
         .map(PathBuf::from)
@@ -213,7 +217,12 @@ pub fn call(ep: &Endpoint, command: &str, args: Value, if_revision: Option<u64>,
 
 #[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{pid}")).exists() || !cfg!(target_os = "linux")
+    let Ok(pid) = libc::pid_t::try_from(pid) else { return false };
+    // Signal 0 checks existence without delivering anything. EPERM means the
+    // process exists but belongs to someone else: alive.
+    // SAFETY: no memory is passed.
+    let exists = unsafe { libc::kill(pid, 0) } == 0;
+    exists || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(windows)]

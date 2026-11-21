@@ -720,7 +720,10 @@ meanwhile is refused (`REVISION_CONFLICT`) rather than overwritten.
 Events: `state` (a `StateDto`, after every change from any origin: UI, CLI,
 undo, import, recording, file open), `library-progress`, `model-progress`, `stems-progress`, `audio-status`,
 `export-progress` (`{done, total, name, stage, frac, beat, peak, wave}` while a bounce runs: the
-file in progress, `prepare`/`render`/`write`/`done`, the song position and a live peak waveform).
+file in progress, `prepare`/`render`/`write`/`done`, the song position and a live peak waveform),
+`plugin-editor` (`{fxId, open, edited}` from a VST3 editor window's tick: the user closed the
+window, or the plugin changed parameter values itself; the effect window re-reads the list, and
+only `open: false` changes its editor button, so a late `edited` cannot reopen it).
 
 ```ts
 type StateDto = { project: Project; revision: number; canUndo: boolean; canRedo: boolean;

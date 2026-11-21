@@ -34,6 +34,7 @@ import { MiniKnob } from '../ui/Knob';
 import { VOL_UNITY } from '../api/types';
 import { volText } from '../lib/format';
 import { autoDisplay, isAutomated, paramMenu } from '../state/automation';
+import { IS_MAC, keyCap, shortcuts as keyLabel } from '../lib/platform';
 import { masterClip, masterClipTip, resetMasterClip } from '../state/masterClip';
 import { cpuBand, cpuText, resetUnderruns, underrunFlash, underruns } from '../state/underruns';
 import { audioStatus, openAudioSettings } from '../state/audioWatch';
@@ -185,13 +186,13 @@ export function Toolbar() {
   const wins = () => U.plugs.length + (rackFloating() ? 1 : 0) + (rollFloating() ? 1 : 0);
   const hint = () => t('a.tb.statusHint', { tool: t(TOOLS.find(x => x[0] === U.tool)![2]), hint: t(TOOL_HINT[U.tool]), snap: U.alt ? 'off' : snapLabel(U.snap, U.bw).replace('Snap: ', '') });
   return (
-    <div ref={barEl} class="toolbar" classList={{ native: !!win }} onMouseDown={dragDown}>
+    <div ref={barEl} class="toolbar" classList={{ native: !!win, mac: !!win && IS_MAC }} onMouseDown={dragDown}>
       {/* left: the menus over the hint line (FL): what the last action did, and what the tool does */}
       <div class="tbleft" data-drag>
         <div class="tbmenu" data-drag>
           <MenuBar />
           <button class="cmdbtn" title={t('a.cmd.title') + ' (Ctrl+K)'} aria-label={t('a.cmd.title')} onClick={() => setPaletteOpen(true)}>
-            <Icon d="M11 4a7 7 0 1 0 0 14a7 7 0 0 0 0-14z M20 20l-4-4" size={13} /><kbd>Ctrl K</kbd>
+            <Icon d="M11 4a7 7 0 1 0 0 14a7 7 0 0 0 0-14z M20 20l-4-4" size={13} /><kbd>{IS_MAC ? '⌘K' : 'Ctrl K'}</kbd>
           </button>
           <AskButton />
           <MissingChip />
@@ -287,7 +288,8 @@ export function Toolbar() {
           <span class="midiled" classList={{ on: !!midiStatus()?.connected, hit: midiFlash() }} /><span class="tag9">MIDI</span>
         </button>
       </Show>
-      <Show when={win}>
+      {/* macOS draws its own traffic lights over the bar's left end (titleBarStyle "Overlay") */}
+      <Show when={win && !IS_MAC}>
         <div class="winbtns">
           <button title={t('a.tb.minimize')} aria-label={t('a.tb.minimize')} onClick={() => void win!.minimize()}><svg width="10" height="10" viewBox="0 0 10 10"><path d="M0 5h10" stroke="currentColor" /></svg></button>
           <Show when={isFullscreen()}>
@@ -586,8 +588,8 @@ function KeyCombo(props: { k: string }) {
   const parts = () => (props.k.startsWith('Num ') ? [props.k] : props.k.split('+').map(x => x.trim()).filter(Boolean));
   const keys = () => parts().length > 0 && parts().every(x => x.length <= 9);
   return (
-    <Show when={keys()} fallback={<span class="gesture">{props.k}</span>}>
-      <span class="combo"><For each={parts()}>{x => <kbd>{x}</kbd>}</For></span>
+    <Show when={keys()} fallback={<span class="gesture">{keyLabel(props.k)}</span>}>
+      <span class="combo"><For each={parts()}>{x => <kbd>{keyCap(x)}</kbd>}</For></span>
     </Show>
   );
 }
@@ -600,7 +602,7 @@ export function Help() {
       <div class="overlay" onPointerDown={close}>
         <div class="dialog helpdlg" onPointerDown={e => e.stopPropagation()} onKeyDown={e => { if (e.key === 'Escape') { e.stopPropagation(); close(); } }}>
           <div class="hd"><span>{t('a.tb.helpTitle')}</span>
-            <button class="chip helpcmd" onClick={() => { close(); setPaletteOpen(true); }}>{t('a.cmd.title')}<kbd>Ctrl K</kbd></button>
+            <button class="chip helpcmd" onClick={() => { close(); setPaletteOpen(true); }}>{t('a.cmd.title')}<kbd>{IS_MAC ? '⌘K' : 'Ctrl K'}</kbd></button>
             <button aria-label={t('a.tb.close')} onClick={close}>×</button></div>
           <div class="helplist">
             <For each={shortcuts()}>

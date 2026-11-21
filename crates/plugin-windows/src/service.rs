@@ -16,10 +16,13 @@ use parking_lot::Mutex;
 #[cfg(windows)]
 use crate::win32 as backend;
 
+#[cfg(target_os = "macos")]
+use crate::macos as backend;
+
 #[cfg(target_os = "linux")]
 use crate::x11 as backend;
 
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 use crate::unsupported as backend;
 
 use crate::header::Header;
@@ -130,7 +133,7 @@ pub enum WindowError {
     #[error("plugin windows are owned by thread {owner:?}; this call came from {caller:?}")]
     WrongThread { owner: ThreadId, caller: ThreadId },
 
-    /// This platform has no plugin-window backend (macOS).
+    /// This platform has no plugin-window backend (everything but Windows, Linux and macOS).
     #[error("native plugin windows are not implemented on this platform")]
     Unsupported,
 
@@ -160,6 +163,10 @@ pub enum WindowError {
     /// [`Service::close_all`]).
     #[error("{0} is not open")]
     Closed(WindowId),
+
+    /// A native (AppKit) call failed or was refused.
+    #[error("could not drive the plugin window: {0}")]
+    Native(String),
 
     /// A Win32 call on a live window failed.
     #[error("{api} failed on {id} (win32 error {code})")]
@@ -577,7 +584,7 @@ impl Drop for Window {
 
 /// State every window procedure needs. Boxed and owned by the native window,
 /// freed when it is destroyed.
-#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "linux", target_os = "macos")), allow(dead_code))]
 pub(crate) struct WindowState {
     pub(crate) events: Sender<WindowEvent>,
     pub(crate) ticks: Arc<AtomicU64>,
@@ -586,12 +593,14 @@ pub(crate) struct WindowState {
     /// Synkopa's header above the plugin, with the button under the pointer.
     pub(crate) header: std::cell::RefCell<Header>,
     pub(crate) tag: u64,
+    // read by the backends that draw Synkopa's header (macOS keeps the native title bar)
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) resizable: bool,
     /// The native child the plugin embeds into (below the header); 0 until created.
     pub(crate) embed: std::cell::Cell<isize>,
 }
 
-#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "linux", target_os = "macos")), allow(dead_code))]
 impl WindowState {
     pub(crate) fn new(options: &WindowOptions, events: Sender<WindowEvent>, ticks: Arc<AtomicU64>) -> Self {
         Self {
@@ -626,7 +635,7 @@ impl WindowState {
     }
 
     /// The pinned state the header shows right now.
-    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+    #[cfg_attr(not(any(windows, target_os = "linux", target_os = "macos")), allow(dead_code))]
     pub(crate) fn pinned(&self) -> bool {
         self.header.borrow().pinned
     }
@@ -637,6 +646,7 @@ impl WindowState {
     }
 
     /// Set the hovered / pressed button; `true` when that changed the picture.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn set_header_state(&self, hover: Option<crate::header::Part>, pressed: Option<crate::header::Part>) -> bool {
         let keep = |p: Option<crate::header::Part>| p.filter(|p| *p != crate::header::Part::Drag);
         let mut h = self.header.borrow_mut();
@@ -703,7 +713,7 @@ mod tests {
         assert_eq!(service.close_all(), 0);
     }
 
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     #[test]
     fn without_a_backend_opening_is_unsupported_and_says_so() {
         let service = Service::new();

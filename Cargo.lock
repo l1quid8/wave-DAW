@@ -5797,9 +5797,13 @@ dependencies = [
 name = "wave-plugin-windows"
 version = "0.4.0"
 dependencies = [
+ "block2",
  "fontdue",
  "libc",
  "log",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "parking_lot",
  "thiserror 2.0.21",
  "windows-sys 0.61.2",
@@ -5821,6 +5825,7 @@ name = "wave-session"
 version = "0.4.0"
 dependencies = [
  "interprocess",
+ "libc",
  "log",
  "serde",
  "serde_json",
@@ -5862,6 +5867,7 @@ version = "0.4.0"
 dependencies = [
  "libc",
  "log",
+ "objc2-core-foundation",
  "parking_lot",
  "rtrb",
  "serde",

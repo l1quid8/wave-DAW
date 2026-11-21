@@ -265,7 +265,7 @@ export interface F0ModelStatus {
 /** An update found on GitHub Releases (`update_check`). `notes`: the release notes (Markdown), `date`: `YYYY-MM-DD`. */
 export interface UpdateInfo { version: string; notes: string | null; date: string | null }
 /** `app_info`: the running version, the version whose notes were last shown (null on a fresh install), the auto-check switch. */
-/** `pluginEditors`: plugins can open their own windows in this session (Windows; Linux with an X11 display or XWayland);
+/** `pluginEditors`: plugins can open their own windows in this session (Windows, macOS; Linux with an X11 display or XWayland);
  *  `pluginEditorsWhy`: why not, when they cannot. */
 export interface AppInfo { version: string; seenVersion: string | null; autoUpdate: boolean; pluginEditors: boolean; pluginEditorsWhy?: string }
 export interface UpdateProgress { done: number; total: number }
@@ -680,6 +680,9 @@ export interface PluginParam {
   steps?: number; toggle?: boolean; integer?: boolean; log?: boolean;
   options?: { value: number; label: string }[];
 }
+
+/** `plugin-editor`: a plugin's own editor window was closed by the user (`open: false`) or changed parameter values (`edited`). */
+export interface PluginEditorEvent { fxId: Id; open: boolean; edited: boolean }
 
 export interface CliStatus { installed: boolean; command: string; path: string | null; note?: string | null }
 

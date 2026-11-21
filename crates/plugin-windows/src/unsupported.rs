@@ -1,6 +1,6 @@
 //! Backend for platforms with no plugin-window implementation (everything but
-//! Windows). Everything above this file compiles and is tested anywhere; only
-//! these calls are missing. macOS (`NSView`) and X11 backends slot in here.
+//! Windows, Linux and macOS). Everything above this file compiles and is tested
+//! anywhere; only these calls are missing.
 
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;

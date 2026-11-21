@@ -33,8 +33,8 @@ jobs:
             features: ""
             bundles: deb,rpm,appimage
           # Apple Silicon, macOS 13.4+ (ONNX Runtime's prebuilt library needs it). Ad-hoc signed, not
-          # notarized: the first start needs System Settings → Privacy & Security → Open Anyway. No VST3
-          # hosting on macOS yet (the VST3 host and plugin windows are Windows/Linux only).
+          # notarized: the first start needs System Settings → Privacy & Security → Open Anyway. VST3 plugins
+          # (Apple Silicon or universal) load and open their windows; the Demo Synth is not bundled yet.
           - os: macos-latest
             features: ""
             bundles: app,dmg
@@ -109,7 +109,7 @@ jobs:
             * The Windows installer is built **with ASIO** (Settings → Audio → ASIO) and includes the Synkopa Keys piano.
             * Windows: there is no `.msi` any more. If you installed it from an `.msi`, uninstall it and install `Synkopa_…_x64-setup.exe` once; updates then arrive by themselves.
             * Linux: `.AppImage` (any distribution), `.deb` (Ubuntu, Debian, Mint) or `.rpm` (Fedora, openSUSE).
-            * macOS (Apple Silicon, 13.4 or newer): the `.dmg`. It is not notarized yet: the first time, open it, then System Settings → Privacy & Security → Open Anyway. VST3 plugins are not hosted on macOS yet.
+            * macOS (Apple Silicon, 13.4 or newer): the `.dmg`. It is not notarized yet: the first time, open it, then System Settings → Privacy & Security → Open Anyway. VST3 plugins built for Apple Silicon (or universal) work, with their own windows.
             * The interface is English by default; Polish is in Settings.
             * The `synkopa` command line works after the first start (open a new terminal): `synkopa status`, `synkopa context` (the old `wave` name still works), see docs/cli.md.
             * VST3 effects: Add effect → VST3… (the first scan may take a while).
