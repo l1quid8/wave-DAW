@@ -592,9 +592,8 @@ pub(crate) struct WindowState {
     pub(crate) tick: std::cell::RefCell<Option<Rc<dyn Fn()>>>,
     /// Synkopa's header above the plugin, with the button under the pointer.
     pub(crate) header: std::cell::RefCell<Header>,
-    // read by the backends that draw Synkopa's header (macOS keeps the native title bar)
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) tag: u64,
+    // read by the backends that draw Synkopa's header (macOS keeps the native title bar)
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) resizable: bool,
     /// The native child the plugin embeds into (below the header); 0 until created.
@@ -619,7 +618,6 @@ impl WindowState {
     }
 
     /// A click released on a header button (`part`, the one it was pressed on).
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn header_click(&self, part: crate::header::Part) {
         match part {
             crate::header::Part::Settings => settings_requested(self.tag),
@@ -637,7 +635,7 @@ impl WindowState {
     }
 
     /// The pinned state the header shows right now.
-    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
+    #[cfg_attr(not(any(windows, target_os = "linux", target_os = "macos")), allow(dead_code))]
     pub(crate) fn pinned(&self) -> bool {
         self.header.borrow().pinned
     }

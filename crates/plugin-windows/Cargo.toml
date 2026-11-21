@@ -41,4 +41,4 @@ x11rb = { version = "0.13", features = ["xtest"] }
 objc2 = "0.6"
 block2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "NSObject", "NSString", "NSGeometry", "NSNotification", "NSRunLoop", "NSTimer", "NSDate", "NSArray"] }
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSWindow", "NSView", "NSResponder", "NSGraphics"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSWindow", "NSView", "NSResponder", "NSGraphics", "NSButton", "NSControl", "NSCell", "NSImage", "NSTitlebarAccessoryViewController", "NSViewController", "NSLayoutConstraint"] }

@@ -20,8 +20,10 @@
 //!
 //! The editor keeps the native title bar (traffic lights, drag to move) instead of the
 //! software header the Win32 and X11 backends draw: the plugin embeds straight into the
-//! content view, and the title reads "name — subtitle". Pinning raises the window to the
-//! floating level.
+//! content view, and the title is the plugin's name alone: AppKit does not shorten a title
+//! for a titlebar accessory, and in a narrow editor the subtitle would run under the buttons. The header's gear and pin sit at
+//! the title bar's right as a titlebar accessory and report through the same
+//! [`WindowState::header_click`]. Pinning raises the window to the floating level.
 //!
 //! # Units
 //!
@@ -40,15 +42,17 @@ use std::sync::Arc;
 
 use block2::RcBlock;
 use objc2::rc::Retained;
-use objc2::runtime::ProtocolObject;
-use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2::runtime::{AnyObject, ProtocolObject, Sel};
+use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSBackingStoreType, NSFloatingWindowLevel, NSNormalWindowLevel, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
+    NSBackingStoreType, NSButton, NSControlStateValueOff, NSControlStateValueOn, NSFloatingWindowLevel, NSImage, NSLayoutAttribute,
+    NSNormalWindowLevel, NSTitlebarAccessoryViewController, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer,
 };
 
+use crate::header::Part;
 use crate::service::{WindowError, WindowEvent, WindowId, WindowOptions, WindowSize, WindowState, PUMP_INTERVAL_MS};
 
 /// The "dpi" every macOS window reports: sizes are already in points.
@@ -63,6 +67,10 @@ struct Entry {
     delegate: Retained<WindowDelegate>,
     timer: Retained<NSTimer>,
     state: Rc<WindowState>,
+    /// The title bar's pin, drawn filled while the window is pinned (`None`: no symbol images).
+    pin: Option<Retained<NSButton>>,
+    // Owned by the window once added; kept for as long as the entry.
+    _accessory: Retained<NSTitlebarAccessoryViewController>,
 }
 
 thread_local! {
@@ -73,6 +81,10 @@ thread_local! {
 /// while owner code (which may close this very window) runs.
 fn state_of(handle: isize) -> Option<Rc<WindowState>> {
     WINDOWS.with(|windows| windows.borrow().get(&handle).map(|entry| Rc::clone(&entry.state)))
+}
+
+fn pin_of(handle: isize) -> Option<Retained<NSButton>> {
+    WINDOWS.with(|windows| windows.borrow().get(&handle).and_then(|entry| entry.pin.clone()))
 }
 
 fn window_of(handle: isize) -> Option<(Retained<NSWindow>, Retained<NSView>)> {
@@ -92,15 +104,6 @@ fn to_size(size: NSSize) -> WindowSize {
 
 fn to_ns_size(size: WindowSize) -> NSSize {
     NSSize::new(f64::from(size.width), f64::from(size.height))
-}
-
-/// The native title: the name, then the subtitle when there is one.
-fn title_for(title: &str, subtitle: &str) -> String {
-    if subtitle.is_empty() {
-        title.to_owned()
-    } else {
-        format!("{title} — {subtitle}")
-    }
 }
 
 fn style_for(resizable: bool) -> NSWindowStyleMask {
@@ -126,6 +129,32 @@ define_class!(
     struct WindowDelegate;
 
     unsafe impl NSObjectProtocol for WindowDelegate {}
+
+    impl WindowDelegate {
+        /// The title bar's gear: Synkopa's own window for the plugin.
+        #[unsafe(method(synkopaSettings:))]
+        fn settings_clicked(&self, _sender: Option<&AnyObject>) {
+            let handle = self.ivars().handle;
+            guarded("settings", || {
+                if let Some(state) = state_of(handle) {
+                    state.header_click(Part::Settings);
+                }
+            });
+        }
+
+        /// The title bar's pin: keep the window on top of the app's, or not.
+        #[unsafe(method(synkopaPin:))]
+        fn pin_clicked(&self, _sender: Option<&AnyObject>) {
+            let handle = self.ivars().handle;
+            guarded("pin", || {
+                if let Some(state) = state_of(handle) {
+                    // toggles the state and tells the app, which remembers it per plugin
+                    state.header_click(Part::Pin);
+                    set_always_on_top(handle, state.pinned());
+                }
+            });
+        }
+    }
 
     unsafe impl NSWindowDelegate for WindowDelegate {
         /// The close button: tell the owner and refuse. The owner detaches the
@@ -161,6 +190,48 @@ impl WindowDelegate {
     }
 }
 
+/// SF Symbols for the pin, unpinned and pinned.
+const PIN_SYMBOLS: [&str; 2] = ["pin", "pin.fill"];
+
+fn symbol(name: &str, description: &str) -> Option<Retained<NSImage>> {
+    NSImage::imageWithSystemSymbolName_accessibilityDescription(&NSString::from_str(name), Some(&NSString::from_str(description)))
+}
+
+/// A borderless title-bar button at `x` in the accessory that sends `action` to `delegate`.
+fn title_button(mtm: MainThreadMarker, image: &NSImage, tip: &str, delegate: &WindowDelegate, action: Sel, x: f64) -> Retained<NSButton> {
+    let target: &AnyObject = delegate.as_ref();
+    // SAFETY: the delegate implements `action` (see `define_class!` above) and outlives the
+    // button: both live in the window's registry entry.
+    let button = unsafe { NSButton::buttonWithImage_target_action(image, Some(target), Some(action), mtm) };
+    button.setBordered(false);
+    button.setToolTip(Some(&NSString::from_str(tip)));
+    button.setFrame(NSRect::new(NSPoint::new(x, 3.0), NSSize::new(26.0, 22.0)));
+    button
+}
+
+/// The pin and the gear at the title bar's right; the pin is returned so it can show its state.
+fn add_title_buttons(
+    mtm: MainThreadMarker,
+    window: &NSWindow,
+    delegate: &WindowDelegate,
+) -> (Retained<NSTitlebarAccessoryViewController>, Option<Retained<NSButton>>) {
+    let bar = NSView::initWithFrame(NSView::alloc(mtm), NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(64.0, 28.0)));
+    let pin = symbol(PIN_SYMBOLS[0], "Keep on top").map(|image| {
+        let pin = title_button(mtm, &image, "Keep this window on top", delegate, sel!(synkopaPin:), 4.0);
+        bar.addSubview(&pin);
+        pin
+    });
+    if let Some(image) = symbol("gearshape", "Settings") {
+        let gear = title_button(mtm, &image, "Synkopa's settings for this plugin", delegate, sel!(synkopaSettings:), 34.0);
+        bar.addSubview(&gear);
+    }
+    let accessory = NSTitlebarAccessoryViewController::new(mtm);
+    accessory.setView(&bar);
+    accessory.setLayoutAttribute(NSLayoutAttribute::Right);
+    window.addTitlebarAccessoryViewController(&accessory);
+    (accessory, pin)
+}
+
 pub(crate) fn create_window(
     options: &WindowOptions,
     size: WindowSize,
@@ -187,7 +258,7 @@ pub(crate) fn create_window(
     // release it when it closes.
     unsafe { window.setReleasedWhenClosed(false) };
     let state = Rc::new(WindowState::new(options, events, ticks));
-    window.setTitle(&NSString::from_str(&title_for(&options.title, &options.subtitle)));
+    window.setTitle(&NSString::from_str(&options.title));
     window.setContentMinSize(to_ns_size(state.min_size));
     let view = window.contentView().ok_or_else(|| WindowError::Native("the new window has no content view".into()))?;
     let handle = Retained::as_ptr(&view) as isize;
@@ -196,6 +267,7 @@ pub(crate) fn create_window(
     let delegate = WindowDelegate::new(mtm, handle);
     window.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     window.center();
+    let (accessory, pin) = add_title_buttons(mtm, &window, &delegate);
 
     let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
         guarded("tick", || {
@@ -210,7 +282,7 @@ pub(crate) fn create_window(
     // SAFETY: main thread; `NSRunLoopCommonModes` is a valid mode constant.
     unsafe { NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes) };
 
-    WINDOWS.with(|windows| windows.borrow_mut().insert(handle, Entry { window, view, delegate, timer, state }));
+    WINDOWS.with(|windows| windows.borrow_mut().insert(handle, Entry { window, view, delegate, timer, state, pin, _accessory: accessory }));
     Ok(handle)
 }
 
@@ -236,6 +308,12 @@ pub(crate) fn set_always_on_top(handle: isize, pinned: bool) {
     };
     state.set_pinned_state(pinned);
     window.setLevel(if pinned { NSFloatingWindowLevel } else { NSNormalWindowLevel });
+    if let Some(button) = pin_of(handle) {
+        button.setState(if pinned { NSControlStateValueOn } else { NSControlStateValueOff });
+        if let Some(image) = symbol(PIN_SYMBOLS[usize::from(pinned)], "Keep on top") {
+            button.setImage(Some(&image));
+        }
+    }
 }
 
 pub(crate) fn show_window(handle: isize) {
@@ -292,12 +370,6 @@ mod tests {
         assert!(style_for(true).contains(NSWindowStyleMask::Resizable));
         assert!(!style_for(false).contains(NSWindowStyleMask::Resizable));
         assert!(style_for(false).contains(NSWindowStyleMask::Closable));
-    }
-
-    #[test]
-    fn the_title_carries_the_subtitle_when_there_is_one() {
-        assert_eq!(title_for("Delay", ""), "Delay");
-        assert_eq!(title_for("Delay", "Insert 3"), "Delay — Insert 3");
     }
 
     #[test]

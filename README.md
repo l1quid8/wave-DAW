@@ -143,7 +143,7 @@ a complete beat and a vocal session. What it does not do yet:
   Synkopa says what to install when it does not. An LV2 plugin that needs a host feature Synkopa does
   not provide (for example a fixed block size) is listed with the reason and cannot be added;
 - on macOS: Apple Silicon and macOS 13.4 or newer only; Intel-only (x86_64) plugins do not load;
-  plugin windows use the macOS title bar instead of Synkopa's header (no gear or pin there yet);
+  plugin windows use the macOS title bar, with Synkopa's gear and pin at its right;
   and the app is not notarized, so macOS asks once before the first start (see Install);
 - no Session view or clip launching;
 - no import of FL Studio projects (`.flp`); bring stems or samples over instead;
